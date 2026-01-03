@@ -1,0 +1,42 @@
+// Shader that includes a working header
+
+#hina
+group Scene = 0;
+
+bindings(Scene, start=0) {
+  uniform(std140) UBO {
+    mat4 mvp;
+    vec4 color;
+  } ubo;
+}
+
+struct VertexIn {
+  vec3 a_position;
+  vec2 a_uv;
+};
+
+struct Varyings {
+  vec2 uv;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+    gl_Position = ubo.mvp * vec4(in.a_position, 1.0);
+    out.uv = in.a_uv;
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+    FragOut out;
+    out.color = ubo.color;
+    return out;
+}
+#hina_end

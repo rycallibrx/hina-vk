@@ -1,0 +1,73 @@
+/**
+ * Mirror Shader
+ *
+ * Renders a plane that samples from the offscreen reflection texture.
+ * Uses the reflected view-projection to compute proper texture coordinates
+ * that give correct parallax when the camera moves.
+ */
+
+#hina
+group Transforms = 0;
+group Material = 1;
+
+bindings(Transforms, start=0) {
+  uniform(std140) UBO {
+    mat4 projection;
+    mat4 view;
+    mat4 model;
+    mat4 reflected_vp;  // View-projection from reflected camera
+  } ubo;
+}
+
+bindings(Material, start=0) {
+  texture sampler2D u_reflection;
+}
+
+struct VertexIn {
+  vec3 a_position;
+  vec3 a_normal;
+  vec2 a_uv;
+};
+
+struct Varyings {
+  vec3 world_pos;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+
+    vec4 world_pos = ubo.model * vec4(in.a_position, 1.0);
+    gl_Position = ubo.projection * ubo.view * world_pos;
+    out.world_pos = world_pos.xyz;
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+    FragOut out;
+
+    // Project this world position through the reflected camera
+    // This tells us where this point appears in the offscreen texture
+    vec4 reflected_clip = ubo.reflected_vp * vec4(in.world_pos, 1.0);
+
+    // Perspective divide to get NDC
+    vec2 ndc = reflected_clip.xy / reflected_clip.w;
+
+    // Convert NDC [-1,1] to texture coordinates [0,1]
+    vec2 reflection_uv = ndc * 0.5 + 0.5;
+
+    // Sample the reflection texture
+    vec4 reflection = texture(u_reflection, reflection_uv);
+
+    // Simple output - the reflection color with slight darkening for realism
+    out.color = vec4(reflection.rgb * 0.8, 1.0);
+    return out;
+}
+#hina_end

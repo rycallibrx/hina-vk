@@ -1,0 +1,10 @@
+// Auto-discover example projects
+rootProject.name = 'hina-vk-android'
+
+// Include each example as a subproject
+file('examples').eachDir { dir ->
+    if (dir.name != '_template' && file("examples/${dir.name}/build.gradle").exists()) {
+        include ":${dir.name}"
+        project(":${dir.name}").projectDir = new File("examples/${dir.name}")
+    }
+}

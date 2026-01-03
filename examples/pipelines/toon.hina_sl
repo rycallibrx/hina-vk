@@ -1,0 +1,92 @@
+/**
+ * Toon/Cel shading pipeline
+ * Quantized lighting for cartoon-like appearance
+ */
+
+#hina
+group Scene = 0;
+
+bindings(Scene, start=0) {
+  uniform(std140) UBO {
+    mat4 projection;
+    mat4 model;
+    mat4 view;
+    vec4 light_pos;
+  } ubo;
+}
+
+struct VertexIn {
+  vec3 a_position;
+  vec3 a_normal;
+  vec3 a_color;
+};
+
+struct Varyings {
+  vec3 normal;
+  vec3 color;
+  vec3 view_vec;
+  vec3 light_vec;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+
+    mat4 model_view = ubo.view * ubo.model;
+    vec4 world_pos = model_view * vec4(in.a_position, 1.0);
+
+    gl_Position = ubo.projection * world_pos;
+
+    // Transform normal to view space
+    mat3 normal_matrix = transpose(inverse(mat3(model_view)));
+    out.normal = normalize(normal_matrix * in.a_normal);
+
+    out.color = in.a_color;
+
+    // View space light calculations
+    vec3 light_pos_view = (ubo.view * ubo.light_pos).xyz;
+    out.light_vec = light_pos_view - world_pos.xyz;
+    out.view_vec = -world_pos.xyz;
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+    FragOut out;
+
+    vec3 N = normalize(in.normal);
+    vec3 L = normalize(in.light_vec);
+
+    // Toon shading: quantize the diffuse lighting into discrete bands
+    float intensity = dot(N, L);
+
+    float shade;
+    if (intensity > 0.95)
+        shade = 1.0;
+    else if (intensity > 0.5)
+        shade = 0.7;
+    else if (intensity > 0.25)
+        shade = 0.4;
+    else
+        shade = 0.2;
+
+    // Apply quantized shade to color
+    vec3 color = in.color * shade;
+
+    // Edge detection for outline (based on view angle)
+    vec3 V = normalize(in.view_vec);
+    float edge = abs(dot(N, V));
+    if (edge < 0.3) {
+        color = vec3(0.0);  // Outline
+    }
+
+    out.color = vec4(color, 1.0);
+    return out;
+}
+#hina_end

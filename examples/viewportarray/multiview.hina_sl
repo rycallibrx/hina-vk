@@ -1,0 +1,97 @@
+/**
+ * Multiview Geometry Shader Example
+ *
+ * Demonstrates geometry shader instancing to render the same mesh
+ * to two screen positions in a single draw call.
+ *
+ * Features:
+ * - layout(triangles, invocations = 2) - GS instancing
+ * - gl_InvocationID - per-invocation indexing for different transforms
+ * - EmitVertex() / EndPrimitive() - standard GS output
+ */
+
+#hina
+group Scene = 0;
+
+bindings(Scene, start=0) {
+  uniform(std140) UBO {
+    mat4 projection[2];
+    mat4 modelview[2];
+    vec4 lightPos;
+    vec4 screenOffsets[2];
+  } ubo;
+}
+#hina_end
+
+#hina_stage vertex entry VSMain
+layout(location = 0) in vec3 inPos;
+layout(location = 1) in vec3 inNormal;
+layout(location = 2) in vec3 inColor;
+
+layout(location = 0) out vec3 outNormal;
+layout(location = 1) out vec3 outColor;
+
+void VSMain() {
+    outNormal = inNormal;
+    outColor = inColor;
+    gl_Position = vec4(inPos, 1.0);
+}
+#hina_end
+
+#hina_stage geometry entry GSMain
+layout(triangles, invocations = 2) in;
+layout(triangle_strip, max_vertices = 3) out;
+
+layout(location = 0) in vec3 inNormal[];
+layout(location = 1) in vec3 inColor[];
+
+layout(location = 0) out vec3 outNormal;
+layout(location = 1) out vec3 outColor;
+layout(location = 2) out vec3 outViewVec;
+layout(location = 3) out vec3 outLightVec;
+
+void GSMain() {
+    for (int i = 0; i < gl_in.length(); i++) {
+        // Transform normal to view space
+        outNormal = mat3(ubo.modelview[gl_InvocationID]) * inNormal[i];
+        outColor = inColor[i];
+
+        vec4 pos = gl_in[i].gl_Position;
+        vec4 worldPos = ubo.modelview[gl_InvocationID] * pos;
+
+        // Calculate lighting vectors
+        vec3 lPos = vec3(ubo.modelview[gl_InvocationID] * ubo.lightPos);
+        outLightVec = lPos - worldPos.xyz;
+        outViewVec = -worldPos.xyz;
+
+        // Transform to clip space and apply screen offset
+        gl_Position = ubo.projection[gl_InvocationID] * worldPos;
+        gl_Position.x += ubo.screenOffsets[gl_InvocationID].x * gl_Position.w;
+
+        EmitVertex();
+    }
+    EndPrimitive();
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+layout(location = 0) in vec3 inNormal;
+layout(location = 1) in vec3 inColor;
+layout(location = 2) in vec3 inViewVec;
+layout(location = 3) in vec3 inLightVec;
+
+layout(location = 0) out vec4 outColor;
+
+void FSMain() {
+    vec3 N = normalize(inNormal);
+    vec3 L = normalize(inLightVec);
+    vec3 V = normalize(inViewVec);
+    vec3 R = reflect(-L, N);
+
+    vec3 ambient = vec3(0.1);
+    vec3 diffuse = max(dot(N, L), 0.0) * vec3(1.0);
+    vec3 specular = pow(max(dot(R, V), 0.0), 16.0) * vec3(0.75);
+
+    outColor = vec4((ambient + diffuse) * inColor + specular, 1.0);
+}
+#hina_end

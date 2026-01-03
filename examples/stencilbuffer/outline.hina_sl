@@ -1,0 +1,47 @@
+/**
+ * Outline Shader
+ * Extrudes vertices along normals to create outline effect
+ * Only renders where stencil != 1 (outside the original model)
+ *
+ * Based on Sascha Willems stencilbuffer example
+ */
+
+#hina
+group Scene = 0;
+
+bindings(Scene, start=0) {
+  uniform(std140) UBO {
+    mat4 projection;
+    mat4 model;
+    vec4 light_pos;
+    float outline_width;
+    float _pad[3];
+  } ubo;
+}
+
+struct VertexIn {
+  vec3 a_position;
+  vec3 a_normal;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+void VSMain(VertexIn in) {
+    // Extrude vertex position along normal direction
+    vec3 extruded_pos = in.a_position + in.a_normal * ubo.outline_width;
+    gl_Position = ubo.projection * ubo.model * vec4(extruded_pos, 1.0);
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain() {
+    FragOut out;
+    // Output solid white for the outline
+    out.color = vec4(1.0, 1.0, 1.0, 1.0);
+    return out;
+}
+#hina_end

@@ -1,0 +1,60 @@
+/**
+ * Shadow Map Shader
+ *
+ * Simple depth-only pass for shadow map generation.
+ * Uses SSBO for instanced object transforms.
+ */
+
+#hina
+group Scene = 0;
+group Object = 1;
+
+struct ObjectData {
+  mat4 model;
+  mat4 normal;
+};
+
+bindings(Scene, start=0) {
+  uniform(std140) SceneUBO {
+    mat4 view;
+    mat4 proj;
+    mat4 view_proj;
+    mat4 light_view_proj;
+    vec4 camera_pos;
+    vec4 light_dir;
+    vec4 light_color;
+    vec4 ambient_color;
+  } scene;
+}
+
+bindings(Object, start=0) {
+  buffer(readonly) ObjectBuffer {
+    ObjectData objects[];
+  } object_buf;
+}
+
+struct VertexIn {
+  vec3 a_position;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+void VSMain(VertexIn in) {
+    uint obj_index = gl_InstanceIndex;
+    mat4 model = object_buf.objects[obj_index].model;
+    vec4 world = model * vec4(in.a_position, 1.0);
+    gl_Position = scene.light_view_proj * world;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain() {
+    FragOut out;
+    out.color = vec4(1.0);
+    return out;
+}
+#hina_end

@@ -1,0 +1,53 @@
+/**
+ * Debug Shader
+ *
+ * Simple full-screen quad shader that displays the offscreen render target.
+ * Useful for debugging the offscreen rendering.
+ * Uses procedural vertices (no vertex buffer needed).
+ */
+
+#hina
+group Debug = 0;
+
+bindings(Debug, start=0) {
+  texture sampler2D u_texture;
+}
+
+struct Varyings {
+  vec2 uv;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+// Full-screen triangle vertex positions
+const vec2 positions[3] = vec2[](
+    vec2(-1.0, -1.0),
+    vec2( 3.0, -1.0),
+    vec2(-1.0,  3.0)
+);
+
+const vec2 uvs[3] = vec2[](
+    vec2(0.0, 0.0),
+    vec2(2.0, 0.0),
+    vec2(0.0, 2.0)
+);
+
+Varyings VSMain() {
+    Varyings out;
+    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
+    out.uv = uvs[gl_VertexIndex];
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+    FragOut out;
+    out.color = texture(u_texture, in.uv);
+    return out;
+}
+#hina_end

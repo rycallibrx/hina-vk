@@ -1,0 +1,85 @@
+/**
+ * GPU Frustum Culling Shader
+ *
+ * Compute shader that performs per-object frustum culling.
+ * Modifies draw command instance counts to cull invisible objects.
+ */
+
+#hina
+group Culling = 0;
+
+struct DrawCommand {
+  uint index_count;
+  uint instance_count;
+  uint first_index;
+  int vertex_offset;
+  uint first_instance;
+};
+
+struct ObjectData {
+  mat4 model;
+  mat4 normal;
+};
+
+struct ObjectBounds {
+  vec4 center_radius;
+};
+
+bindings(Culling, start=0) {
+  buffer(readonly) ObjectBuffer {
+    ObjectData objects[];
+  } object_buf;
+  buffer(readonly) BoundsBuffer {
+    ObjectBounds bounds_data[];
+  } bounds_buf;
+  buffer(readwrite) DrawCommands {
+    DrawCommand commands[];
+  } draw_cmds;
+  uniform(std140) CullingParams {
+    vec4 frustum_planes[6];
+    uint draw_count;
+    vec3 _pad0;
+  } params;
+}
+#hina_end
+
+#hina_stage compute entry CSMain
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+bool sphere_in_frustum(vec4 center_radius, vec4 planes[6]) {
+    vec3 c = center_radius.xyz;
+    float r = center_radius.w;
+    for (int i = 0; i < 6; ++i) {
+        vec4 p = planes[i];
+        float d = dot(p.xyz, c) + p.w;
+        if (d < -r) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void CSMain() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.draw_count) {
+        return;
+    }
+
+    DrawCommand cmd = draw_cmds.commands[idx];
+    uint obj_index = cmd.first_instance;
+
+    vec4 center_radius = bounds_buf.bounds_data[obj_index].center_radius;
+    mat4 model = object_buf.objects[obj_index].model;
+
+    vec4 world_center = model * vec4(center_radius.xyz, 1.0);
+    vec3 sx = vec3(model[0]);
+    vec3 sy = vec3(model[1]);
+    vec3 sz = vec3(model[2]);
+    float scale = max(length(sx), max(length(sy), length(sz)));
+    vec4 world_bounds = vec4(world_center.xyz, center_radius.w * scale);
+
+    bool visible = sphere_in_frustum(world_bounds, params.frustum_planes);
+    cmd.instance_count = visible ? 1u : 0u;
+    draw_cmds.commands[idx] = cmd;
+}
+#hina_end

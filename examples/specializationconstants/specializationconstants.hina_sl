@@ -1,0 +1,159 @@
+/**
+ * Specialization Constants shader
+ * Based on Sascha Willems' specializationconstants example
+ *
+ * Demonstrates using specialization constants to create shader variants
+ * from a single shader source. Different lighting models are selected
+ * at pipeline creation time without requiring shader recompilation.
+ */
+
+#hina
+group Scene = 0;
+
+bindings(Scene, start=0) {
+  uniform(std140) UBO {
+    mat4 projection;
+    mat4 model;
+    mat4 view;
+    vec4 light_pos;
+  } ubo;
+}
+
+// Specialization constants
+// constant_id = 0: Lighting model (0 = Phong, 1 = Toon, 2 = Textured)
+// constant_id = 1: Toon desaturation factor (0.0 = full color, 1.0 = grayscale)
+spec_const(0) int LIGHTING_MODEL = 0;
+spec_const(1) float PARAM_TOON_DESATURATION = 0.5;
+
+struct VertexIn {
+  vec3 a_position;
+  vec3 a_normal;
+  vec3 a_color;
+  vec2 a_uv;
+};
+
+struct Varyings {
+  vec3 normal;
+  vec3 color;
+  vec2 uv;
+  vec3 view_vec;
+  vec3 light_vec;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+
+    // Pass through color and UV
+    out.color = in.a_color;
+    out.uv = in.a_uv;
+
+    // Transform position through model-view
+    mat4 model_view = ubo.view * ubo.model;
+    vec4 view_pos = model_view * vec4(in.a_position, 1.0);
+
+    gl_Position = ubo.projection * view_pos;
+
+    // Transform normal to view space using normal matrix
+    mat3 normal_matrix = transpose(inverse(mat3(model_view)));
+    out.normal = normalize(normal_matrix * in.a_normal);
+
+    // Compute vectors for lighting in view space
+    vec3 light_pos_view = (ubo.view * ubo.light_pos).xyz;
+    out.light_vec = light_pos_view - view_pos.xyz;
+    out.view_vec = -view_pos.xyz;
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+vec3 phong_lighting(vec3 N, vec3 L, vec3 V, vec3 color) {
+    // Ambient
+    vec3 ambient = 0.1 * color;
+
+    // Diffuse
+    float diff = max(dot(N, L), 0.0);
+    vec3 diffuse = diff * color;
+
+    // Specular (Blinn-Phong)
+    vec3 H = normalize(L + V);
+    float spec = pow(max(dot(N, H), 0.0), 32.0);
+    vec3 specular = vec3(0.75) * spec;
+
+    return ambient + diffuse + specular;
+}
+
+vec3 toon_lighting(vec3 N, vec3 L, vec3 color) {
+    // Calculate intensity bands
+    float intensity = dot(N, L);
+    vec3 toon_color;
+
+    if (intensity > 0.98)
+        toon_color = color * 1.5;
+    else if (intensity > 0.9)
+        toon_color = color * 1.0;
+    else if (intensity > 0.5)
+        toon_color = color * 0.6;
+    else if (intensity > 0.25)
+        toon_color = color * 0.4;
+    else
+        toon_color = color * 0.2;
+
+    // Apply desaturation based on specialization constant
+    float gray = dot(toon_color, vec3(0.299, 0.587, 0.114));
+    return mix(toon_color, vec3(gray), PARAM_TOON_DESATURATION);
+}
+
+vec3 textured_lighting(vec3 N, vec3 L, vec3 V, vec3 color, vec2 uv) {
+    // Similar to phong but with texture-based modulation
+    // Since we don't have a texture sampler, we simulate a pattern
+    float pattern = sin(uv.x * 20.0) * sin(uv.y * 20.0);
+    pattern = pattern * 0.5 + 0.5;
+
+    vec3 tex_color = mix(color * 0.5, color, pattern);
+
+    // Ambient
+    vec3 ambient = 0.15 * tex_color;
+
+    // Diffuse
+    float diff = max(dot(N, L), 0.0);
+    vec3 diffuse = diff * tex_color;
+
+    // Specular
+    vec3 H = normalize(L + V);
+    float spec = pow(max(dot(N, H), 0.0), 16.0);
+    vec3 specular = vec3(0.5 * pattern) * spec;
+
+    return ambient + diffuse + specular;
+}
+
+FragOut FSMain(Varyings in) {
+    FragOut out;
+
+    vec3 N = normalize(in.normal);
+    vec3 L = normalize(in.light_vec);
+    vec3 V = normalize(in.view_vec);
+
+    vec3 final_color;
+
+    // Select lighting model based on specialization constant
+    if (LIGHTING_MODEL == 0) {
+        // Phong shading
+        final_color = phong_lighting(N, L, V, in.color);
+    } else if (LIGHTING_MODEL == 1) {
+        // Toon shading
+        final_color = toon_lighting(N, L, in.color);
+    } else {
+        // Textured shading
+        final_color = textured_lighting(N, L, V, in.color, in.uv);
+    }
+
+    out.color = vec4(final_color, 1.0);
+    return out;
+}
+#hina_end

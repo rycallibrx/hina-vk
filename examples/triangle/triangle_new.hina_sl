@@ -1,0 +1,49 @@
+// Triangle shader - HinaVK Example (New HSL Syntax)
+// Renders a colored triangle with MVP transformation
+
+#hina
+// Define bind group: Scene at set 0
+group Scene = 0;
+
+// Resources in Scene group
+bindings(Scene, start=0) {
+  uniform(std140) UBO {
+    mat4 projection;
+    mat4 model;
+    mat4 view;
+  } ubo;
+}
+
+// Vertex input struct
+struct VertexIn {
+  vec3 a_position;
+  vec3 a_color;
+};
+
+// Varyings: vertex-to-fragment interpolated data
+struct Varyings {
+  vec3 color;
+};
+
+// Fragment output
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+  Varyings out;
+  out.color = in.a_color;
+  gl_Position = ubo.projection * ubo.view * ubo.model * vec4(in.a_position, 1.0);
+  return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+  FragOut out;
+  out.color = vec4(in.color, 1.0);
+  return out;
+}
+#hina_end

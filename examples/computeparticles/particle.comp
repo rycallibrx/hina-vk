@@ -1,0 +1,72 @@
+// Compute shader for particle simulation
+// Based on Sascha Willems' computeparticles example
+
+struct Particle {
+    vec2 pos;
+    vec2 vel;
+    vec4 gradientPos;
+};
+
+layout(std140, binding = 0) readonly buffer ParticleSSBOIn {
+    Particle particlesIn[];
+};
+
+layout(std140, binding = 1) buffer ParticleSSBOOut {
+    Particle particlesOut[];
+};
+
+layout(local_size_x = 256) in;
+
+layout(binding = 2) uniform UBO {
+    float deltaT;
+    float destX;
+    float destY;
+    int particleCount;
+} ubo;
+
+vec2 attraction(vec2 pos, vec2 attractPos) {
+    vec2 delta = attractPos - pos;
+    const float damp = 0.5;
+    float dDampedDot = dot(delta, delta) + damp;
+    float invDist = 1.0 / sqrt(dDampedDot);
+    float invDistCubed = invDist * invDist * invDist;
+    return delta * invDistCubed * 0.0035;
+}
+
+vec2 repulsion(vec2 pos, vec2 attractPos) {
+    vec2 delta = attractPos - pos;
+    float targetDistance = sqrt(dot(delta, delta));
+    return delta * (1.0 / (targetDistance * targetDistance * targetDistance)) * -0.000035;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= ubo.particleCount)
+        return;
+
+    // Read position and velocity from previous frame
+    vec2 vVel = particlesIn[index].vel;
+    vec2 vPos = particlesIn[index].pos;
+    vec4 gPos = particlesIn[index].gradientPos;
+
+    vec2 destPos = vec2(ubo.destX, ubo.destY);
+
+    vVel += repulsion(vPos, destPos) * 0.05;
+
+    // Move by velocity
+    vPos += vVel * ubo.deltaT;
+
+    // Collide with boundary
+    if ((vPos.x < -1.0) || (vPos.x > 1.0) || (vPos.y < -1.0) || (vPos.y > 1.0)) {
+        vVel = (-vVel * 0.1) + attraction(vPos, destPos) * 12.0;
+    } else {
+        particlesOut[index].pos = vPos;
+    }
+
+    // Write back velocity and gradient
+    particlesOut[index].vel = vVel;
+    gPos.x += 0.02 * ubo.deltaT;
+    if (gPos.x > 1.0)
+        gPos.x -= 1.0;
+    particlesOut[index].gradientPos = gPos;
+}

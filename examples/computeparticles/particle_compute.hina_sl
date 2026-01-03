@@ -1,0 +1,84 @@
+/**
+ * Particle Compute Shader
+ *
+ * Simulates particle physics with attraction/repulsion.
+ * Double-buffered: reads from one SSBO, writes to another.
+ *
+ * Based on Sascha Willems' computeparticles example.
+ */
+
+#hina
+group Compute = 0;
+
+struct Particle {
+  vec2 pos;
+  vec2 vel;
+  vec4 gradientPos;
+};
+
+bindings(Compute, start=0) {
+  buffer(readonly) ParticleSSBOIn {
+    Particle particlesIn[];
+  } ssbo_in;
+  buffer(readwrite) ParticleSSBOOut {
+    Particle particlesOut[];
+  } ssbo_out;
+  uniform(std140) UBO {
+    float deltaT;
+    float destX;
+    float destY;
+    int particleCount;
+  } ubo;
+}
+#hina_end
+
+#hina_stage compute entry CSMain
+layout(local_size_x = 256) in;
+
+vec2 attraction(vec2 pos, vec2 attractPos) {
+    vec2 delta = attractPos - pos;
+    const float damp = 0.5;
+    float dDampedDot = dot(delta, delta) + damp;
+    float invDist = 1.0 / sqrt(dDampedDot);
+    float invDistCubed = invDist * invDist * invDist;
+    return delta * invDistCubed * 0.0035;
+}
+
+vec2 repulsion(vec2 pos, vec2 attractPos) {
+    vec2 delta = attractPos - pos;
+    float targetDistance = sqrt(dot(delta, delta));
+    return delta * (1.0 / (targetDistance * targetDistance * targetDistance)) * -0.000035;
+}
+
+void CSMain() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= uint(ubo.particleCount))
+        return;
+
+    // Read position and velocity from previous frame
+    vec2 vVel = ssbo_in.particlesIn[index].vel;
+    vec2 vPos = ssbo_in.particlesIn[index].pos;
+    vec4 gPos = ssbo_in.particlesIn[index].gradientPos;
+
+    vec2 destPos = vec2(ubo.destX, ubo.destY);
+
+    vVel += repulsion(vPos, destPos) * 0.05;
+
+    // Move by velocity
+    vPos += vVel * ubo.deltaT;
+
+    // Collide with boundary
+    if ((vPos.x < -1.0) || (vPos.x > 1.0) || (vPos.y < -1.0) || (vPos.y > 1.0)) {
+        vVel = (-vVel * 0.1) + attraction(vPos, destPos) * 12.0;
+    } else {
+        ssbo_out.particlesOut[index].pos = vPos;
+    }
+
+    // Write back velocity and gradient
+    ssbo_out.particlesOut[index].vel = vVel;
+    gPos.x += 0.02 * ubo.deltaT;
+    if (gPos.x > 1.0)
+        gPos.x -= 1.0;
+    ssbo_out.particlesOut[index].gradientPos = gPos;
+}
+#hina_end

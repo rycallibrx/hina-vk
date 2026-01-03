@@ -1,0 +1,75 @@
+apply plugin: 'com.android.application'
+
+android {
+    // TODO: Change to your example name (e.g., com.hinavk.descriptorsets)
+    namespace "com.hinavk.example"
+    compileSdk rootProject.ext.compileSdkVersion
+    ndkVersion rootProject.ext.ndkVersion
+
+    defaultConfig {
+        // TODO: Change to your example name
+        applicationId "com.hinavk.example"
+        minSdk rootProject.ext.minSdkVersion
+        targetSdk rootProject.ext.targetSdkVersion
+        versionCode 1
+        versionName "1.0"
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared",
+                          "-DANDROID_TOOLCHAIN=clang"
+                cppFlags "-std=c++17"
+            }
+        }
+
+        ndk {
+            abiFilters rootProject.ext.abiFilters as String[]
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+        }
+        debug {
+            debuggable true
+            jniDebuggable true
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java']
+            assets.srcDirs = ['src/main/assets']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+// TODO: Update the shader copy source path
+// Copy shaders from your example directory to assets before build
+task copyShaders(type: Copy) {
+    // Change this path to your example's shader location
+    from("${rootProject.ext.examplesDir}/triangle") {
+        include "*.hina_sl"
+    }
+    into "src/main/assets/shaders"
+}
+
+preBuild.dependsOn copyShaders
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+}

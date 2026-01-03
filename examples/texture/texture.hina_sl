@@ -1,0 +1,74 @@
+/**
+ * Texture Loading Example Shader
+ *
+ * Demonstrates basic texture mapping on a quad with lighting.
+ * Based on Sascha Willems texture example.
+ */
+
+#hina
+group Transforms = 0;
+group Material = 1;
+
+bindings(Transforms, start=0) {
+  uniform(std140) UBO {
+    mat4 projection;
+    mat4 model;
+    mat4 view;
+    vec4 view_pos;
+  } ubo;
+}
+
+bindings(Material, start=0) {
+  texture sampler2D u_texture;
+}
+
+struct VertexIn {
+  vec3 a_position;
+  vec2 a_uv;
+  vec3 a_normal;
+};
+
+struct Varyings {
+  vec2 uv;
+  vec3 normal;
+  vec3 view_vec;
+  vec3 light_vec;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+    out.uv = in.a_uv;
+
+    vec3 world_pos = vec3(ubo.model * vec4(in.a_position, 1.0));
+    gl_Position = ubo.projection * ubo.view * vec4(world_pos, 1.0);
+
+    vec4 pos = ubo.model * vec4(in.a_position, 1.0);
+    out.normal = mat3(ubo.model) * in.a_normal;
+
+    // Light at camera position for good illumination
+    out.light_vec = ubo.view_pos.xyz - pos.xyz;
+    out.view_vec = ubo.view_pos.xyz - pos.xyz;
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+    FragOut out;
+    // Sample texture
+    // The texture has different solid colors per mip level:
+    // Mip 0: Red, Mip 1: Orange, Mip 2: Yellow, Mip 3: Green,
+    // Mip 4: Cyan, Mip 5: Blue, Mip 6: Purple, Mip 7: Magenta, Mip 8: White
+    vec4 color = texture(u_texture, in.uv);
+
+    // Output raw texture color - shows which mip level the GPU sampled
+    out.color = color;
+    return out;
+}
+#hina_end

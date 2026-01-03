@@ -1,0 +1,81 @@
+/**
+ * G-Buffer Fill Shader
+ *
+ * Writes world-space position, normal, and albedo color to separate
+ * render targets (MRT - Multiple Render Targets).
+ *
+ * Output attachments:
+ *   0: Position (RGB16F) - World-space position
+ *   1: Normal (RGB16F) - World-space normal
+ *   2: Albedo (RGBA8) - Surface color
+ */
+
+#hina
+group Scene = 0;
+
+bindings(Scene, start=0) {
+  uniform(std140) UBO {
+    mat4 projection;
+    mat4 view;
+  } ubo;
+}
+
+push_constant PushConstants {
+  mat4 model;
+  vec4 color_override;  // w > 0 means use this color (as emissive)
+} pc;
+
+struct VertexIn {
+  vec3 a_position;
+  vec3 a_normal;
+  vec3 a_color;
+};
+
+struct Varyings {
+  vec3 world_pos;
+  vec3 normal;
+  vec3 color;
+};
+
+struct FragOut {
+  vec4 position;
+  vec4 normal;
+  vec4 albedo;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+
+    vec4 world_pos = pc.model * vec4(in.a_position, 1.0);
+    out.world_pos = world_pos.xyz;
+
+    // Transform normal to world space
+    mat3 normal_matrix = transpose(inverse(mat3(pc.model)));
+    out.normal = normalize(normal_matrix * in.a_normal);
+
+    // Use color override if w > 0, otherwise use vertex color
+    out.color = (pc.color_override.w > 0.0) ? pc.color_override.rgb * pc.color_override.w : in.a_color;
+
+    gl_Position = ubo.projection * ubo.view * world_pos;
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+    FragOut out;
+
+    // Use albedo alpha to mark emissive geometry (color.r > 1.0 means emissive)
+    // Emissive flag stored in normal.w (0 = normal, 1 = emissive)
+    float maxColor = max(in.color.r, max(in.color.g, in.color.b));
+    float emissive = (maxColor > 1.5) ? 1.0 : 0.0;
+
+    out.position = vec4(in.world_pos, 1.0);
+    out.normal = vec4(normalize(in.normal), emissive);
+    // For emissive, store the normalized color so composition can use it
+    out.albedo = vec4(emissive > 0.5 ? in.color / maxColor : in.color, 1.0);
+    return out;
+}
+#hina_end

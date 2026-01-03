@@ -1,0 +1,201 @@
+/**
+ * PBR Shader
+ *
+ * Physically Based Rendering with shadow mapping.
+ * Uses SSBO for instanced object data and multiple material textures.
+ */
+
+#hina
+group Scene = 0;
+group Material = 1;
+group Object = 2;
+
+struct ObjectData {
+  mat4 model;
+  mat4 normal;
+};
+
+bindings(Scene, start=0) {
+  uniform(std140) SceneUBO {
+    mat4 view;
+    mat4 proj;
+    mat4 view_proj;
+    mat4 light_view_proj;
+    vec4 camera_pos;
+    vec4 light_dir;
+    vec4 light_color;
+    vec4 ambient_color;
+  } scene;
+  texture sampler2DShadow u_shadow_map;
+}
+
+bindings(Object, start=0) {
+  buffer(readonly) ObjectBuffer {
+    ObjectData objects[];
+  } object_buf;
+}
+
+bindings(Material, start=0) {
+  texture sampler2D u_base_color;
+  texture sampler2D u_normal;
+  texture sampler2D u_metallic_roughness;
+  texture sampler2D u_occlusion;
+  texture sampler2D u_emissive;
+  uniform(std140) MaterialUBO {
+    vec4 base_color_factor;
+    vec4 emissive_factor;
+    vec4 mrno;       // x=metallic, y=roughness, z=normal_scale, w=occlusion_strength
+    vec4 alpha_flags; // x=alpha_cutoff, y=alpha_mode, z=double_sided
+  } material;
+}
+
+struct VertexIn {
+  vec3 a_position;
+  vec3 a_normal;
+  vec4 a_tangent;
+  vec2 a_uv;
+};
+
+struct Varyings {
+  vec3 world_pos;
+  vec3 normal;
+  vec2 uv;
+  vec4 tangent;
+  vec4 shadow_coord;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+
+    uint obj_index = gl_InstanceIndex;
+    mat4 model = object_buf.objects[obj_index].model;
+    mat4 normal_m = object_buf.objects[obj_index].normal;
+    vec4 world = model * vec4(in.a_position, 1.0);
+
+    out.world_pos = world.xyz;
+    out.normal = normalize(mat3(normal_m) * in.a_normal);
+    out.tangent = vec4(normalize(mat3(model) * in.a_tangent.xyz), in.a_tangent.w);
+    out.uv = in.a_uv;
+    out.shadow_coord = scene.light_view_proj * world;
+
+    gl_Position = scene.view_proj * world;
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+const float PI = 3.14159265359;
+
+vec3 srgb_to_linear(vec3 c) {
+    return pow(c, vec3(2.2));
+}
+
+vec3 linear_to_srgb(vec3 c) {
+    return pow(c, vec3(1.0 / 2.2));
+}
+
+float D_GGX(float NdotH, float roughness) {
+    float a = roughness * roughness;
+    float a2 = a * a;
+    float denom = (NdotH * NdotH) * (a2 - 1.0) + 1.0;
+    return a2 / (PI * denom * denom);
+}
+
+float G_SchlickGGX(float NdotV, float k) {
+    return NdotV / (NdotV * (1.0 - k) + k);
+}
+
+float G_Smith(float NdotV, float NdotL, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    float ggx1 = G_SchlickGGX(NdotV, k);
+    float ggx2 = G_SchlickGGX(NdotL, k);
+    return ggx1 * ggx2;
+}
+
+vec3 F_Schlick(float cosTheta, vec3 F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+float shadow_sample(vec4 shadow_coord, float bias) {
+    vec3 proj = shadow_coord.xyz / shadow_coord.w;
+    vec2 uv = proj.xy * 0.5 + 0.5;
+    float depth = proj.z;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        return 1.0;
+    }
+    return texture(u_shadow_map, vec3(uv, depth - bias));
+}
+
+FragOut FSMain(Varyings in) {
+    FragOut out;
+
+    vec4 base = texture(u_base_color, in.uv);
+    vec3 albedo = srgb_to_linear(base.rgb) * material.base_color_factor.rgb;
+    float alpha = base.a * material.base_color_factor.a;
+
+    if (material.alpha_flags.y > 0.5 && alpha < material.alpha_flags.x) {
+        discard;
+    }
+
+    vec3 N = normalize(in.normal);
+    vec3 T = normalize(in.tangent.xyz);
+    vec3 B = cross(N, T) * in.tangent.w;
+    mat3 TBN = mat3(T, B, N);
+
+    vec3 nmap = texture(u_normal, in.uv).xyz * 2.0 - 1.0;
+    nmap.xy *= material.mrno.z;
+    N = normalize(TBN * nmap);
+
+    vec4 mr = texture(u_metallic_roughness, in.uv);
+    float metallic = mr.b * material.mrno.x;
+    float roughness = mr.g * material.mrno.y;
+    roughness = clamp(roughness, 0.04, 1.0);
+
+    float ao = texture(u_occlusion, in.uv).r * material.mrno.w;
+    vec3 emissive = srgb_to_linear(texture(u_emissive, in.uv).rgb) * material.emissive_factor.rgb;
+
+    vec3 V = normalize(scene.camera_pos.xyz - in.world_pos);
+    vec3 L = normalize(-scene.light_dir.xyz);
+    vec3 H = normalize(V + L);
+
+    float NdotL = max(dot(N, L), 0.0);
+    float NdotV = max(dot(N, V), 0.0);
+    float NdotH = max(dot(N, H), 0.0);
+    float HdotV = max(dot(H, V), 0.0);
+
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+    vec3 F = F_Schlick(HdotV, F0);
+    float D = D_GGX(NdotH, roughness);
+    float G = G_Smith(NdotV, NdotL, roughness);
+
+    vec3 numerator = D * G * F;
+    float denom = 4.0 * max(NdotV, 0.0) * max(NdotL, 0.0) + 1e-4;
+    vec3 specular = numerator / denom;
+
+    vec3 kS = F;
+    vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
+    vec3 diffuse = kD * albedo / PI;
+
+    float bias = max(0.001 * (1.0 - NdotL), 0.0005);
+    float shadow = shadow_sample(in.shadow_coord, bias);
+
+    vec3 light = scene.light_color.rgb * scene.light_color.w;
+    vec3 Lo = (diffuse + specular) * light * NdotL * shadow;
+
+    vec3 ambient = scene.ambient_color.rgb * albedo * ao;
+    vec3 color = ambient + Lo + emissive;
+
+    color = color / (color + vec3(1.0));
+    color = linear_to_srgb(color);
+
+    out.color = vec4(color, alpha);
+    return out;
+}
+#hina_end

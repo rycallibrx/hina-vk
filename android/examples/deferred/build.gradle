@@ -1,0 +1,81 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace "com.hinavk.deferred"
+    compileSdk rootProject.ext.compileSdkVersion
+    ndkVersion rootProject.ext.ndkVersion
+
+    defaultConfig {
+        applicationId "com.hinavk.deferred"
+        minSdk rootProject.ext.minSdkVersion
+        targetSdk rootProject.ext.targetSdkVersion
+        versionCode 1
+        versionName "1.0"
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared",
+                          "-DANDROID_TOOLCHAIN=clang"
+                cppFlags "-std=c++17"
+            }
+        }
+
+        ndk {
+            abiFilters rootProject.ext.abiFilters as String[]
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+            signingConfig signingConfigs.debug
+        }
+        debug {
+            debuggable true
+            jniDebuggable true
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java']
+            assets.srcDirs = ['src/main/assets']
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+// Copy shaders from example directory to assets
+task copyShaders(type: Copy) {
+    from("${rootProject.ext.examplesDir}/deferred") {
+        include "*.hina_sl"
+    }
+    into "src/main/assets/shaders"
+}
+
+// Copy textures if they exist
+task copyTextures(type: Copy) {
+    from("${rootProject.ext.examplesDir}/deferred/textures") {
+        include "**/*"
+    }
+    into "src/main/assets/textures"
+}
+
+preBuild.dependsOn copyShaders
+preBuild.dependsOn copyTextures
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+}

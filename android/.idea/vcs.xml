@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$/.." vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/SDL2" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/SPIRV-Headers" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/SPIRV-Reflect" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/SPIRV-Reflect/third_party/googletest" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/SPIRV-Tools" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/Vulkan-Headers" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/VulkanMemoryAllocator" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/glm" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/glslang" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/imgui" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/ktx" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/ktx/tests/cts" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/tinygltf" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/tracy" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/../third_party/volk" vcs="Git" />
+  </component>
+</project>
