@@ -4977,6 +4977,62 @@ static uint32_t hina_count_bind_group_layouts(const hina_bind_group_layout layou
   return count;
 }
 
+/**
+ * @brief Count subpasses in a tile pass layout (for pipeline creation).
+ *
+ * Empty subpass terminator: color_count == 0 && input_count == 0 && depth_format == UNDEFINED.
+ * Validates no sparse subpasses in debug mode.
+ */
+static uint32_t hina_count_tile_subpasses_layout(const hina_tile_pass_layout* layout)
+{
+  if (!layout) return 0;
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < HINA_MAX_TILE_SUBPASSES; i++) {
+    const hina_tile_subpass_layout* sp = &layout->subpasses[i];
+    // Empty subpass: no color outputs, no tile inputs, no depth
+    if (sp->color_count == 0 && sp->input_count == 0 && sp->depth_format == HINA_FORMAT_UNDEFINED) break;
+    count++;
+  }
+#if HINA_DEBUG
+  // Validate no sparse subpasses: subpasses after first empty must all be empty
+  for (uint32_t i = count; i < HINA_MAX_TILE_SUBPASSES; i++) {
+    const hina_tile_subpass_layout* sp = &layout->subpasses[i];
+    HINA_ASSERTF(sp->color_count == 0 && sp->input_count == 0 && sp->depth_format == HINA_FORMAT_UNDEFINED,
+                 "Sparse tile subpasses not supported: found non-empty subpass at index %u after empty at index %u",
+                 i, count);
+  }
+#endif
+  return count;
+}
+
+/**
+ * @brief Count subpasses in a tile pass descriptor (for runtime).
+ *
+ * Empty subpass terminator: color_count == 0 && tile_input_count == 0 && has_depth == false.
+ * Validates no sparse subpasses in debug mode.
+ */
+static uint32_t hina_count_tile_subpasses_desc(const hina_tile_pass_desc* desc)
+{
+  if (!desc) return 0;
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < HINA_MAX_TILE_SUBPASSES; i++) {
+    const hina_tile_subpass* sp = &desc->subpasses[i];
+    // Empty subpass: no color outputs, no tile inputs, no depth
+    if (sp->color_count == 0 && sp->tile_input_count == 0 && !sp->has_depth) break;
+    count++;
+  }
+#if HINA_DEBUG
+  // Validate no sparse subpasses: subpasses after first empty must all be empty
+  for (uint32_t i = count; i < HINA_MAX_TILE_SUBPASSES; i++) {
+    const hina_tile_subpass* sp = &desc->subpasses[i];
+    HINA_ASSERTF(sp->color_count == 0 && sp->tile_input_count == 0 && !sp->has_depth,
+                 "Sparse tile subpasses not supported: found non-empty subpass at index %u after empty at index %u",
+                 i, count);
+  }
+#endif
+  return count;
+}
+
 static const uint8_t g_hina_format_size[HINA_FORMAT_ASTC_12x12_SRGB_BLOCK + 1] = {
   [HINA_FORMAT_R8_UNORM] = 1, [HINA_FORMAT_R8_SNORM] = 1, [HINA_FORMAT_R8_UINT] = 1, [HINA_FORMAT_R8_SINT] = 1,
   [HINA_FORMAT_S8_UINT] = 1, [HINA_FORMAT_R8G8_UNORM] = 2, [HINA_FORMAT_R8G8_SNORM] = 2, [HINA_FORMAT_R8G8_UINT] = 2,
@@ -5874,12 +5930,13 @@ static HINA_INLINE VkAttachmentStoreOp hina_store_op_to_vk(hina_store_op op)
 static void hina_validate_tile_pass_desc(const hina_tile_pass_desc* desc)
 {
   HINA_ASSERT(desc);
-  HINA_ASSERTF(desc->subpass_count > 0 && desc->subpass_count <= HINA_MAX_TILE_SUBPASSES,
-               "tile_pass_desc subpass_count out of range: %u (max %u)", desc->subpass_count, HINA_MAX_TILE_SUBPASSES);
-  const uint32_t last_sp = desc->subpass_count - 1;
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
+  HINA_ASSERTF(subpass_count > 0 && subpass_count <= HINA_MAX_TILE_SUBPASSES,
+               "tile_pass_desc subpass_count out of range: %u (max %u)", subpass_count, HINA_MAX_TILE_SUBPASSES);
+  const uint32_t last_sp = subpass_count - 1;
   VkSampleCountFlagBits pass_samples = VK_SAMPLE_COUNT_1_BIT;
   bool pass_samples_set = false;
-  for (uint32_t sp = 0; sp < desc->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* subpass = &desc->subpasses[sp];
     HINA_ASSERTF(subpass->color_count <= HINA_MAX_COLOR_ATTACHMENTS,
@@ -5953,9 +6010,10 @@ static void hina_validate_tile_pass_desc(const hina_tile_pass_desc* desc)
 static void hina_validate_tile_pass_layout(const hina_tile_pass_layout* layout)
 {
   HINA_ASSERT(layout);
-  if (layout->subpass_count == 0) return;
-  HINA_ASSERTF(layout->subpass_count <= HINA_MAX_TILE_SUBPASSES,
-               "tile_pass_layout subpass_count out of range: %u (max %u)", layout->subpass_count,
+  const uint32_t subpass_count = hina_count_tile_subpasses_layout(layout);
+  if (subpass_count == 0) return;
+  HINA_ASSERTF(subpass_count <= HINA_MAX_TILE_SUBPASSES,
+               "tile_pass_layout subpass_count out of range: %u (max %u)", subpass_count,
                HINA_MAX_TILE_SUBPASSES);
   uint32_t sample_mask = (uint32_t)layout->samples;
   if (sample_mask != 0)
@@ -5964,8 +6022,8 @@ static void hina_validate_tile_pass_layout(const hina_tile_pass_layout* layout)
                  (unsigned)layout->samples);
   }
   const bool has_msaa = layout->samples != 0 && layout->samples != HINA_SAMPLE_COUNT_1_BIT;
-  const uint32_t last_sp = layout->subpass_count - 1;
-  for (uint32_t sp = 0; sp < layout->subpass_count; sp++)
+  const uint32_t last_sp = subpass_count - 1;
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass_layout* subpass = &layout->subpasses[sp];
     HINA_ASSERTF(subpass->color_count <= HINA_MAX_COLOR_ATTACHMENTS,
@@ -6003,7 +6061,7 @@ static void hina_validate_tile_pass_layout(const hina_tile_pass_layout* layout)
   }
   if (!has_msaa)
   {
-    for (uint32_t sp = 0; sp < layout->subpass_count; sp++)
+    for (uint32_t sp = 0; sp < subpass_count; sp++)
     {
       const hina_tile_subpass_layout* subpass = &layout->subpasses[sp];
       for (uint32_t c = 0; c < subpass->color_count; c++)
@@ -6016,15 +6074,16 @@ static void hina_validate_tile_pass_layout(const hina_tile_pass_layout* layout)
 }
 #endif
 // FNV-1a hash for tile render pass cache key
-static uint64_t hina_tile_rp_cache_key(const hina_tile_pass_desc* desc, const VkFormat* color_fmts,
+static uint64_t hina_tile_rp_cache_key(const hina_tile_pass_desc* desc, uint32_t subpass_count,
+                                       const VkFormat* color_fmts,
                                        // [sp][c] = [sp * HINA_MAX_COLOR_ATTACHMENTS + c]
                                        const VkSampleCountFlagBits* color_samples, const VkFormat* resolve_fmts,
                                        VkFormat depth_fmt, VkSampleCountFlagBits depth_samples)
 {
   uint64_t h = 0xcbf29ce484222325ULL;
 #define FNV_MIX(v) do { h ^= (uint64_t)(v); h *= 0x100000001b3ULL; } while(0)
-  FNV_MIX(desc->subpass_count);
-  for (uint32_t sp = 0; sp < desc->subpass_count; sp++)
+  FNV_MIX(subpass_count);
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* s = &desc->subpasses[sp];
     FNV_MIX(s->color_count);
@@ -6062,13 +6121,14 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
 static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, const hina_tile_pass_desc* desc)
 {
   hina_device* dev = ctx->core.device;
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   VkFormat color_fmts[HINA_MAX_TILE_SUBPASSES * HINA_MAX_COLOR_ATTACHMENTS] = {VK_FORMAT_UNDEFINED};
   VkSampleCountFlagBits color_samples[HINA_MAX_TILE_SUBPASSES * HINA_MAX_COLOR_ATTACHMENTS] = {(VkSampleCountFlagBits)0};
   VkFormat resolve_fmts[HINA_MAX_TILE_SUBPASSES * HINA_MAX_COLOR_ATTACHMENTS] = {VK_FORMAT_UNDEFINED};
   VkFormat depth_fmt = VK_FORMAT_UNDEFINED;
   VkSampleCountFlagBits depth_samples = VK_SAMPLE_COUNT_1_BIT;
-  const uint32_t last_sp = desc->subpass_count - 1;
-  for (uint32_t sp = 0; sp < desc->subpass_count; sp++)
+  const uint32_t last_sp = subpass_count - 1;
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* s = &desc->subpasses[sp];
     for (uint32_t c = 0; c < s->color_count; c++)
@@ -6098,7 +6158,7 @@ static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, c
       depth_samples = (VkSampleCountFlagBits)hot->samples;
     }
   }
-  uint64_t key = hina_tile_rp_cache_key(desc, color_fmts, color_samples, resolve_fmts, depth_fmt, depth_samples);
+  uint64_t key = hina_tile_rp_cache_key(desc, subpass_count, color_fmts, color_samples, resolve_fmts, depth_fmt, depth_samples);
   uint64_t frame = ctx->frame.frame_index;
   // Use unified rp cache
   hina_rp_cache_table* table = hina_atomic_load_ptr(&dev->core.backend.legacy.rp.table);
@@ -6107,7 +6167,7 @@ static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, c
     for (uint32_t i = 0; i < HINA_RP_CACHE_SIZE; i++)
     {
       hina_rp_cache_entry* e = &table->entries[i];
-      if (e->rp && e->key == key && e->subpass_count == desc->subpass_count)
+      if (e->rp && e->key == key && e->subpass_count == subpass_count)
       {
         if (frame - e->last_used >= 8) e->last_used = frame;
         return e->rp;
@@ -6121,7 +6181,7 @@ static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, c
     for (uint32_t i = 0; i < HINA_RP_CACHE_SIZE; i++)
     {
       hina_rp_cache_entry* e = &table->entries[i];
-      if (e->rp && e->key == key && e->subpass_count == desc->subpass_count)
+      if (e->rp && e->key == key && e->subpass_count == subpass_count)
       {
         e->last_used = frame;
         mtx_unlock(&dev->lock.legacy_cache_lock);
@@ -6161,7 +6221,7 @@ static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, c
   table->entries[slot].key = key;
   table->entries[slot].rp = rp;
   table->entries[slot].last_used = frame;
-  table->entries[slot].subpass_count = (uint8_t)desc->subpass_count;
+  table->entries[slot].subpass_count = (uint8_t)subpass_count;
   if (table->count < HINA_RP_CACHE_SIZE) table->count++;
   if (old_rp)
     HINA_DEFER_DESTROY_RENDER_PASS(ctx, old_rp);
@@ -6173,6 +6233,7 @@ static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, c
 // Attachments from subpass 0 can be used as input attachments in later subpasses
 static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const hina_tile_pass_desc* desc)
 {
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   // Maximum attachments: colors per subpass + resolves for last subpass + 1 depth
   VkAttachmentDescription attachments[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES + HINA_MAX_COLOR_ATTACHMENTS
     + 1];
@@ -6182,12 +6243,12 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
   uint32_t subpass_resolve_indices[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   uint32_t subpass_color_counts[HINA_MAX_TILE_SUBPASSES] = {0};
   bool subpass_has_resolve[HINA_MAX_TILE_SUBPASSES] = {0};
-  const uint32_t last_sp = desc->subpass_count - 1;
+  const uint32_t last_sp = subpass_count - 1;
   int32_t depth_att_idx = -1;
   VkFormat depth_format = VK_FORMAT_UNDEFINED;
   VkSampleCountFlagBits depth_samples = VK_SAMPLE_COUNT_1_BIT;
   // First pass: collect all color attachments from all subpasses
-  for (uint32_t sp = 0; sp < desc->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* subpass = &desc->subpasses[sp];
     subpass_color_counts[sp] = subpass->color_count;
@@ -6279,7 +6340,7 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
   VkAttachmentReference resolve_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS];
   VkAttachmentReference depth_refs[HINA_MAX_TILE_SUBPASSES];
-  for (uint32_t sp = 0; sp < desc->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* sp_desc = &desc->subpasses[sp];
     // Color attachment references
@@ -6342,7 +6403,7 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
     .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT
   };
   // Subpass N -> Subpass N+1 dependencies
-  for (uint32_t sp = 1; sp < desc->subpass_count; sp++)
+  for (uint32_t sp = 1; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* prev_subpass = &desc->subpasses[sp - 1];
     const hina_tile_subpass* next_subpass = &desc->subpasses[sp];
@@ -6368,7 +6429,7 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
   // Last subpass -> External (synchronize writes before presentation/next pass)
   // Match Sascha Willems' pattern: include READ access for blending, MEMORY_READ for external
   {
-    const hina_tile_subpass* last = &desc->subpasses[desc->subpass_count - 1];
+    const hina_tile_subpass* last = &desc->subpasses[subpass_count - 1];
     VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     if (last->has_depth)
@@ -6377,14 +6438,14 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
       src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     }
     dependencies[dep_count++] = (VkSubpassDependency){
-      .srcSubpass = desc->subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = src_stage,
+      .srcSubpass = subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = src_stage,
       .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, .srcAccessMask = src_access,
       .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT, .dependencyFlags = 0 // No BY_REGION for external
     };
   }
   const VkRenderPassCreateInfo rp_info = {
     .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = att_count, .pAttachments = attachments,
-    .subpassCount = desc->subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
+    .subpassCount = subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
     .pDependencies = dependencies
   };
   VkRenderPass render_pass = VK_NULL_HANDLE;
@@ -6393,7 +6454,7 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
   if (render_pass != VK_NULL_HANDLE)
   {
     hina_set_object_namef(ctx, (uint64_t)render_pass, VK_OBJECT_TYPE_RENDER_PASS,
-                          "hina_tile_render_pass_subpasses=%u_attachments=%u", desc->subpass_count, att_count);
+                          "hina_tile_render_pass_subpasses=%u_attachments=%u", subpass_count, att_count);
   }
   return render_pass;
 }
@@ -6426,6 +6487,7 @@ typedef struct hina_tile_template_override
 static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx, const hina_tile_pass_layout* layout,
                                                                const hina_tile_template_override* override)
 {
+  const uint32_t subpass_count = hina_count_tile_subpasses_layout(layout);
   // Maximum attachments: colors per subpass + resolves for last subpass + 1 depth
   VkAttachmentDescription attachments[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES + HINA_MAX_COLOR_ATTACHMENTS
     + 1];
@@ -6434,11 +6496,11 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
   uint32_t subpass_color_indices[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   uint32_t subpass_resolve_indices[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   bool subpass_has_resolve[HINA_MAX_TILE_SUBPASSES] = {0};
-  const uint32_t last_sp = layout->subpass_count - 1;
+  const uint32_t last_sp = subpass_count - 1;
   int32_t depth_att_idx = -1;
   VkFormat depth_format = VK_FORMAT_UNDEFINED;
   // First pass: collect all color attachments from all subpasses
-  for (uint32_t sp = 0; sp < layout->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass_layout* sub = &layout->subpasses[sp];
     // Determine formats for this subpass - use override if provided for this subpass
@@ -6516,7 +6578,7 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
   VkAttachmentReference resolve_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS];
   VkAttachmentReference depth_refs[HINA_MAX_TILE_SUBPASSES];
-  for (uint32_t sp = 0; sp < layout->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass_layout* sub = &layout->subpasses[sp];
     // Determine counts for this subpass - use override if provided for this subpass
@@ -6585,7 +6647,7 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
   };
   // Subpass N -> Subpass N+1 dependencies
   // Must match hina_legacy_make_tile_render_pass() exactly for render pass compatibility
-  for (uint32_t sp = 1; sp < layout->subpass_count; sp++)
+  for (uint32_t sp = 1; sp < subpass_count; sp++)
   {
     const hina_tile_subpass_layout* prev_subpass = &layout->subpasses[sp - 1];
     const hina_tile_subpass_layout* next_subpass = &layout->subpasses[sp];
@@ -6611,7 +6673,7 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
   // Last subpass -> External (synchronize writes before presentation/next pass)
   // Match Sascha Willems' pattern: include READ access for blending, MEMORY_READ for external
   {
-    const hina_tile_subpass_layout* last = &layout->subpasses[layout->subpass_count - 1];
+    const hina_tile_subpass_layout* last = &layout->subpasses[subpass_count - 1];
     VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     if (last->depth_format != HINA_FORMAT_UNDEFINED)
@@ -6620,14 +6682,14 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
       src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     }
     dependencies[dep_count++] = (VkSubpassDependency){
-      .srcSubpass = layout->subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = src_stage,
+      .srcSubpass = subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = src_stage,
       .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, .srcAccessMask = src_access,
       .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT, .dependencyFlags = 0 // No BY_REGION for external
     };
   }
   const VkRenderPassCreateInfo rp_info = {
     .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = att_count, .pAttachments = attachments,
-    .subpassCount = layout->subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
+    .subpassCount = subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
     .pDependencies = dependencies
   };
   VkRenderPass render_pass = VK_NULL_HANDLE;
@@ -6636,7 +6698,7 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
   if (render_pass != VK_NULL_HANDLE)
   {
     hina_set_object_namef(ctx, (uint64_t)render_pass, VK_OBJECT_TYPE_RENDER_PASS,
-                          "hina_tile_template_render_pass_subpasses=%u", layout->subpass_count);
+                          "hina_tile_template_render_pass_subpasses=%u", subpass_count);
   }
   return render_pass;
 }
@@ -6652,14 +6714,15 @@ static VkRenderPass hina_legacy_get_cached_tile_template_render_pass(hina_contex
                                                                      const hina_tile_template_override* override)
 {
   hina_device* dev = ctx->core.device;
+  const uint32_t subpass_count = hina_count_tile_subpasses_layout(layout);
   // Build cache key from layout (use FNV-1a for consistency)
   uint64_t key = 0xcbf29ce484222325ULL;
 #define FNV_MIX(v) do { key ^= (uint64_t)(v); key *= 0x100000001b3ULL; } while(0)
   // Mark as template to avoid collision with runtime tile pass keys
   FNV_MIX(0xFFFFFFFFu); // Template marker
-  FNV_MIX(layout->subpass_count);
+  FNV_MIX(subpass_count);
   FNV_MIX(layout->samples);
-  for (uint32_t sp = 0; sp < layout->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass_layout* sub = &layout->subpasses[sp];
     // Use override for the target subpass
@@ -6690,7 +6753,7 @@ static VkRenderPass hina_legacy_get_cached_tile_template_render_pass(hina_contex
     for (uint32_t i = 0; i < HINA_RP_CACHE_SIZE; i++)
     {
       hina_rp_cache_entry* e = &table->entries[i];
-      if (e->rp && e->key == key && e->subpass_count == layout->subpass_count) return e->rp;
+      if (e->rp && e->key == key && e->subpass_count == subpass_count) return e->rp;
     }
   }
   mtx_lock(&dev->lock.legacy_cache_lock);
@@ -6700,7 +6763,7 @@ static VkRenderPass hina_legacy_get_cached_tile_template_render_pass(hina_contex
     for (uint32_t i = 0; i < HINA_RP_CACHE_SIZE; i++)
     {
       hina_rp_cache_entry* e = &table->entries[i];
-      if (e->rp && e->key == key && e->subpass_count == layout->subpass_count)
+      if (e->rp && e->key == key && e->subpass_count == subpass_count)
       {
         mtx_unlock(&dev->lock.legacy_cache_lock);
         return e->rp;
@@ -6739,7 +6802,7 @@ static VkRenderPass hina_legacy_get_cached_tile_template_render_pass(hina_contex
   table->entries[slot].key = key;
   table->entries[slot].rp = rp;
   table->entries[slot].last_used = ctx->frame.frame_index;
-  table->entries[slot].subpass_count = (uint8_t)layout->subpass_count;
+  table->entries[slot].subpass_count = (uint8_t)subpass_count;
   if (table->count < HINA_RP_CACHE_SIZE) table->count++;
   if (old_rp)
     HINA_DEFER_DESTROY_RENDER_PASS(ctx, old_rp);
@@ -6749,8 +6812,9 @@ static VkRenderPass hina_legacy_get_cached_tile_template_render_pass(hina_contex
 
 static uint32_t hina_tile_count_total_attachments(const hina_tile_pass_layout* layout)
 {
+  const uint32_t subpass_count = hina_count_tile_subpasses_layout(layout);
   uint32_t total = 0;
-  for (uint32_t sp = 0; sp < layout->subpass_count; sp++) total += layout->subpasses[sp].color_count;
+  for (uint32_t sp = 0; sp < subpass_count; sp++) total += layout->subpasses[sp].color_count;
   return total;
 }
 
@@ -13254,13 +13318,14 @@ static void hina_log_pipeline_creation_feedback(hina_context* ctx, const char* p
 static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_pipeline_desc* desc)
 {
   HINA_ASSERT(desc);
+  const uint32_t tile_subpass_count = desc->tile_layout ? hina_count_tile_subpasses_layout(desc->tile_layout) : 0;
 #ifdef HINA_DEBUG
-  if (desc->tile_layout && desc->tile_layout->subpass_count > 0)
+  if (tile_subpass_count > 0)
   {
     hina_validate_tile_pass_layout(desc->tile_layout);
-    HINA_ASSERTF(desc->subpass_index < desc->tile_layout->subpass_count,
+    HINA_ASSERTF(desc->subpass_index < tile_subpass_count,
                  "pipeline subpass_index out of range: %u (subpass_count=%u)", desc->subpass_index,
-                 desc->tile_layout->subpass_count);
+                 tile_subpass_count);
   }
 #endif
   // Validate required shaders (VS and FS must have valid SPIR-V)
@@ -13690,8 +13755,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   VkRenderingInputAttachmentIndexInfo dyn_input_att_info = {
     .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO
   };
-  const bool use_dyn_local_read = desc->tile_layout && desc->tile_layout->subpass_count > 0 && g_device_caps.
-    has_dynamic_rendering_local_read;
+  const bool use_dyn_local_read = tile_subpass_count > 0 && g_device_caps.has_dynamic_rendering_local_read;
   // For dynamic local read: colorAttachmentCount must equal total attachments in rendering
   // Unused attachments get VK_FORMAT_UNDEFINED
   VkFormat dyn_local_read_formats[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
@@ -13774,14 +13838,14 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   // Use legacy VkRenderPass when:
   // 1. Dynamic rendering is not available (!vkCmdBeginRendering), OR
   // 2. This is a tile pass pipeline and dynamic_rendering_local_read is disabled
-  const bool need_legacy_rp = !vkCmdBeginRendering || (desc->tile_layout && desc->tile_layout->subpass_count > 0 && !
+  const bool need_legacy_rp = !vkCmdBeginRendering || (tile_subpass_count > 0 && !
     g_device_caps.has_dynamic_rendering_local_read);
   if (need_legacy_rp)
   {
     VkRenderPass rp = VK_NULL_HANDLE;
     // For tile pass pipelines (subpass_index > 0 or tile_layout provided),
     // use the tile template render pass for proper subpass structure
-    if (desc->tile_layout && desc->tile_layout->subpass_count > 0)
+    if (tile_subpass_count > 0)
     {
       // Build format override from pipeline desc - this allows users to skip
       // specifying formats in tile_layout for the current subpass
@@ -14414,13 +14478,14 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
                                              hina_hsl_cache* cache)
 {
   if (!module || !desc) return (hina_pipeline){HINA_INVALID_HANDLE};
+  const uint32_t tile_subpass_count = desc->tile_layout ? hina_count_tile_subpasses_layout(desc->tile_layout) : 0;
 #ifdef HINA_DEBUG
-  if (desc->tile_layout && desc->tile_layout->subpass_count > 0)
+  if (tile_subpass_count > 0)
   {
     hina_validate_tile_pass_layout(desc->tile_layout);
-    HINA_ASSERTF(desc->subpass_index < desc->tile_layout->subpass_count,
+    HINA_ASSERTF(desc->subpass_index < tile_subpass_count,
                  "pipeline subpass_index out of range: %u (subpass_count=%u)", desc->subpass_index,
-                 desc->tile_layout->subpass_count);
+                 tile_subpass_count);
   }
 #endif
   hina_context* ctx = &g_hina_ctx;
@@ -15261,8 +15326,7 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   VkRenderingInputAttachmentIndexInfo hsl_input_att_info = {
     .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO
   };
-  const bool hsl_use_dyn_local_read = desc->tile_layout && desc->tile_layout->subpass_count > 0 && g_device_caps.
-    has_dynamic_rendering_local_read;
+  const bool hsl_use_dyn_local_read = tile_subpass_count > 0 && g_device_caps.has_dynamic_rendering_local_read;
   // For dynamic local read: colorAttachmentCount must equal total attachments in rendering
   VkFormat hsl_dyn_formats[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
   uint32_t hsl_color_att_count = color_count;
@@ -15342,14 +15406,14 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   // Legacy render pass when:
   // 1. Dynamic rendering is not available (!vkCmdBeginRendering), OR
   // 2. This is a tile pass pipeline and dynamic_rendering_local_read is disabled
-  const bool need_legacy_rp = !vkCmdBeginRendering || (desc->tile_layout && desc->tile_layout->subpass_count > 0 && !
+  const bool need_legacy_rp = !vkCmdBeginRendering || (tile_subpass_count > 0 && !
     g_device_caps.has_dynamic_rendering_local_read);
   if (need_legacy_rp)
   {
     VkRenderPass rp = VK_NULL_HANDLE;
     // For tile pass pipelines (subpass_index > 0 or tile_layout provided),
     // use the tile template render pass for proper subpass structure
-    if (desc->tile_layout && desc->tile_layout->subpass_count > 0)
+    if (tile_subpass_count > 0)
     {
       // Build format override from pipeline desc - this allows users to skip
       // specifying formats in tile_layout for the current subpass
@@ -16651,8 +16715,9 @@ void hina_cmd_end_pass(hina_cmd* cmd)
 static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_desc* desc)
 {
   HINA_ZONE_N("tile_pass_begin");
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   bool uses_swapchain = false;
-  const uint32_t last_sp = desc->subpass_count - 1;
+  const uint32_t last_sp = subpass_count - 1;
   // Batch barriers for all attachments (colors + resolves + depth)
   VkImageMemoryBarrier2 barriers[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES + HINA_MAX_COLOR_ATTACHMENTS + 1];
   uint32_t barrier_count = 0;
@@ -16660,7 +16725,7 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
   VkRenderingAttachmentInfo color_atts[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
   uint32_t color_att_map[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   uint32_t total_color_count = 0;
-  for (uint32_t sp = 0; sp < desc->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* subpass = &desc->subpasses[sp];
     for (uint32_t c = 0; c < subpass->color_count; c++)
@@ -16673,7 +16738,7 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
       color_att_map[sp][c] = total_color_count;
       // Check if this attachment is used as tile input in any later subpass
       bool is_tile_input = false;
-      for (uint32_t sp2 = sp + 1; sp2 < desc->subpass_count && !is_tile_input; sp2++)
+      for (uint32_t sp2 = sp + 1; sp2 < subpass_count && !is_tile_input; sp2++)
       {
         for (uint32_t ti = 0; ti < desc->subpasses[sp2].tile_input_count; ti++)
         {
@@ -16753,7 +16818,7 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
   // Collect depth attachment (use first subpass that has one)
   VkRenderingAttachmentInfo depth_att = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   bool has_depth = false;
-  for (uint32_t sp = 0; sp < desc->subpass_count && !has_depth; sp++)
+  for (uint32_t sp = 0; sp < subpass_count && !has_depth; sp++)
   {
     const hina_tile_subpass* subpass = &desc->subpasses[sp];
     if (subpass->has_depth && hina_texture_view_slot_valid(subpass->depth.image))
@@ -16800,7 +16865,7 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
   uint32_t render_height = desc->height;
   if (render_width == 0 || render_height == 0)
   {
-    for (uint32_t sp = 0; sp < desc->subpass_count && (render_width == 0 || render_height == 0); sp++)
+    for (uint32_t sp = 0; sp < subpass_count && (render_width == 0 || render_height == 0); sp++)
     {
       const hina_tile_subpass* subpass = &desc->subpasses[sp];
       for (uint32_t c = 0; c < subpass->color_count; c++)
@@ -16857,7 +16922,7 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
   // Update command buffer state
   cmd->tile.active = true;
   cmd->tile.current_subpass = 0;
-  cmd->tile.subpass_count = (uint8_t)desc->subpass_count;
+  cmd->tile.subpass_count = (uint8_t)subpass_count;
   cmd->is_rendering = true;
   cmd->uses_swapchain |= uses_swapchain;
   // Track first subpass's color attachments for layout tracking
@@ -16866,7 +16931,7 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
   for (uint32_t c = 0; c < cmd->color_count; c++)
   {
     cmd->color_views[c] = sp0->color[c].image;
-    cmd->resolve_views[c] = (desc->subpass_count == 1)
+    cmd->resolve_views[c] = (subpass_count == 1)
                               ? sp0->color[c].resolve
                               : (hina_texture_view){HINA_INVALID_HANDLE};
   }
@@ -16879,6 +16944,7 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
 static void hina_tile_pass_next_dynamic(hina_cmd* cmd, const hina_tile_pass_desc* desc)
 {
   HINA_ZONE_N("tile_pass_next");
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   const uint32_t next_sp = cmd->tile.current_subpass + 1;
   const hina_tile_subpass* prev_subpass = &desc->subpasses[next_sp - 1];
   const hina_tile_subpass* next_subpass = &desc->subpasses[next_sp];
@@ -16912,7 +16978,7 @@ static void hina_tile_pass_next_dynamic(hina_cmd* cmd, const hina_tile_pass_desc
   // This is O(n²) but subpass counts are tiny (typically 2-4)
   uint32_t color_att_map[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   uint32_t total_color_count = 0;
-  for (uint32_t s = 0; s < desc->subpass_count; s++)
+  for (uint32_t s = 0; s < subpass_count; s++)
   {
     for (uint32_t c = 0; c < desc->subpasses[s].color_count; c++)
     {
@@ -16947,7 +17013,7 @@ static void hina_tile_pass_next_dynamic(hina_cmd* cmd, const hina_tile_pass_desc
   for (uint32_t c = 0; c < cmd->color_count; c++)
   {
     cmd->color_views[c] = subpass->color[c].image;
-    cmd->resolve_views[c] = (sp + 1 == desc->subpass_count)
+    cmd->resolve_views[c] = (sp + 1 == subpass_count)
                               ? subpass->color[c].resolve
                               : (hina_texture_view){HINA_INVALID_HANDLE};
   }
@@ -17048,8 +17114,9 @@ static void hina_end_tile_pass_dynamic(hina_cmd* cmd)
 HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_tile_pass_desc* desc)
 {
   hina_context* ctx = cmd->ctx;
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   bool uses_swapchain = false;
-  const uint32_t last_sp = desc->subpass_count - 1;
+  const uint32_t last_sp = subpass_count - 1;
   VkRenderPass render_pass = hina_legacy_get_cached_tile_render_pass(ctx, desc);
   if (render_pass == VK_NULL_HANDLE)
   {
@@ -17060,7 +17127,7 @@ HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_
   VkImageView fb_views[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES + HINA_MAX_COLOR_ATTACHMENTS + 1];
   uint32_t fb_view_count = 0;
   bool depth_added = false;
-  for (uint32_t sp = 0; sp < desc->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* subpass = &desc->subpasses[sp];
     for (uint32_t c = 0; c < subpass->color_count; c++)
@@ -17094,7 +17161,7 @@ HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_
   uint32_t render_height = desc->height;
   if (render_width == 0 || render_height == 0)
   {
-    for (uint32_t sp = 0; sp < desc->subpass_count && (render_width == 0 || render_height == 0); sp++)
+    for (uint32_t sp = 0; sp < subpass_count && (render_width == 0 || render_height == 0); sp++)
     {
       const hina_tile_subpass* subpass = &desc->subpasses[sp];
       for (uint32_t c = 0; c < subpass->color_count; c++)
@@ -17132,7 +17199,7 @@ HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_
   VkClearValue clear_values[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES + HINA_MAX_COLOR_ATTACHMENTS + 1];
   uint32_t clear_count = 0;
   bool depth_clear_added = false;
-  for (uint32_t sp = 0; sp < desc->subpass_count; sp++)
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* subpass = &desc->subpasses[sp];
     for (uint32_t c = 0; c < subpass->color_count; c++)
@@ -17164,7 +17231,7 @@ HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_
   vkCmdSetScissor(cmd->vk_cmd, 0, 1, &scissor);
   cmd->tile.active = true;
   cmd->tile.current_subpass = 0;
-  cmd->tile.subpass_count = (uint8_t)desc->subpass_count;
+  cmd->tile.subpass_count = (uint8_t)subpass_count;
   cmd->is_rendering = true;
   cmd->uses_swapchain |= uses_swapchain;
   // Track first subpass's color attachments for layout tracking
@@ -17173,7 +17240,7 @@ HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_
   for (uint32_t c = 0; c < cmd->color_count; c++)
   {
     cmd->color_views[c] = sp0->color[c].image;
-    cmd->resolve_views[c] = (desc->subpass_count == 1)
+    cmd->resolve_views[c] = (subpass_count == 1)
                               ? sp0->color[c].resolve
                               : (hina_texture_view){HINA_INVALID_HANDLE};
   }
@@ -17185,6 +17252,7 @@ HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_
 
 HINA_NOINLINE static void hina_tile_pass_next_legacy(hina_cmd* cmd, const hina_tile_pass_desc* desc)
 {
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   vkCmdNextSubpass(cmd->vk_cmd, VK_SUBPASS_CONTENTS_INLINE);
   cmd->tile.current_subpass++;
   uint32_t sp = cmd->tile.current_subpass;
@@ -17193,7 +17261,7 @@ HINA_NOINLINE static void hina_tile_pass_next_legacy(hina_cmd* cmd, const hina_t
   for (uint32_t c = 0; c < cmd->color_count; c++)
   {
     cmd->color_views[c] = subpass->color[c].image;
-    cmd->resolve_views[c] = (sp + 1 == desc->subpass_count)
+    cmd->resolve_views[c] = (sp + 1 == subpass_count)
                               ? subpass->color[c].resolve
                               : (hina_texture_view){HINA_INVALID_HANDLE};
   }
@@ -17256,11 +17324,13 @@ bool hina_begin_tile_pass(hina_cmd* cmd, const hina_tile_pass_desc* desc)
   HINA_ASSERT(desc);
   HINA_ASSERT(cmd->recording && "hina_begin_tile_pass: command buffer must be recording");
   HINA_ASSERTF(!cmd->is_rendering, "hina_begin_tile_pass: already in a render pass");
-  HINA_ASSERTF(desc->subpass_count > 0 && desc->subpass_count <= HINA_MAX_TILE_SUBPASSES,
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
+  HINA_ASSERTF(subpass_count > 0 && subpass_count <= HINA_MAX_TILE_SUBPASSES,
                "hina_begin_tile_pass: subpass_count must be 1-%d", HINA_MAX_TILE_SUBPASSES);
 #ifdef HINA_DEBUG
   hina_validate_tile_pass_desc(desc);
 #endif
+  (void)subpass_count; // Used in assert above
   if (g_device_caps.has_dynamic_rendering_local_read) return hina_begin_tile_pass_dynamic(cmd, desc);
   else return hina_begin_tile_pass_legacy(cmd, desc);
 }
@@ -17273,8 +17343,9 @@ void hina_tile_pass_next(hina_cmd* cmd, const hina_tile_pass_desc* desc)
   HINA_ASSERT(cmd->tile.current_subpass + 1 < cmd->tile.subpass_count);
 #ifdef HINA_DEBUG
   hina_validate_tile_pass_desc(desc);
-  HINA_ASSERTF(desc->subpass_count == cmd->tile.subpass_count,
-               "hina_tile_pass_next: desc subpass_count mismatch (desc=%u, active=%u)", desc->subpass_count,
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
+  HINA_ASSERTF(subpass_count == cmd->tile.subpass_count,
+               "hina_tile_pass_next: desc subpass_count mismatch (desc=%u, active=%u)", subpass_count,
                cmd->tile.subpass_count);
 #endif
   if (g_device_caps.has_dynamic_rendering_local_read) hina_tile_pass_next_dynamic(cmd, desc);

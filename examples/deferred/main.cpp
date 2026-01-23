@@ -629,8 +629,8 @@ static bool example_init(hina_example_app* app) {
 
     // Define tile pass layout for legacy render pass compatibility
     // This describes the subpass structure so pipelines get the right render pass template
+    // Subpass count is derived automatically - first empty subpass terminates
     hina_tile_pass_layout tile_layout = {};
-    tile_layout.subpass_count = 2;
     tile_layout.samples = HINA_SAMPLE_COUNT_1_BIT;
     // Subpass 0: G-Buffer (3 color outputs + depth write)
     tile_layout.subpasses[0].color_count = 3;
@@ -852,7 +852,7 @@ static void example_render(hina_example_app* app) {
 
     hina_tile_pass_desc tile_pass = {};
     tile_pass.label = "deferred_tile_pass";
-    tile_pass.subpass_count = 2;
+    // Subpass count is derived automatically - first empty subpass terminates
 
     // Subpass 0: G-Buffer fill
     tile_pass.subpasses[0].label = "gbuffer";

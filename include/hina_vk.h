@@ -2814,6 +2814,12 @@ typedef struct hina_depth_attachment
 /**
  * @brief Defines a dynamic render pass.
  * HinaVK uses dynamic rendering, so pass objects are transient structs, not created resources.
+ *
+ * @section color_attachments Color Attachments
+ * - First invalid handle (`.id == HINA_INVALID_HANDLE`) in colors[] terminates the list
+ * - Dynamic rendering backend (vkCmdBeginRendering): supports all HINA_MAX_COLOR_ATTACHMENTS
+ * - Legacy render pass backend: **only uses colors[0]** (colors[1..N] silently ignored)
+ *   Check hina_device_caps.has_dynamic_rendering to detect which backend is active.
  */
 typedef struct hina_pass_action
 {
@@ -2824,6 +2830,15 @@ typedef struct hina_pass_action
   uint32_t flags; // hina_pass_flags
 } hina_pass_action;
 
+/**
+ * @brief Begin a dynamic render pass.
+ *
+ * Starts rendering to the color/depth attachments specified in the action.
+ * Must be paired with hina_cmd_end_pass(). Cannot be nested.
+ *
+ * @param cmd   Command buffer (must be recording, not inside a pass)
+ * @param action Pass configuration (attachments, dimensions, clear values)
+ */
 HINA_API void hina_cmd_begin_pass(hina_cmd* cmd, const hina_pass_action* action);
 
 HINA_API void hina_cmd_end_pass(hina_cmd* cmd);
@@ -2867,12 +2882,17 @@ typedef struct hina_tile_subpass
   bool depth_read_only; // Preserve depth from previous subpass (read-only)
 } hina_tile_subpass;
 
-/** @brief Describes a complete tile pass with multiple subpasses */
+/**
+ * @brief Describes a complete tile pass with multiple subpasses.
+ *
+ * Subpass count is derived automatically - first empty subpass terminates.
+ * An empty subpass has: color_count == 0 && tile_input_count == 0 && has_depth == false.
+ * Zero-init produces no subpasses; at least one subpass with attachments is required.
+ */
 typedef struct hina_tile_pass_desc
 {
   const char* label;
   hina_tile_subpass subpasses[HINA_MAX_TILE_SUBPASSES];
-  uint32_t subpass_count; // Must be 1..HINA_MAX_TILE_SUBPASSES
   uint32_t width; // Render area width (0 = use first attachment size)
   uint32_t height; // Render area height (0 = use first attachment size)
 } hina_tile_pass_desc;
@@ -2912,10 +2932,16 @@ typedef struct hina_tile_subpass_layout
   uint32_t input_count; // Must be <= HINA_MAX_TILE_INPUTS
 } hina_tile_subpass_layout;
 
+/**
+ * @brief Layout for tile passes (used in pipeline creation).
+ *
+ * Subpass count is derived automatically - first empty subpass terminates.
+ * An empty subpass has: color_count == 0 && input_count == 0 && depth_format == UNDEFINED.
+ * Zero-init produces no subpasses; pipelines using tile_layout require at least one subpass.
+ */
 typedef struct hina_tile_pass_layout
 {
   hina_tile_subpass_layout subpasses[HINA_MAX_TILE_SUBPASSES];
-  uint32_t subpass_count; // Must be <= HINA_MAX_TILE_SUBPASSES
   hina_sample_count samples; // Must be 0 or a single HINA_SAMPLE_COUNT_* value
 } hina_tile_pass_layout;
 

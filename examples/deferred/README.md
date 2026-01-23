@@ -20,13 +20,13 @@ G-buffer rendering with tile-based composition and 64 dynamic point lights.
 The tile pass combines multiple subpasses that can read each other's outputs via input attachments:
 
 ```c
+// Subpass count is derived automatically - first empty subpass terminates
 hina_tile_pass_desc desc = {
     .subpasses = {
         { .color = {...}, .color_count = 3, .has_depth = true },           // G-buffer
         { .tile_inputs = {{0,0},{0,1},{0,2}}, .tile_input_count = 3, ... }, // Composition
         { .depth_read_only = true, ... }                                    // Transparent
-    },
-    .subpass_count = 3
+    }
 };
 hina_begin_tile_pass(cmd, &desc);
 // draw G-buffer

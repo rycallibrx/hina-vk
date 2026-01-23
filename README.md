@@ -187,7 +187,6 @@ The easiest path is HSL modules, which include reflection data and validate bind
 hina_hsl_module* module = hslc_compile_hsl("shader.hina_sl", &error);
 hina_pipeline pipeline = hina_make_pipeline_from_module(module, &(hina_hsl_pipeline_desc){
     .color_formats = { HINA_FORMAT_B8G8R8A8_SRGB },
-    .color_count = 1,
     .depth_format = HINA_FORMAT_D32_SFLOAT,
     .cull_mode = HINA_CULL_BACK,
 }, NULL);
@@ -219,20 +218,18 @@ For simple rendering without tile-local reads, use regular passes:
 
 ```c
 hina_cmd_begin_pass(cmd, &(hina_pass_action){
-    .color[0] = {
+    .colors[0] = {
         .image = swapchain_view,
         .load_op = HINA_LOAD_OP_CLEAR,
         .store_op = HINA_STORE_OP_STORE,
-        .clear = { 0.1f, 0.1f, 0.1f, 1.0f }
+        .clear_color = { 0.1f, 0.1f, 0.1f, 1.0f }
     },
-    .color_count = 1,
     .depth = {
         .image = depth_view,
         .load_op = HINA_LOAD_OP_CLEAR,
         .store_op = HINA_STORE_OP_DONT_CARE,
-        .clear_depth = 1.0f
+        .depth_clear = 1.0f
     },
-    .has_depth = true
 });
 
 hina_cmd_bind_pipeline(cmd, pipeline);
@@ -393,12 +390,14 @@ For cross-queue work (e.g., async compute produces data that graphics consumes),
 
 ```c
 // On compute queue: release to graphics
-hina_cmd_release_buffer(cmd, ssbo, HINA_QUEUE_GRAPHICS);
-hina_ticket sync = hina_frame_submit(HINA_QUEUE_COMPUTE, cmd);
+hina_cmd* compute_cmd = hina_cmd_begin_ex(HINA_QUEUE_COMPUTE);
+hina_cmd_release_buffer(compute_cmd, ssbo, HINA_QUEUE_GRAPHICS);
+hina_sync_point sync = hina_frame_submit(compute_cmd);
 
 // On graphics queue: wait for compute, then acquire
 hina_frame_wait(HINA_QUEUE_GRAPHICS, sync);
-hina_cmd_acquire_buffer(cmd, ssbo, HINA_QUEUE_COMPUTE);
+hina_cmd* gfx_cmd = hina_cmd_begin();
+hina_cmd_acquire_buffer(gfx_cmd, ssbo, HINA_QUEUE_COMPUTE);
 ```
 
 If both queues map to the same hardware queue family (common on some GPUs), release/acquire are no-ops.
