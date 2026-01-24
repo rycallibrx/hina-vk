@@ -3097,7 +3097,7 @@ static const char* hina_log_level_str(hina_log_level level)
 // Core logging function - formats and routes to user callback
 static void hina_vlogf(hina_context* ctx, hina_log_level level, const char* fmt, va_list args)
 {
-    if (!ctx->core.device || !ctx->core.device->config.log_fn) return;
+    if (!ctx->core.device->config.log_fn) return;
     char body[1024];
     vsnprintf(body, sizeof(body), fmt, args);
     body[sizeof(body) - 1] = '\0';
@@ -4983,7 +4983,6 @@ static uint32_t hina_count_tile_subpasses_layout(const hina_tile_pass_layout* la
  */
 static uint32_t hina_count_tile_subpasses_desc(const hina_tile_pass_desc* desc)
 {
-  if (!desc) return 0;
   uint32_t count = 0;
   for (uint32_t i = 0; i < HINA_MAX_TILE_SUBPASSES; i++) {
     const hina_tile_subpass* sp = &desc->subpasses[i];
@@ -8459,7 +8458,7 @@ static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* 
 
 bool hina_init(const hina_desc* desc)
 {
-  if (!desc) return false;
+  HINA_ASSERT(desc);
   hina_context* ctx = &g_hina_ctx;
   if (ctx->core.initialized && ctx->core.device && ctx->core.device->core.initialized) return true;
   // Initialize static storage system (idempotent)
@@ -10269,9 +10268,9 @@ void hina_shutdown(void)
 }
 
 // Thread context management
-hina_context* hina_create_thread_context(hina_context* parent)
+hina_context* hina_create_thread_context(void)
 {
-  if (!parent || !parent->core.device || !parent->core.device->core.initialized) return NULL;
+  hina_context* parent = &g_hina_ctx;
   // Check if parent can accept more children
   if (parent->hierarchy.child_count >= 8) // HINA_MAX_THREAD_CONTEXTS
   {
@@ -13981,7 +13980,6 @@ static hina_pipeline hina_make_compute_pipeline_internal(hina_context* ctx, cons
 
 static hina_pipeline hina_ctx_make_pipeline_ex(hina_context* ctx, const hina_pipeline_desc_any* desc)
 {
-  if (!desc) return (hina_pipeline){HINA_INVALID_HANDLE};
   hina_pipeline result;
   switch (desc->kind)
   {
@@ -13997,6 +13995,7 @@ static hina_pipeline hina_ctx_make_pipeline_ex(hina_context* ctx, const hina_pip
 
 hina_pipeline hina_make_pipeline_ex(const hina_pipeline_desc_any* desc)
 {
+  HINA_ASSERT(desc);
   return hina_ctx_make_pipeline_ex(&g_hina_ctx, desc);
 }
 

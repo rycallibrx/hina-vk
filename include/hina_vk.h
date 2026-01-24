@@ -804,11 +804,9 @@ HINA_API bool hina_init(const hina_desc* desc);
  */
 HINA_API void hina_shutdown(void);
 
-// Global Context Access
-extern hina_context g_hina_ctx;
 // Thread Context Creation
 // HinaVK allows creating child contexts for multi-threaded command recording.
-HINA_API hina_context* hina_create_thread_context(hina_context* parent);
+HINA_API hina_context* hina_create_thread_context(void);
 
 HINA_API void hina_destroy_thread_context(hina_context* ctx);
 

@@ -1666,8 +1666,8 @@ int main(int argc, char** argv) {
     // Thread contexts
     // ========================================================================
 
-    hina_context* shadow_ctx = hina_create_thread_context(&g_hina_ctx);
-    hina_context* main_ctx = hina_create_thread_context(&g_hina_ctx);
+    hina_context* shadow_ctx = hina_create_thread_context();
+    hina_context* main_ctx = hina_create_thread_context();
     if (!shadow_ctx || !main_ctx) {
         EXAMPLE_LOGE("Failed to create thread contexts");
         return 1;
