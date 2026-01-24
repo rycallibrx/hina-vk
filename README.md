@@ -29,7 +29,7 @@ HinaVK is a heavily opinionated Vulkan abstraction layer designed to make common
 - Works both for both single threaded and multi-threaded recording
 - 1 .c file, 1 .h file, and one .cpp file for volk/VMA implementation
 
-Unfortunately, in the spirit of write once use everywhere code, I don't expose platform-specific features like ray tracing or mesh shaders. If you need those, escape hatches to raw vulkan exist.
+In the spirit of write-once-use-everywhere code, I don't expose platform-specific features like mesh shaders. If you need those, escape hatches to raw Vulkan exist.
 
 ---
 
@@ -442,7 +442,7 @@ Resource labels are set via the `.label` field in creation descriptors.
 
 ### Vulkan Escape Hatches
 
-When you need to drop down to raw Vulkan (ray tracing, mesh shaders, vendor extensions, etc.):
+When you need to drop down to raw Vulkan (mesh shaders, vendor extensions, etc.):
 
 ```c
 hina_vulkan_handles handles;

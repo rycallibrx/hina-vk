@@ -222,29 +222,6 @@ typedef enum hina_log_level
   HINA_LOG_ERROR = 2
 } hina_log_level;
 
-/**
- * @brief Get the last error message from the error side-channel.
- *
- * When a function returns HINA_INVALID_HANDLE or otherwise fails, it logs
- * an error message to a per-context ring buffer. This function retrieves
- * the most recent error message.
- *
- * @note The returned pointer is valid until the next error is logged.
- *       Copy the string if you need to keep it.
- * @note Thread-local: returns errors from the current context only.
- *
- * @return Error message string, or NULL if no error has been logged.
- */
-HINA_API const char* hina_get_last_error(void);
-
-/**
- * @brief Clear the last error message.
- *
- * Resets the error side-channel. Useful before a sequence of operations
- * where you want to check if any of them failed.
- */
-HINA_API void hina_clear_last_error(void);
-
 // ===========================================================================
 //  Handle Definitions
 // ===========================================================================

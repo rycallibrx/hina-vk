@@ -816,8 +816,6 @@ HINA_STATIC_ASSERT(sizeof(hina_depth_bias_state) == 16, hina_depth_bias_state_si
 #ifndef HINA_PERSISTENT_ARENA_INIT_COMMIT
 #define HINA_PERSISTENT_ARENA_INIT_COMMIT (4ull * 1024ull * 1024ull)
 #endif
-#define HINA_ERROR_SCRATCH_SIZE           4096u                    // Per-context error message ring buffer
-
 #define HINA_PERSISTENT_MAX_ALLOCS  8192u                  // Max nodes for persistent allocator
 #define HINA_PERSISTENT_ALLOC_ALIGN 16u                    // Persistent allocation alignment (bytes)
 HINA_STATIC_ASSERT((HINA_PERSISTENT_ALLOC_ALIGN & (HINA_PERSISTENT_ALLOC_ALIGN - 1u)) == 0,
@@ -2916,10 +2914,6 @@ typedef struct hina_context
   // Staging & profiling
   hina_staging_context staging;
   hina_profiler_hooks profiler;
-  // Error scratch (per-context, ring buffer for error side-channel)
-  uint32_t error_scratch_offset;
-  uint32_t last_error_offset;  // Start of most recent error (UINT32_MAX = no error)
-  char error_scratch[HINA_ERROR_SCRATCH_SIZE];
 #ifdef HINA_DEBUG
   struct
   {
@@ -3101,28 +3095,12 @@ static const char* hina_log_level_str(hina_log_level level)
 }
 
 // Core logging function - formats and routes to user callback
-// For ERROR level, also stores in error scratch for hina_get_last_error()
 static void hina_vlogf(hina_context* ctx, hina_log_level level, const char* fmt, va_list args)
 {
+    if (!ctx->core.device || !ctx->core.device->config.log_fn) return;
     char body[1024];
     vsnprintf(body, sizeof(body), fmt, args);
     body[sizeof(body) - 1] = '\0';
-
-    // Store ERROR messages in scratch buffer for later retrieval
-    if (level == HINA_LOG_ERROR)
-    {
-        size_t len = strlen(body) + 1;
-        if (len <= HINA_ERROR_SCRATCH_SIZE)
-        {
-            uint32_t offset = ctx->error_scratch_offset;
-            if (offset + len > HINA_ERROR_SCRATCH_SIZE) offset = 0;
-            memcpy(ctx->error_scratch + offset, body, len);
-            ctx->last_error_offset = offset;
-            ctx->error_scratch_offset = offset + (uint32_t)len;
-        }
-    }
-
-    if (!ctx->core.device || !ctx->core.device->config.log_fn) return;
     hina_log_fn log_fn = ctx->core.device->config.log_fn;
     // Format: "[hina][LEVEL] message"
     char buf[1152];
@@ -3139,19 +3117,6 @@ static void hina_logf(hina_context* ctx, hina_log_level level, const char* fmt, 
     va_start(args, fmt);
     hina_vlogf(ctx, level, fmt, args);
     va_end(args);
-}
-
-// Error side-channel retrieval (see agents.md Error Policy)
-const char* hina_get_last_error(void)
-{
-    hina_context* ctx = &g_hina_ctx;
-    if (ctx->last_error_offset == UINT32_MAX) return NULL;
-    return ctx->error_scratch + ctx->last_error_offset;
-}
-
-void hina_clear_last_error(void)
-{
-    g_hina_ctx.last_error_offset = UINT32_MAX;
 }
 
 // Public logging macros
@@ -6954,7 +6919,16 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
   static const char* layers[1] = {"VK_LAYER_KHRONOS_validation"};
   if (desc->instance_ext_count && desc->instance_exts)
   {
-    // User-provided extensions - use as-is (user is responsible for validation)
+    // Validate user-provided extensions are available
+    for (uint32_t i = 0; i < desc->instance_ext_count; ++i)
+    {
+      if (!hina_has_instance_extension(available_exts, available_ext_count, desc->instance_exts[i]))
+      {
+        HINA_LOGE(ctx, "requested instance extension '%s' is not available", desc->instance_exts[i]);
+        if (heap_alloc && available_exts) hina_free_host(available_exts);
+        return false;
+      }
+    }
     ici.enabledExtensionCount = desc->instance_ext_count;
     ici.ppEnabledExtensionNames = desc->instance_exts;
     HINA_LOGI(ctx, "using %u user-provided instance extensions", desc->instance_ext_count);
@@ -7417,6 +7391,15 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   const bool is_vk10 = g_device_caps.vk_version == HINA_VK_VERSION_1_0;
   if (desc->device_exts && desc->device_ext_count)
   {
+    // Validate user-provided extensions are available
+    for (uint32_t i = 0; i < desc->device_ext_count; ++i)
+    {
+      if (!hina_has_device_extension(ctx->core.device->core.phys, desc->device_exts[i]))
+      {
+        HINA_LOGE(ctx, "requested device extension '%s' is not available", desc->device_exts[i]);
+        return false;
+      }
+    }
     dev_exts = desc->device_exts;
     dev_ext_count = desc->device_ext_count;
   }
@@ -8484,7 +8467,6 @@ bool hina_init(const hina_desc* desc)
   // Initialize spinlock timing infrastructure (idempotent, uses hardware counters)
   hina_spin_init();
   memset(ctx, 0, sizeof(*ctx));
-  ctx->last_error_offset = UINT32_MAX;  // "no error" sentinel
   hina_device* dev = hina_calloc_host(1, sizeof(hina_device));
   if (!dev) return false;
   ctx->core.device = dev;
