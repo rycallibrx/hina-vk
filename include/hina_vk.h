@@ -1428,40 +1428,41 @@ HINA_API uint32_t hina_pass_layout_color_count(hina_pass_layout layout);
 /**
  * @brief Downloads texture data from GPU to CPU memory.
  *
- * This is a synchronous helper that:
- * 1. Creates a temporary staging buffer
+ * This is a synchronous operation that:
+ * 1. Uses a persistent internal staging buffer (grown as needed)
  * 2. Transitions the texture to TRANSFER_SRC layout
  * 3. Copies the specified mip/layer to the staging buffer
  * 4. Waits for GPU completion
  * 5. Copies data to the user-provided destination
  *
  * The texture must have been created with HINA_TEXTURE_TRANSFER_SRC_BIT usage.
+ * Asserts on invalid parameters (null dst, invalid handle, out-of-bounds mip/layer, insufficient dst_size).
  *
  * @param src       Source texture to download from
  * @param mip       Mip level to download (0 = base level)
  * @param layer     Array layer to download (0 = first layer)
  * @param dst       Destination buffer (must be large enough for the mip level)
  * @param dst_size  Size of destination buffer in bytes
- * @return true on success, false on failure
  */
-HINA_API bool hina_download_texture(hina_texture src, uint32_t mip, uint32_t layer, void* dst, size_t dst_size);
+HINA_API void hina_download_texture(hina_texture src, uint32_t mip, uint32_t layer, void* dst, size_t dst_size);
 
-HINA_API bool hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t layer, void* dst,
+HINA_API void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t layer, void* dst,
                                         size_t dst_size);
 
-HINA_API bool hina_download_texture_3d(hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth, void* dst,
+HINA_API void hina_download_texture_3d(hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth, void* dst,
                                        size_t dst_size);
 
-HINA_API bool hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t z_offset,
+HINA_API void hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t z_offset,
                                            uint32_t depth, void* dst, size_t dst_size);
 
 /**
  * @brief Calculates the size in bytes needed to download a texture mip level.
  * For 3D textures, this includes the full mip depth.
+ * Asserts on invalid texture handle, out-of-bounds mip level, or unsupported format.
  *
  * @param tex   The texture to query
  * @param mip   The mip level to query
- * @return Size in bytes, or 0 if texture is invalid or format is unsupported
+ * @return Size in bytes
  */
 HINA_API size_t hina_texture_mip_size(hina_texture tex, uint32_t mip);
 

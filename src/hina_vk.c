@@ -50,7 +50,7 @@
   } while(0)
 #endif
 
-// Always-on fatal crash for unrecoverable runtime failures (per ERROR_POLICY.md section 2.2)
+// Always-on fatal crash for unrecoverable runtime failures
 // These are NOT compiled out in release - they crash at call site
 #define HINA_FATAL(msg) do { \
     fprintf(stderr, "[hina][FATAL] %s:%d: %s\n", __FILE__, __LINE__, (msg)); \
@@ -2618,6 +2618,11 @@ typedef struct hina_staging_context
   uint64_t last_submit_ticket;
   // Last graphics submission ticket - wait before reusing gfx_vk_cmd
   uint64_t last_gfx_submit_ticket;
+  // Persistent staging buffer for texture downloads (reused, grows as needed)
+  VkBuffer download_staging_buf;
+  VkDeviceMemory download_staging_mem;
+  void* download_staging_mapped;
+  size_t download_staging_size;
 #ifndef NDEBUG
   // Debug: thread affinity check - set on first use, validated on subsequent uses
   thrd_t owner_thread;
@@ -8983,6 +8988,15 @@ static void hina_staging_ctx_destroy(hina_context* ctx, hina_staging_context* sc
     sc->gfx_cmd_pool = VK_NULL_HANDLE;
     sc->gfx_vk_cmd = VK_NULL_HANDLE;
   }
+  // Destroy persistent download staging buffer (allocated via VMA)
+  if (sc->download_staging_buf && ctx->core.device && ctx->core.device->allocator.vma)
+  {
+    vmaDestroyBuffer(ctx->core.device->allocator.vma, sc->download_staging_buf, (VmaAllocation)sc->download_staging_mem);
+    sc->download_staging_buf = VK_NULL_HANDLE;
+    sc->download_staging_mem = VK_NULL_HANDLE;
+  }
+  sc->download_staging_mapped = NULL;
+  sc->download_staging_size = 0;
   sc->pending_cmd = NULL;
   sc->gfx_pending_cmd = NULL;
 }
@@ -10475,6 +10489,7 @@ hina_buffer hina_ctx_make_buffer(hina_context* ctx, const hina_buffer_desc* desc
 {
   HINA_ASSERT(desc);
   hina_buffer handle = hina_make_buffer_internal(ctx, desc);
+  if (handle.id == HINA_INVALID_HANDLE) return handle; // Creation failed
 #ifdef HINA_DEBUG
   if (desc->label) hina_debug_name_add(handle.id, VK_OBJECT_TYPE_BUFFER, desc->label);
 #endif
@@ -11689,16 +11704,10 @@ void hina_destroy_texture_view(hina_texture_view view)
 // Texture Download
 size_t hina_texture_mip_size(hina_texture tex, uint32_t mip)
 {
-  if (!hina_texture_slot_valid(tex))
-  {
-    return 0;
-  }
+  HINA_ASSERTF(hina_texture_slot_valid(tex), "hina_texture_mip_size: invalid texture handle");
   uint16_t idx = hina_id_index(tex.id);
   hina_texture_hot* hot = HINA_TEX_HOT(idx);
-  if (mip >= hot->mip_levels)
-  {
-    return 0;
-  }
+  HINA_ASSERTF(mip < hot->mip_levels, "hina_texture_mip_size: mip %u out of bounds (max %u)", mip, hot->mip_levels);
   // Get format size
   hina_format hfmt = hina_vk_format_to_hina(hot->dims.format);
   uint32_t mip_width = hina_mip_dim(hot->dims.width, mip);
@@ -11707,76 +11716,94 @@ size_t hina_texture_mip_size(hina_texture tex, uint32_t mip)
   if (hina_format_is_block_compressed(hfmt))
   {
     hina_block_format_info block = {0};
-    if (!hina_format_block_info(hfmt, &block)) return 0;
+    HINA_ASSERTF(hina_format_block_info(hfmt, &block), "hina_texture_mip_size: unknown block format");
     uint32_t blocks_x = hina_div_ceil_u32(mip_width, block.block_w);
     uint32_t blocks_y = hina_div_ceil_u32(mip_height, block.block_h);
     return (size_t)blocks_x * blocks_y * mip_depth * block.block_bytes;
   }
   uint32_t pixel_size = hina_format_size(hfmt);
-  if (pixel_size == 0)
-  {
-    return 0;
-  }
+  HINA_ASSERTF(pixel_size > 0, "hina_texture_mip_size: unsupported format for size calculation");
   return (size_t)mip_width * mip_height * mip_depth * pixel_size;
 }
 
-bool hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t layer, void* dst,
+// Ensure persistent download staging buffer is allocated and large enough
+static void* hina_staging_ensure_download_buffer(hina_context* ctx, size_t required_size)
+{
+  hina_staging_context* sc = &ctx->staging;
+  // If existing buffer is large enough, reuse it
+  if (sc->download_staging_buf && sc->download_staging_size >= required_size)
+  {
+    return sc->download_staging_mapped;
+  }
+  // Need to (re)allocate - destroy old buffer if any
+  if (sc->download_staging_buf)
+  {
+    vmaDestroyBuffer(ctx->core.device->allocator.vma, sc->download_staging_buf, (VmaAllocation)sc->download_staging_mem);
+    sc->download_staging_buf = VK_NULL_HANDLE;
+    sc->download_staging_mem = VK_NULL_HANDLE;
+    sc->download_staging_mapped = NULL;
+    sc->download_staging_size = 0;
+  }
+  // Allocate new buffer (grow by 1.5x to reduce reallocations)
+  size_t alloc_size = required_size + required_size / 2;
+  if (alloc_size < 4096) alloc_size = 4096; // Minimum 4KB
+  VkBufferCreateInfo buf_info = {
+    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .size = alloc_size,
+    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+  };
+  VmaAllocationCreateInfo alloc_info = {
+    .usage = VMA_MEMORY_USAGE_AUTO,
+    .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+    .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+  };
+  VmaAllocationInfo result_info = {0};
+  VmaAllocation allocation = NULL;
+  VkResult res = vmaCreateBuffer(ctx->core.device->allocator.vma, &buf_info, &alloc_info,
+                                 &sc->download_staging_buf, &allocation, &result_info);
+  if (res != VK_SUCCESS)
+  {
+    HINA_LOGE(ctx, "failed to allocate download staging buffer (size=%zu)", alloc_size);
+    return NULL;
+  }
+  sc->download_staging_mem = (VkDeviceMemory)allocation; // Store VmaAllocation as opaque handle
+  sc->download_staging_mapped = result_info.pMappedData;
+  sc->download_staging_size = alloc_size;
+  return sc->download_staging_mapped;
+}
+
+void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t layer, void* dst,
                                size_t dst_size)
 {
-  HINA_ASSERT(dst && dst_size > 0);
-  // Validate source texture
-  if (!hina_texture_slot_valid(src))
-  {
-    HINA_LOGE(ctx, "download_texture: invalid source texture");
-    return false;
-  }
+  HINA_ASSERT(ctx && "hina_ctx_download_texture: ctx is NULL");
+  HINA_ASSERT(dst && dst_size > 0 && "hina_ctx_download_texture: invalid dst or dst_size");
+  HINA_ASSERTF(hina_texture_slot_valid(src), "hina_ctx_download_texture: invalid texture handle");
   uint16_t sidx = hina_id_index(src.id);
   hina_texture_hot* hot = HINA_TEX_HOT(sidx);
-  if (hot->texture_dim == HINA_TEX_DIM_3D)
-  {
-    HINA_LOGE(ctx, "download_texture: use hina_ctx_download_texture_3d for 3D textures");
-    return false;
-  }
-  // Validate mip and layer
-  if (mip >= hot->mip_levels || layer >= hot->layers)
-  {
-    HINA_LOGE(ctx, "download_texture: mip %u or layer %u out of bounds", mip, layer);
-    return false;
-  }
+  HINA_ASSERTF(hot->texture_dim != HINA_TEX_DIM_3D,
+               "hina_ctx_download_texture: use hina_ctx_download_texture_3d for 3D textures");
+  HINA_ASSERTF(mip < hot->mip_levels, "hina_ctx_download_texture: mip %u out of bounds (max %u)", mip, hot->mip_levels);
+  HINA_ASSERTF(layer < hot->layers, "hina_ctx_download_texture: layer %u out of bounds (max %u)", layer, hot->layers);
   // Calculate required size
   hina_format hfmt = hina_vk_format_to_hina(hot->dims.format);
   uint32_t pixel_size = hina_format_size(hfmt);
-  if (pixel_size == 0)
-  {
-    HINA_LOGE(ctx, "download_texture: unsupported format for download");
-    return false;
-  }
+  HINA_ASSERTF(pixel_size > 0, "hina_ctx_download_texture: unsupported format for download");
   uint32_t mip_width = hina_mip_dim(hot->dims.width, mip);
   uint32_t mip_height = hina_mip_dim(hot->dims.height, mip);
   size_t required_size = (size_t)mip_width * mip_height * pixel_size;
-  if (dst_size < required_size)
-  {
-    HINA_LOGE(ctx, "download_texture: dst_size (%zu) < required (%zu)", dst_size, required_size);
-    return false;
-  }
-  // Store texture info we need, then release lock
+  HINA_ASSERTF(dst_size >= required_size, "hina_ctx_download_texture: dst_size (%zu) < required (%zu)", dst_size,
+               required_size);
+  // Store texture info we need
   VkImage vk_image = hot->vk.image;
   VkFormat vk_format = hot->dims.format;
   VkImageLayout current_layout = hot->state.layout;
   VkAccessFlags current_access = hot->state.access;
   VkPipelineStageFlags current_stages = hot->state.stages;
-  // Create a temporary host-visible buffer for readback
-  hina_buffer_desc buf_desc = {0};
-  buf_desc.size = required_size;
-  buf_desc.flags = (hina_buffer_flags)(HINA_BUFFER_TRANSFER_DST_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
-  hina_buffer staging = hina_make_buffer_internal(ctx, &buf_desc);
-  if (staging.id == HINA_INVALID_HANDLE)
-  {
-    HINA_LOGE(ctx, "download_texture: failed to create staging buffer");
-    return false;
-  }
-  uint16_t staging_idx = hina_id_index(staging.id);
-  hina_buffer_hot* staging_hot = HINA_BUF_HOT(staging_idx);
+  // Ensure persistent staging buffer is ready
+  void* staging_mapped = hina_staging_ensure_download_buffer(ctx, required_size);
+  HINA_ASSERTF(staging_mapped, "hina_ctx_download_texture: failed to allocate staging buffer");
+  VkBuffer staging_buf = ctx->staging.download_staging_buf;
   // Determine if we need split-path handling (dedicated transfer queue)
   bool split = hina_staging_use_split(ctx, &ctx->staging);
   uint32_t xfer_family = ctx->staging.queue_family;
@@ -11784,22 +11811,12 @@ bool hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip
   bool needs_qfot = split && xfer_family != gfx_family;
   // Acquire command buffers
   VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
-  if (!xfer_cmd)
-  {
-    HINA_LOGE(ctx, "download_texture: failed to acquire staging command buffer");
-    hina_ctx_destroy_buffer(ctx, staging);
-    return false;
-  }
+  HINA_ASSERTF(xfer_cmd, "hina_ctx_download_texture: failed to acquire staging command buffer");
   VkCommandBuffer gfx_cmd = xfer_cmd; // Same buffer if not split
   if (split)
   {
     gfx_cmd = hina_staging_ctx_acquire_gfx_cmd(ctx);
-    if (!gfx_cmd)
-    {
-      HINA_LOGE(ctx, "download_texture: failed to acquire graphics command buffer");
-      hina_ctx_destroy_buffer(ctx, staging);
-      return false;
-    }
+    HINA_ASSERTF(gfx_cmd, "hina_ctx_download_texture: failed to acquire graphics command buffer");
   }
   const VkImageAspectFlags aspect = hina_aspect_from_format(vk_format);
   VkImageSubresourceRange range = {aspect, mip, 1, layer, 1};
@@ -11825,7 +11842,7 @@ bool hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip
     HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   }
   // Copy image to buffer (always on transfer queue)
-  hina_copy_image_to_buffer(xfer_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_hot->vk.buffer, 0,
+  hina_copy_image_to_buffer(xfer_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
                             (VkImageSubresourceLayers){aspect, mip, layer, 1}, (VkOffset3D){0, 0, 0},
                             (VkExtent3D){mip_width, mip_height, 1});
   if (needs_qfot)
@@ -11853,97 +11870,49 @@ bool hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip
   }
   // Flush staging and wait synchronously
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
-  if (ticket)
-  {
-    hina_ctx_wait_ticket(ctx, ticket);
-  }
-  else
-  {
-    HINA_LOGE(ctx, "download_texture: staging flush failed");
-    hina_ctx_destroy_buffer(ctx, staging);
-    return false;
-  }
+  HINA_ASSERTF(ticket, "hina_ctx_download_texture: staging flush failed");
+  hina_ctx_wait_ticket(ctx, ticket);
   // Copy from staging buffer to user destination
-  if (staging_hot->vk.mapped)
-  {
-    memcpy(dst, staging_hot->vk.mapped, required_size);
-  }
-  else
-  {
-    // Shouldn't happen for host-visible buffer, but handle it
-    HINA_LOGE(ctx, "download_texture: staging buffer not mapped");
-    hina_ctx_destroy_buffer(ctx, staging);
-    return false;
-  }
-  // Clean up staging buffer
-  hina_ctx_destroy_buffer(ctx, staging);
-  return true;
+  memcpy(dst, staging_mapped, required_size);
 }
 
-bool hina_download_texture(hina_texture src, uint32_t mip, uint32_t layer, void* dst, size_t dst_size)
+void hina_download_texture(hina_texture src, uint32_t mip, uint32_t layer, void* dst, size_t dst_size)
 {
-  return hina_ctx_download_texture(&g_hina_ctx, src, mip, layer, dst, dst_size);
+  hina_ctx_download_texture(&g_hina_ctx, src, mip, layer, dst, dst_size);
 }
 
-bool hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth,
+void hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth,
                                   void* dst, size_t dst_size)
 {
-  HINA_ASSERT(dst && dst_size > 0);
-  if (!hina_texture_slot_valid(src))
-  {
-    HINA_LOGE(ctx, "download_texture_3d: invalid source texture");
-    return false;
-  }
+  HINA_ASSERT(ctx && "hina_ctx_download_texture_3d: ctx is NULL");
+  HINA_ASSERT(dst && dst_size > 0 && "hina_ctx_download_texture_3d: invalid dst or dst_size");
+  HINA_ASSERTF(hina_texture_slot_valid(src), "hina_ctx_download_texture_3d: invalid texture handle");
   uint16_t sidx = hina_id_index(src.id);
   hina_texture_hot* hot = HINA_TEX_HOT(sidx);
-  if (hot->texture_dim != HINA_TEX_DIM_3D)
-  {
-    HINA_LOGE(ctx, "download_texture_3d: source is not a 3D texture");
-    return false;
-  }
-  if (mip >= hot->mip_levels)
-  {
-    HINA_LOGE(ctx, "download_texture_3d: mip %u out of bounds", mip);
-    return false;
-  }
+  HINA_ASSERTF(hot->texture_dim == HINA_TEX_DIM_3D, "hina_ctx_download_texture_3d: source is not a 3D texture");
+  HINA_ASSERTF(mip < hot->mip_levels, "hina_ctx_download_texture_3d: mip %u out of bounds (max %u)", mip,
+               hot->mip_levels);
   uint32_t mip_depth = hina_mip_dim(hot->depth ? hot->depth : 1u, mip);
-  if (depth == 0 || z_offset >= mip_depth || z_offset + depth > mip_depth)
-  {
-    HINA_LOGE(ctx, "download_texture_3d: z range [%u, %u) out of bounds (depth=%u)", z_offset, z_offset + depth,
-              mip_depth);
-    return false;
-  }
+  HINA_ASSERTF(depth > 0 && z_offset < mip_depth && z_offset + depth <= mip_depth,
+               "hina_ctx_download_texture_3d: z range [%u, %u) out of bounds (depth=%u)", z_offset, z_offset + depth,
+               mip_depth);
   hina_format hfmt = hina_vk_format_to_hina(hot->dims.format);
   uint32_t pixel_size = hina_format_size(hfmt);
-  if (pixel_size == 0)
-  {
-    HINA_LOGE(ctx, "download_texture_3d: unsupported format for download");
-    return false;
-  }
+  HINA_ASSERTF(pixel_size > 0, "hina_ctx_download_texture_3d: unsupported format for download");
   uint32_t mip_width = hina_mip_dim(hot->dims.width, mip);
   uint32_t mip_height = hina_mip_dim(hot->dims.height, mip);
   size_t required_size = (size_t)mip_width * mip_height * depth * pixel_size;
-  if (dst_size < required_size)
-  {
-    HINA_LOGE(ctx, "download_texture_3d: dst_size (%zu) < required (%zu)", dst_size, required_size);
-    return false;
-  }
+  HINA_ASSERTF(dst_size >= required_size, "hina_ctx_download_texture_3d: dst_size (%zu) < required (%zu)", dst_size,
+               required_size);
   VkImage vk_image = hot->vk.image;
   VkFormat vk_format = hot->dims.format;
   VkImageLayout current_layout = hot->state.layout;
   VkAccessFlags current_access = hot->state.access;
   VkPipelineStageFlags current_stages = hot->state.stages;
-  hina_buffer_desc buf_desc = {0};
-  buf_desc.size = required_size;
-  buf_desc.flags = (hina_buffer_flags)(HINA_BUFFER_TRANSFER_DST_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
-  hina_buffer staging = hina_make_buffer_internal(ctx, &buf_desc);
-  if (staging.id == HINA_INVALID_HANDLE)
-  {
-    HINA_LOGE(ctx, "download_texture_3d: failed to create staging buffer");
-    return false;
-  }
-  uint16_t staging_idx = hina_id_index(staging.id);
-  hina_buffer_hot* staging_hot = HINA_BUF_HOT(staging_idx);
+  // Ensure persistent staging buffer is ready
+  void* staging_mapped = hina_staging_ensure_download_buffer(ctx, required_size);
+  HINA_ASSERTF(staging_mapped, "hina_ctx_download_texture_3d: failed to allocate staging buffer");
+  VkBuffer staging_buf = ctx->staging.download_staging_buf;
   // Determine if we need split-path handling (dedicated transfer queue)
   bool split = hina_staging_use_split(ctx, &ctx->staging);
   uint32_t xfer_family = ctx->staging.queue_family;
@@ -11951,22 +11920,12 @@ bool hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t 
   bool needs_qfot = split && xfer_family != gfx_family;
   // Acquire command buffers
   VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
-  if (!xfer_cmd)
-  {
-    HINA_LOGE(ctx, "download_texture_3d: failed to acquire staging command buffer");
-    hina_ctx_destroy_buffer(ctx, staging);
-    return false;
-  }
+  HINA_ASSERTF(xfer_cmd, "hina_ctx_download_texture_3d: failed to acquire staging command buffer");
   VkCommandBuffer gfx_cmd = xfer_cmd; // Same buffer if not split
   if (split)
   {
     gfx_cmd = hina_staging_ctx_acquire_gfx_cmd(ctx);
-    if (!gfx_cmd)
-    {
-      HINA_LOGE(ctx, "download_texture_3d: failed to acquire graphics command buffer");
-      hina_ctx_destroy_buffer(ctx, staging);
-      return false;
-    }
+    HINA_ASSERTF(gfx_cmd, "hina_ctx_download_texture_3d: failed to acquire graphics command buffer");
   }
   const VkImageAspectFlags aspect = hina_aspect_from_format(vk_format);
   VkImageSubresourceRange range = {aspect, mip, 1, 0, 1};
@@ -11992,7 +11951,7 @@ bool hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t 
     HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   }
   // Copy image to buffer (always on transfer queue)
-  hina_copy_image_to_buffer(xfer_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_hot->vk.buffer, 0,
+  hina_copy_image_to_buffer(xfer_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
                             (VkImageSubresourceLayers){aspect, mip, 0, 1}, (VkOffset3D){0, 0, (int32_t)z_offset},
                             (VkExtent3D){mip_width, mip_height, depth});
   if (needs_qfot)
@@ -12019,34 +11978,16 @@ bool hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t 
     HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   }
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
-  if (ticket)
-  {
-    hina_ctx_wait_ticket(ctx, ticket);
-  }
-  else
-  {
-    HINA_LOGE(ctx, "download_texture_3d: staging flush failed");
-    hina_ctx_destroy_buffer(ctx, staging);
-    return false;
-  }
-  if (staging_hot->vk.mapped)
-  {
-    memcpy(dst, staging_hot->vk.mapped, required_size);
-  }
-  else
-  {
-    HINA_LOGE(ctx, "download_texture_3d: staging buffer not mapped");
-    hina_ctx_destroy_buffer(ctx, staging);
-    return false;
-  }
-  hina_ctx_destroy_buffer(ctx, staging);
-  return true;
+  HINA_ASSERTF(ticket, "hina_ctx_download_texture_3d: staging flush failed");
+  hina_ctx_wait_ticket(ctx, ticket);
+  // Copy from staging buffer to user destination
+  memcpy(dst, staging_mapped, required_size);
 }
 
-bool hina_download_texture_3d(hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth, void* dst,
+void hina_download_texture_3d(hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth, void* dst,
                               size_t dst_size)
 {
-  return hina_ctx_download_texture_3d(&g_hina_ctx, src, mip, z_offset, depth, dst, dst_size);
+  hina_ctx_download_texture_3d(&g_hina_ctx, src, mip, z_offset, depth, dst, dst_size);
 }
 
 void hina_ctx_destroy_texture(hina_context* ctx, hina_texture tex)
