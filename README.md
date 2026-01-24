@@ -25,7 +25,8 @@ HinaVK is a heavily opinionated Vulkan abstraction layer designed to make common
 - Uses bind groups instead of descriptor sets (borrowed the idea from WebGPU)
 - Has its own shader format and compiler (HSL) so you can keep vertex + fragment in one file
 - Handles resource creation and destruction for you and manages them for you internally, so you only have to manage handles.
-- Zero calls to malloc/free outside of the shader compiler, which is optional.
+- Entirely internal memory management for both VMA and internal tracking. 
+- Works both for both single threaded and multi-threaded recording
 - 1 .c file, 1 .h file, and one .cpp file for volk/VMA implementation
 
 Unfortunately, in the spirit of write once use everywhere code, I don't expose platform-specific features like ray tracing or mesh shaders. If you need those, escape hatches to raw vulkan exist.
@@ -202,12 +203,11 @@ hina_shader vs = hina_make_shader(vs_spirv, vs_size);
 hina_shader fs = hina_make_shader(fs_spirv, fs_size);
 
 hina_pipeline pipeline = hina_make_pipeline_ex(&(hina_pipeline_desc_any){
-    .type = HINA_PIPELINE_GRAPHICS,
-    .graphics = {
-        .vs = &vs, .fs = &fs,
-        .vertex_layout = { ... },
+    .kind = HINA_PIPELINE_KIND_GRAPHICS,
+    .desc.graphics = {
+        .vs = vs, .fs = fs,
+        .layout = { ... },
         .color_formats = { HINA_FORMAT_B8G8R8A8_SRGB },
-        .color_count = 1,
     }
 });
 ```
@@ -303,8 +303,8 @@ I don't love exposing subpasses directly, so this is a simplified abstraction. I
 ```c
 hina_tile_pass_desc tile_pass = {
     .label = "deferred",
-    .subpass_count = 2,
-    
+    // Subpass count is derived automatically (first empty subpass terminates)
+
     // Subpass 0: G-Buffer fill
     .subpasses[0] = {
         .label = "gbuffer",
@@ -408,7 +408,7 @@ Timestamp queries for GPU profiling:
 
 ```c
 hina_query_pool timestamps = hina_make_query_pool(&(hina_query_pool_desc){
-    .type = HINA_QUERY_TIMESTAMP,
+    .type = HINA_QUERY_TYPE_TIMESTAMP,
     .count = 16
 });
 

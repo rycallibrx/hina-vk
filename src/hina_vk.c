@@ -11777,31 +11777,80 @@ bool hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip
   }
   uint16_t staging_idx = hina_id_index(staging.id);
   hina_buffer_hot* staging_hot = HINA_BUF_HOT(staging_idx);
-  // Get a staging command buffer
-  VkCommandBuffer vk_cmd = hina_staging_ctx_acquire_cmd(ctx);
-  if (!vk_cmd)
+  // Determine if we need split-path handling (dedicated transfer queue)
+  bool split = hina_staging_use_split(ctx, &ctx->staging);
+  uint32_t xfer_family = ctx->staging.queue_family;
+  uint32_t gfx_family = ctx->staging.gfx_queue_family;
+  bool needs_qfot = split && xfer_family != gfx_family;
+  // Acquire command buffers
+  VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
+  if (!xfer_cmd)
   {
     HINA_LOGE(ctx, "download_texture: failed to acquire staging command buffer");
     hina_ctx_destroy_buffer(ctx, staging);
     return false;
   }
-  // Transition to TRANSFER_SRC
+  VkCommandBuffer gfx_cmd = xfer_cmd; // Same buffer if not split
+  if (split)
+  {
+    gfx_cmd = hina_staging_ctx_acquire_gfx_cmd(ctx);
+    if (!gfx_cmd)
+    {
+      HINA_LOGE(ctx, "download_texture: failed to acquire graphics command buffer");
+      hina_ctx_destroy_buffer(ctx, staging);
+      return false;
+    }
+  }
   const VkImageAspectFlags aspect = hina_aspect_from_format(vk_format);
-  HINA_IMAGE_BARRIER(vk_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image,
-                     ((VkImageSubresourceRange){aspect, mip, 1, layer, 1}));
-  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  // Copy image to buffer
-  hina_copy_image_to_buffer(vk_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_hot->vk.buffer, 0,
+  VkImageSubresourceRange range = {aspect, mip, 1, layer, 1};
+  if (needs_qfot)
+  {
+    // Graphics queue: release ownership, transition to TRANSFER_SRC
+    HINA_IMAGE_BARRIER_QFOT(gfx_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, current_access, 0, current_layout,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gfx_family, xfer_family, vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+    // Transfer queue: acquire ownership
+    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gfx_family, xfer_family, vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  }
+  else
+  {
+    // Non-split: simple transition on single queue
+    HINA_IMAGE_BARRIER(xfer_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  }
+  // Copy image to buffer (always on transfer queue)
+  hina_copy_image_to_buffer(xfer_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_hot->vk.buffer, 0,
                             (VkImageSubresourceLayers){aspect, mip, layer, 1}, (VkOffset3D){0, 0, 0},
                             (VkExtent3D){mip_width, mip_height, 1});
-  // Transition back to original layout
-  HINA_IMAGE_BARRIER(vk_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                     current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                     VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
-                     vk_image, ((VkImageSubresourceRange){aspect, mip, 1, layer, 1}));
-  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  if (needs_qfot)
+  {
+    // Transfer queue: release ownership back to graphics
+    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
+                            xfer_family, gfx_family, vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+    // Graphics queue: acquire ownership, restore original layout
+    HINA_IMAGE_BARRIER_QFOT(gfx_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, current_access,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout, xfer_family, gfx_family, vk_image,
+                            range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  }
+  else
+  {
+    // Non-split: simple transition back
+    HINA_IMAGE_BARRIER(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                       VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
+                       vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  }
   // Flush staging and wait synchronously
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
   if (ticket)
@@ -11895,26 +11944,80 @@ bool hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t 
   }
   uint16_t staging_idx = hina_id_index(staging.id);
   hina_buffer_hot* staging_hot = HINA_BUF_HOT(staging_idx);
-  VkCommandBuffer vk_cmd = hina_staging_ctx_acquire_cmd(ctx);
-  if (!vk_cmd)
+  // Determine if we need split-path handling (dedicated transfer queue)
+  bool split = hina_staging_use_split(ctx, &ctx->staging);
+  uint32_t xfer_family = ctx->staging.queue_family;
+  uint32_t gfx_family = ctx->staging.gfx_queue_family;
+  bool needs_qfot = split && xfer_family != gfx_family;
+  // Acquire command buffers
+  VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
+  if (!xfer_cmd)
   {
     HINA_LOGE(ctx, "download_texture_3d: failed to acquire staging command buffer");
     hina_ctx_destroy_buffer(ctx, staging);
     return false;
   }
+  VkCommandBuffer gfx_cmd = xfer_cmd; // Same buffer if not split
+  if (split)
+  {
+    gfx_cmd = hina_staging_ctx_acquire_gfx_cmd(ctx);
+    if (!gfx_cmd)
+    {
+      HINA_LOGE(ctx, "download_texture_3d: failed to acquire graphics command buffer");
+      hina_ctx_destroy_buffer(ctx, staging);
+      return false;
+    }
+  }
   const VkImageAspectFlags aspect = hina_aspect_from_format(vk_format);
-  HINA_IMAGE_BARRIER(vk_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, ((VkImageSubresourceRange){aspect, mip, 1, 0, 1}));
-  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  hina_copy_image_to_buffer(vk_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_hot->vk.buffer, 0,
+  VkImageSubresourceRange range = {aspect, mip, 1, 0, 1};
+  if (needs_qfot)
+  {
+    // Graphics queue: release ownership, transition to TRANSFER_SRC
+    HINA_IMAGE_BARRIER_QFOT(gfx_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, current_access, 0, current_layout,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gfx_family, xfer_family, vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+    // Transfer queue: acquire ownership
+    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gfx_family, xfer_family, vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  }
+  else
+  {
+    // Non-split: simple transition on single queue
+    HINA_IMAGE_BARRIER(xfer_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  }
+  // Copy image to buffer (always on transfer queue)
+  hina_copy_image_to_buffer(xfer_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_hot->vk.buffer, 0,
                             (VkImageSubresourceLayers){aspect, mip, 0, 1}, (VkOffset3D){0, 0, (int32_t)z_offset},
                             (VkExtent3D){mip_width, mip_height, depth});
-  HINA_IMAGE_BARRIER(vk_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                     current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                     VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
-                     vk_image, ((VkImageSubresourceRange){aspect, mip, 1, 0, 1}));
-  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  if (needs_qfot)
+  {
+    // Transfer queue: release ownership back to graphics
+    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
+                            xfer_family, gfx_family, vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+    // Graphics queue: acquire ownership, restore original layout
+    HINA_IMAGE_BARRIER_QFOT(gfx_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, current_access,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout, xfer_family, gfx_family, vk_image,
+                            range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  }
+  else
+  {
+    // Non-split: simple transition back
+    HINA_IMAGE_BARRIER(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                       VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
+                       vk_image, range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  }
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
   if (ticket)
   {
