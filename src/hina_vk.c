@@ -1,3 +1,9 @@
+// MSVC warning suppressions (intentional patterns, not bugs)
+#ifdef _MSC_VER
+#pragma warning(disable: 4200)  // Zero-sized array (flexible array member - C99 standard)
+#pragma warning(disable: 4127)  // Conditional expression is constant (compile-time config pattern)
+#endif
+
 #include <assert.h>
 #include <stddef.h>
 #include <inttypes.h>
@@ -14735,7 +14741,7 @@ static hina_pipeline hina_make_compute_pipeline_internal(hina_context* ctx, cons
 
 static hina_pipeline hina_ctx_make_pipeline_ex(hina_context* ctx, const hina_pipeline_desc_any* desc)
 {
-  hina_pipeline result;
+  hina_pipeline result = {0};
   switch (desc->kind)
   {
   case HINA_PIPELINE_KIND_GRAPHICS:
@@ -14743,6 +14749,9 @@ static hina_pipeline hina_ctx_make_pipeline_ex(hina_context* ctx, const hina_pip
     break;
   case HINA_PIPELINE_KIND_COMPUTE:
     result = hina_make_compute_pipeline_internal(ctx, &desc->desc.compute);
+    break;
+  default:
+    HINA_ASSERTF(false, "hina_ctx_make_pipeline_ex: invalid pipeline kind %d", desc->kind);
     break;
   }
   return result;
@@ -17264,7 +17273,6 @@ void hina_cmd_begin_pass(hina_cmd* cmd, const hina_pass_action* action)
 HINA_NOINLINE static void hina_cmd_end_pass_legacy(hina_cmd* cmd)
 {
   HINA_ZONE_N("end_pass_leg");
-  hina_context* ctx = cmd->ctx;
   vkCmdEndRenderPass(cmd->vk_cmd);
   // Sync tracked state with render pass finalLayout (no barriers needed - render pass handles transitions)
   if (cmd->color_count && hina_texture_view_slot_valid(cmd->color_views[0]))
@@ -17539,8 +17547,8 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
           .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
         };
         tex_hot->state.layout = layout;
-        tex_hot->state.stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-        tex_hot->state.access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
+        tex_hot->state.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        tex_hot->state.access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
       }
       VkRenderingAttachmentInfo att = {
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view_slot->view, .imageLayout = layout,
@@ -17841,13 +17849,13 @@ static void hina_end_tile_pass_dynamic(hina_cmd* cmd)
       };
       hot->state.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
       hot->state.access = 0;
-      hot->state.stages = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+      hot->state.stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     }
     else
     {
       hot->state.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      hot->state.access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
-      hot->state.stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      hot->state.access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+      hot->state.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     }
   }
   for (uint32_t i = 0; i < cmd->color_count; i++)
@@ -17873,13 +17881,13 @@ static void hina_end_tile_pass_dynamic(hina_cmd* cmd)
       };
       hot->state.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
       hot->state.access = 0;
-      hot->state.stages = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+      hot->state.stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     }
     else
     {
       hot->state.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      hot->state.access = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
-      hot->state.stages = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      hot->state.access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+      hot->state.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     }
   }
   if (barrier_count > 0)
@@ -18175,7 +18183,6 @@ static void hina_debug_check_pipeline_formats(hina_cmd* cmd, const hina_pipeline
   HINA_ASSERT(cmd && e);
   if (e->kind != HINA_PIPELINE_KIND_GRAPHICS) return;
   if (!cmd->is_rendering || !vkCmdBeginRendering) return;
-  hina_context* ctx = cmd->ctx;
   hina_pass_layout layout = e->kind_data.graphics.pass_layout;
   uint32_t expected_color_count = hina_pass_layout_color_count(layout);
   if (expected_color_count == 0) return;
@@ -27619,7 +27626,7 @@ static bool hslc_reflect_push_constants(const hina_shader_stage_data* vs, const 
 {
   *out_push_constants = NULL;
   *out_count = 0;
-  SpvReflectShaderModule vs_module, tcs_module, tes_module, gs_module, fs_module, cs_module;
+  SpvReflectShaderModule vs_module = {0}, tcs_module = {0}, tes_module = {0}, gs_module = {0}, fs_module = {0}, cs_module = {0};
   bool vs_ok = vs && vs->spirv_data && spvReflectCreateShaderModule(vs->spirv_size, vs->spirv_data, &vs_module) ==
     SPV_REFLECT_RESULT_SUCCESS;
   bool tcs_ok = tcs && tcs->spirv_data && spvReflectCreateShaderModule(tcs->spirv_size, tcs->spirv_data, &tcs_module) ==
