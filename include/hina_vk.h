@@ -1108,6 +1108,68 @@ HINA_API void hina_wait_ticket(hina_ticket ticket);
 HINA_API void hina_ctx_wait_ticket(hina_context* ctx, hina_ticket ticket);
 
 // ===========================================================================
+//  Swapchain & Presentation
+// ===========================================================================
+typedef enum
+{
+  HINA_PRESENT_MODE_FIFO = 0, // Vsync, always available (default)
+  HINA_PRESENT_MODE_MAILBOX, // No vsync, no tearing (falls back to FIFO)
+  HINA_PRESENT_MODE_IMMEDIATE, // Lowest latency, may tear (falls back to MAILBOX→FIFO)
+} hina_present_mode;
+
+typedef enum
+{
+  HINA_SWAPCHAIN_TRANSPARENT_BIT = HINA_FLAG_BIT(0), // Alpha compositing with desktop
+  HINA_SWAPCHAIN_PREROTATE_BIT   = HINA_FLAG_BIT(1), // Use surface preTransform (power saving on Android)
+} hina_swapchain_flags;
+
+typedef enum
+{
+  HINA_COLOR_SPACE_SRGB_NONLINEAR = 0,
+  HINA_COLOR_SPACE_DISPLAY_P3_NONLINEAR = 1000104001,
+  HINA_COLOR_SPACE_EXTENDED_SRGB_LINEAR = 1000104002,
+  HINA_COLOR_SPACE_DISPLAY_P3_LINEAR = 1000104003,
+  HINA_COLOR_SPACE_DCI_P3_NONLINEAR = 1000104004,
+  HINA_COLOR_SPACE_BT709_LINEAR = 1000104005,
+  HINA_COLOR_SPACE_BT709_NONLINEAR = 1000104006,
+  HINA_COLOR_SPACE_BT2020_LINEAR = 1000104007,
+  HINA_COLOR_SPACE_HDR10_ST2084 = 1000104008,
+  HINA_COLOR_SPACE_DOLBYVISION = 1000104009,
+  HINA_COLOR_SPACE_HDR10_HLG = 1000104010,
+  HINA_COLOR_SPACE_ADOBERGB_LINEAR = 1000104011,
+  HINA_COLOR_SPACE_ADOBERGB_NONLINEAR = 1000104012,
+  HINA_COLOR_SPACE_PASS_THROUGH = 1000104013,
+  HINA_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR = 1000104014
+} hina_color_space;
+
+typedef struct hina_swapchain_desc
+{
+  hina_swapchain_flags flags;
+  hina_present_mode present_mode; // 0 = FIFO (vsync, default)
+  hina_format preferred_format; // HINA_FORMAT_UNDEFINED = auto
+  hina_color_space preferred_color_space; // 0 = SRGB_NONLINEAR (default)
+} hina_swapchain_desc;
+
+// Defaults: present_mode=FIFO, format/color_space=auto
+HINA_API hina_swapchain_desc hina_swapchain_desc_default(void);
+
+HINA_API void hina_configure_swapchain(const hina_swapchain_desc* desc);
+
+// Get swapchain prerotation angle in degrees (0, 90, 180, or 270).
+// Returns 0 unless HINA_SWAPCHAIN_PREROTATE_BIT was set.
+// When non-zero, apply rotation to projection matrix: proj = rotate_z(radians(angle)) * proj
+HINA_API float hina_get_swapchain_prerotation(void);
+
+// Surface lost state (for Android lifecycle handling)
+// Returns true if surface was lost and needs recreation via hina_recreate_surface()
+HINA_API bool hina_is_surface_lost(void);
+
+// Recreate Vulkan surface after it was lost (Android lifecycle, BufferQueue abandoned)
+// Call this when SDL provides a new native window (e.g., SDL_APP_DIDENTERFOREGROUND)
+// Returns true on success, false on failure
+HINA_API bool hina_recreate_surface(void* native_window, void* native_display);
+
+// ===========================================================================
 //  Frame Index Queries
 // ===========================================================================
 /**
@@ -1131,22 +1193,6 @@ HINA_API uint64_t hina_get_frame_index(void);
  * @return Last completed frame index, or 0 if no frames have completed.
  */
 HINA_API uint64_t hina_get_completed_frame_index(void);
-
-// ===========================================================================
-//  Diagnostics
-// ===========================================================================
-typedef struct hina_gpu_memory_stats
-{
-  uint64_t total_bytes;
-  uint64_t usage_bytes;
-} hina_gpu_memory_stats;
-
-/**
- * @brief Query device-local GPU memory usage.
- *
- * Returns false if no device is initialized.
- */
-HINA_API bool hina_get_gpu_memory_stats(hina_gpu_memory_stats* out_stats);
 
 // ===========================================================================
 //  Buffers
@@ -1187,11 +1233,13 @@ typedef enum
 
 typedef struct hina_buffer_desc
 {
+  // 8-byte aligned fields first (no padding between them)
   size_t size;
-  hina_buffer_flags flags;
   const void* initial_data; // If non-NULL, data is uploaded via staging buffer
-  hina_queue initial_owner; // Queue that initially owns this buffer (default: HINA_QUEUE_GRAPHICS)
   const char* label; // Optional debug label (shows in RenderDoc, validation layers)
+  // 4-byte fields grouped together
+  hina_buffer_flags flags;
+  hina_queue initial_owner; // Queue that initially owns this buffer (default: HINA_QUEUE_GRAPHICS)
 } hina_buffer_desc;
 
 // Zero-initialize hina_buffer_desc; all fields default to 0/NULL.
@@ -1363,41 +1411,6 @@ HINA_API void hina_destroy_texture_view(hina_texture_view view);
 HINA_API bool hina_texture_view_is_valid(hina_texture_view view);
 
 // ---------------------------------------------------------------------------
-//  Pass Layout
-// ---------------------------------------------------------------------------
-/**
- * @brief Create a pass layout from attachment formats.
- *
- * @param color_formats Array of color attachment formats
- * @param color_count   Number of color attachments (0-4)
- * @param depth_format  Depth/stencil format (HINA_FORMAT_UNDEFINED if none)
- * @param samples       Sample count (1, 2, 4, 8)
- * @return Pass layout key
- */
-HINA_API hina_pass_layout hina_pass_layout_make(const hina_format* color_formats, uint32_t color_count,
-                                                hina_format depth_format, uint32_t samples);
-
-/**
- * @brief Get the color format at the specified index from a pass layout.
- */
-HINA_API hina_format hina_pass_layout_color_format(hina_pass_layout layout, uint32_t index);
-
-/**
- * @brief Get the depth/stencil format from a pass layout.
- */
-HINA_API hina_format hina_pass_layout_depth_format(hina_pass_layout layout);
-
-/**
- * @brief Get the sample count from a pass layout.
- */
-HINA_API uint32_t hina_pass_layout_samples(hina_pass_layout layout);
-
-/**
- * @brief Get the number of color attachments in a pass layout.
- */
-HINA_API uint32_t hina_pass_layout_color_count(hina_pass_layout layout);
-
-// ---------------------------------------------------------------------------
 //  Texture Download
 // ---------------------------------------------------------------------------
 /**
@@ -1498,6 +1511,42 @@ HINA_API hina_sampler hina_make_sampler(const hina_sampler_desc* desc);
 HINA_API void hina_destroy_sampler(hina_sampler samp);
 
 HINA_API void hina_ctx_destroy_sampler(hina_context* ctx, hina_sampler samp);
+
+// ===========================================================================
+//  Pass Layout
+// ===========================================================================
+// ---------------------------------------------------------------------------
+/**
+ * @brief Create a pass layout from attachment formats.
+ *
+ * @param color_formats Array of color attachment formats
+ * @param color_count   Number of color attachments (0-4)
+ * @param depth_format  Depth/stencil format (HINA_FORMAT_UNDEFINED if none)
+ * @param samples       Sample count (1, 2, 4, 8)
+ * @return Pass layout key
+ */
+HINA_API hina_pass_layout hina_pass_layout_make(const hina_format* color_formats, uint32_t color_count,
+                                                hina_format depth_format, uint32_t samples);
+
+/**
+ * @brief Get the color format at the specified index from a pass layout.
+ */
+HINA_API hina_format hina_pass_layout_color_format(hina_pass_layout layout, uint32_t index);
+
+/**
+ * @brief Get the depth/stencil format from a pass layout.
+ */
+HINA_API hina_format hina_pass_layout_depth_format(hina_pass_layout layout);
+
+/**
+ * @brief Get the sample count from a pass layout.
+ */
+HINA_API uint32_t hina_pass_layout_samples(hina_pass_layout layout);
+
+/**
+ * @brief Get the number of color attachments in a pass layout.
+ */
+HINA_API uint32_t hina_pass_layout_color_count(hina_pass_layout layout);
 
 // ===========================================================================
 //  Bind Groups (WebGPU-style descriptor management)
@@ -1603,10 +1652,12 @@ typedef struct hina_bind_group_entry
  */
 typedef struct hina_bind_group_desc
 {
-  hina_bind_group_layout layout; // Layout this group conforms to
+  // 8-byte aligned fields first
   const hina_bind_group_entry* entries;
-  uint32_t entry_count; // Must match layout's entry count
   const char* label; // Optional debug label
+  // 4-byte fields grouped together
+  hina_bind_group_layout layout; // Layout this group conforms to
+  uint32_t entry_count; // Must match layout's entry count
 } hina_bind_group_desc;
 
 // ---------------------------------------------------------------------------
@@ -2903,7 +2954,6 @@ typedef struct hina_tile_subpass_layout
   uint32_t color_count; // Must be <= HINA_MAX_COLOR_ATTACHMENTS
   hina_format depth_format; // HINA_FORMAT_UNDEFINED = no depth (for other subpasses)
   bool depth_read_only; // Must match runtime for render pass compatibility
-  uint8_t pad[3]; // Padding for alignment
   hina_tile_input tile_inputs[HINA_MAX_TILE_INPUTS]; // Input attachment mappings
   uint32_t input_count; // Must be <= HINA_MAX_TILE_INPUTS
 } hina_tile_subpass_layout;
@@ -3134,68 +3184,6 @@ HINA_API void hina_cmd_acquire_texture(hina_cmd* cmd, hina_texture tex, hina_que
 HINA_API void hina_cmd_acquire_buffer(hina_cmd* cmd, hina_buffer buf, hina_queue src_queue);
 
 // ===========================================================================
-//  Swapchain & Presentation
-// ===========================================================================
-typedef enum
-{
-  HINA_PRESENT_MODE_FIFO = 0, // Vsync, always available (default)
-  HINA_PRESENT_MODE_MAILBOX, // No vsync, no tearing (falls back to FIFO)
-  HINA_PRESENT_MODE_IMMEDIATE, // Lowest latency, may tear (falls back to MAILBOX→FIFO)
-} hina_present_mode;
-
-typedef enum
-{
-  HINA_SWAPCHAIN_TRANSPARENT_BIT = HINA_FLAG_BIT(0), // Alpha compositing with desktop
-  HINA_SWAPCHAIN_PREROTATE_BIT   = HINA_FLAG_BIT(1), // Use surface preTransform (power saving on Android)
-} hina_swapchain_flags;
-
-typedef enum
-{
-  HINA_COLOR_SPACE_SRGB_NONLINEAR = 0,
-  HINA_COLOR_SPACE_DISPLAY_P3_NONLINEAR = 1000104001,
-  HINA_COLOR_SPACE_EXTENDED_SRGB_LINEAR = 1000104002,
-  HINA_COLOR_SPACE_DISPLAY_P3_LINEAR = 1000104003,
-  HINA_COLOR_SPACE_DCI_P3_NONLINEAR = 1000104004,
-  HINA_COLOR_SPACE_BT709_LINEAR = 1000104005,
-  HINA_COLOR_SPACE_BT709_NONLINEAR = 1000104006,
-  HINA_COLOR_SPACE_BT2020_LINEAR = 1000104007,
-  HINA_COLOR_SPACE_HDR10_ST2084 = 1000104008,
-  HINA_COLOR_SPACE_DOLBYVISION = 1000104009,
-  HINA_COLOR_SPACE_HDR10_HLG = 1000104010,
-  HINA_COLOR_SPACE_ADOBERGB_LINEAR = 1000104011,
-  HINA_COLOR_SPACE_ADOBERGB_NONLINEAR = 1000104012,
-  HINA_COLOR_SPACE_PASS_THROUGH = 1000104013,
-  HINA_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR = 1000104014
-} hina_color_space;
-
-typedef struct hina_swapchain_desc
-{
-  hina_swapchain_flags flags;
-  hina_present_mode present_mode; // 0 = FIFO (vsync, default)
-  hina_format preferred_format; // HINA_FORMAT_UNDEFINED = auto
-  hina_color_space preferred_color_space; // 0 = SRGB_NONLINEAR (default)
-} hina_swapchain_desc;
-
-// Defaults: present_mode=FIFO, format/color_space=auto
-HINA_API hina_swapchain_desc hina_swapchain_desc_default(void);
-
-HINA_API void hina_configure_swapchain(const hina_swapchain_desc* desc);
-
-// Get swapchain prerotation angle in degrees (0, 90, 180, or 270).
-// Returns 0 unless HINA_SWAPCHAIN_PREROTATE_BIT was set.
-// When non-zero, apply rotation to projection matrix: proj = rotate_z(radians(angle)) * proj
-HINA_API float hina_get_swapchain_prerotation(void);
-
-// Surface lost state (for Android lifecycle handling)
-// Returns true if surface was lost and needs recreation via hina_recreate_surface()
-HINA_API bool hina_is_surface_lost(void);
-
-// Recreate Vulkan surface after it was lost (Android lifecycle, BufferQueue abandoned)
-// Call this when SDL provides a new native window (e.g., SDL_APP_DIDENTERFOREGROUND)
-// Returns true on success, false on failure
-HINA_API bool hina_recreate_surface(void* native_window, void* native_display);
-
-// ===========================================================================
 //  Query Pools & Profiling
 // ===========================================================================
 typedef enum
@@ -3230,20 +3218,21 @@ HINA_API bool hina_get_query_results(hina_query_pool pool, uint32_t first_query,
 
 double hina_timestamp_to_ns(uint64_t timestamp_delta);
 
-/**
- * @brief Profiler hooks for external profiling tools (e.g., Tracy, Optick, PIX).
- * The user_data field is passed to both callbacks, allowing stateful profiling.
- */
-typedef struct hina_profiler_hooks
+// ===========================================================================
+//  Diagnostics
+// ===========================================================================
+typedef struct hina_gpu_memory_stats
 {
-  void (*gpu_zone_begin)(hina_cmd* cmd, const char* name, void* user_data);
+  uint64_t total_bytes;
+  uint64_t usage_bytes;
+} hina_gpu_memory_stats;
 
-  void (*gpu_zone_end)(hina_cmd* cmd, void* user_data);
-
-  void* user_data;
-} hina_profiler_hooks;
-
-HINA_API void hina_set_profiler_hooks(const hina_profiler_hooks* hooks);
+/**
+ * @brief Query device-local GPU memory usage.
+ *
+ * Returns false if no device is initialized.
+ */
+HINA_API bool hina_get_gpu_memory_stats(hina_gpu_memory_stats* out_stats);
 
 // ===========================================================================
 //  Debug Utilities

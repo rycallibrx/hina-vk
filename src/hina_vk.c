@@ -2911,9 +2911,8 @@ typedef struct hina_context
     VkDescriptorPool temp_desc_pools[HINA_MAX_FRAMES_IN_FLIGHT];
   } alloc;
 
-  // Staging & profiling
+  // Staging
   hina_staging_context staging;
-  hina_profiler_hooks profiler;
 #ifdef HINA_DEBUG
   struct
   {
@@ -4769,23 +4768,6 @@ static VkBufferUsageFlags hina_buffer_flags_to_vk_usage(hina_buffer_flags flags)
   if (flags & HINA_BUFFER_TRANSFER_SRC_BIT) vk_flags |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
   if (flags & HINA_BUFFER_TRANSFER_DST_BIT) vk_flags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   return vk_flags;
-}
-
-static void hina_ctx_set_profiler_hooks(hina_context* ctx, const hina_profiler_hooks* hooks)
-{
-  if (hooks)
-  {
-    ctx->profiler = *hooks;
-  }
-  else
-  {
-    memset(&ctx->profiler, 0, sizeof(ctx->profiler));
-  }
-}
-
-void hina_set_profiler_hooks(const hina_profiler_hooks* hooks)
-{
-  hina_ctx_set_profiler_hooks(&g_hina_ctx, hooks);
 }
 
 static const VkFormat g_hina_to_vk_format[HINA_FORMAT_ASTC_12x12_SRGB_BLOCK + 1] = {
@@ -15855,10 +15837,6 @@ hina_cmd* hina_ctx_cmd_begin_ex(hina_context* ctx, hina_queue queue)
   cmd->cross_queue_wait_count = 0;
   for (uint32_t i = 0; i < HINA_MAX_QUEUE_LANES; ++i) cmd->cross_queue_wait_tickets[i] = 0;
   for (uint32_t i = 0; i < HINA_MAX_QUEUE_LANES; ++i) cmd->cross_queue_wait_stages[i] = 0;
-  if (ctx->profiler.gpu_zone_begin)
-  {
-    ctx->profiler.gpu_zone_begin(cmd, "hina_cmd", ctx->profiler.user_data);
-  }
   return cmd;
 }
 
@@ -15873,10 +15851,6 @@ void hina_cmd_end(hina_cmd* cmd)
   HINA_ASSERTF(cmd->recording, "hina_cmd_end: command buffer not recording");
   // Vulkan spec: commandBuffer must be in recording state
   HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_end: vk_cmd is NULL");
-  if (cmd->ctx->profiler.gpu_zone_end)
-  {
-    cmd->ctx->profiler.gpu_zone_end(cmd, cmd->ctx->profiler.user_data);
-  }
   // Vulkan spec: vkEndCommandBuffer can return VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY, VK_ERROR_OUT_OF_DEVICE_MEMORY
   // Vulkan spec: If there was an error during recording, the command buffer will be in invalid state
   VkResult result = vkEndCommandBuffer(cmd->vk_cmd);
@@ -15934,7 +15908,6 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
   hina_context* ctx = cmd->ctx;
   HINA_DEBUG_INC_PASS(ctx);
   HINA_GPU_ZONE_BEGIN(ctx->core.device, cmd, "render_pass");
-  if (ctx->profiler.gpu_zone_begin) ctx->profiler.gpu_zone_begin(cmd, "hina_pass", ctx->profiler.user_data);
   const bool transient_color = (action->flags & HINA_PASS_TRANSIENT_COLOR_BIT) != 0;
   const bool transient_depth = (action->flags & HINA_PASS_TRANSIENT_DEPTH_BIT) != 0;
   {
@@ -16109,7 +16082,6 @@ HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_sync2(hina_cmd* cmd, const
   hina_context* ctx = cmd->ctx;
   HINA_DEBUG_INC_PASS(ctx);
   HINA_GPU_ZONE_BEGIN(ctx->core.device, cmd, "render_pass");
-  if (ctx->profiler.gpu_zone_begin) ctx->profiler.gpu_zone_begin(cmd, "hina_pass", ctx->profiler.user_data);
   const bool transient_color = (action->flags & HINA_PASS_TRANSIENT_COLOR_BIT) != 0;
   const bool transient_depth = (action->flags & HINA_PASS_TRANSIENT_DEPTH_BIT) != 0;
   VkRenderingAttachmentInfo color_infos[HINA_MAX_COLOR_ATTACHMENTS];
@@ -16309,7 +16281,6 @@ HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_legacy(hina_cmd* cmd, cons
   hina_context* ctx = cmd->ctx;
   HINA_DEBUG_INC_PASS(ctx);
   HINA_GPU_ZONE_BEGIN(ctx->core.device, cmd, "render_pass");
-  if (ctx->profiler.gpu_zone_begin) ctx->profiler.gpu_zone_begin(cmd, "hina_pass", ctx->profiler.user_data);
   const bool transient_color = (action->flags & HINA_PASS_TRANSIENT_COLOR_BIT) != 0;
   const bool transient_depth = (action->flags & HINA_PASS_TRANSIENT_DEPTH_BIT) != 0;
   VkRenderingAttachmentInfo color_infos[HINA_MAX_COLOR_ATTACHMENTS];
@@ -16568,7 +16539,6 @@ HINA_NOINLINE static void hina_cmd_end_pass_legacy(hina_cmd* cmd)
   cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE};
   cmd->is_rendering = false;
   HINA_GPU_ZONE_END(cmd);
-  if (ctx->profiler.gpu_zone_end) ctx->profiler.gpu_zone_end(cmd, ctx->profiler.user_data);
   HINA_ZONE_END();
 }
 
@@ -16709,7 +16679,6 @@ HINA_NOINLINE static void hina_cmd_end_pass_dynamic(hina_cmd* cmd)
   cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE};
   cmd->is_rendering = false;
   HINA_GPU_ZONE_END(cmd);
-  if (ctx->profiler.gpu_zone_end) ctx->profiler.gpu_zone_end(cmd, ctx->profiler.user_data);
   HINA_ZONE_END();
 }
 
