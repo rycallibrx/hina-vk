@@ -338,8 +338,8 @@ static bool example_init(hina_example_app *app)
     // Create Model VBO/IBO
     hina_buffer_desc model_vbo_desc = {0};
     model_vbo_desc.size = g_app.model.vertices.size() * sizeof(Vertex);
-    model_vbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    model_vbo_desc.memory = HINA_BUFFER_CPU;
+    model_vbo_desc.usage = HINA_BUFFER_VERTEX;
     model_vbo_desc.initial_data = g_app.model.vertices.data();
 
     g_app.model_vbo = hina_make_buffer(&model_vbo_desc);
@@ -351,8 +351,8 @@ static bool example_init(hina_example_app *app)
 
     hina_buffer_desc model_ibo_desc = {0};
     model_ibo_desc.size = g_app.model.indices.size() * sizeof(uint32_t);
-    model_ibo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    model_ibo_desc.memory = HINA_BUFFER_CPU;
+    model_ibo_desc.usage = HINA_BUFFER_INDEX;
     model_ibo_desc.initial_data = g_app.model.indices.data();
 
     g_app.model_ibo = hina_make_buffer(&model_ibo_desc);
@@ -365,8 +365,8 @@ static bool example_init(hina_example_app *app)
     // Create Mirror VBO/IBO
     hina_buffer_desc mirror_vbo_desc = {0};
     mirror_vbo_desc.size = g_app.mirror.vertices.size() * sizeof(MirrorVertex);
-    mirror_vbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    mirror_vbo_desc.memory = HINA_BUFFER_CPU;
+    mirror_vbo_desc.usage = HINA_BUFFER_VERTEX;
     mirror_vbo_desc.initial_data = g_app.mirror.vertices.data();
 
     g_app.mirror_vbo = hina_make_buffer(&mirror_vbo_desc);
@@ -378,8 +378,8 @@ static bool example_init(hina_example_app *app)
 
     hina_buffer_desc mirror_ibo_desc = {0};
     mirror_ibo_desc.size = g_app.mirror.indices.size() * sizeof(uint32_t);
-    mirror_ibo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    mirror_ibo_desc.memory = HINA_BUFFER_CPU;
+    mirror_ibo_desc.usage = HINA_BUFFER_INDEX;
     mirror_ibo_desc.initial_data = g_app.mirror.indices.data();
 
     g_app.mirror_ibo = hina_make_buffer(&mirror_ibo_desc);
@@ -392,8 +392,8 @@ static bool example_init(hina_example_app *app)
     // Create Uniform Buffers
     hina_buffer_desc offscreen_ubo_desc = {0};
     offscreen_ubo_desc.size = sizeof(PhongUBO);
-    offscreen_ubo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    offscreen_ubo_desc.memory = HINA_BUFFER_CPU;
+    offscreen_ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
     g_app.offscreen_ubo = hina_make_buffer(&offscreen_ubo_desc);
     if (!hina_buffer_is_valid(g_app.offscreen_ubo))
@@ -401,12 +401,12 @@ static bool example_init(hina_example_app *app)
         EXAMPLE_LOGE("Failed to create offscreen UBO");
         return false;
     }
-    g_app.offscreen_ubo_mapped = static_cast<PhongUBO *>(hina_map_buffer(g_app.offscreen_ubo));
+    g_app.offscreen_ubo_mapped = static_cast<PhongUBO *>(hina_mapped_buffer_ptr(g_app.offscreen_ubo));
 
     hina_buffer_desc model_ubo_desc = {0};
     model_ubo_desc.size = sizeof(PhongUBO);
-    model_ubo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    model_ubo_desc.memory = HINA_BUFFER_CPU;
+    model_ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
     g_app.model_ubo = hina_make_buffer(&model_ubo_desc);
     if (!hina_buffer_is_valid(g_app.model_ubo))
@@ -414,12 +414,12 @@ static bool example_init(hina_example_app *app)
         EXAMPLE_LOGE("Failed to create model UBO");
         return false;
     }
-    g_app.model_ubo_mapped = static_cast<PhongUBO *>(hina_map_buffer(g_app.model_ubo));
+    g_app.model_ubo_mapped = static_cast<PhongUBO *>(hina_mapped_buffer_ptr(g_app.model_ubo));
 
     hina_buffer_desc mirror_ubo_desc = {0};
     mirror_ubo_desc.size = sizeof(MirrorUBO);
-    mirror_ubo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    mirror_ubo_desc.memory = HINA_BUFFER_CPU;
+    mirror_ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
     g_app.mirror_ubo = hina_make_buffer(&mirror_ubo_desc);
     if (!hina_buffer_is_valid(g_app.mirror_ubo))
@@ -427,12 +427,12 @@ static bool example_init(hina_example_app *app)
         EXAMPLE_LOGE("Failed to create mirror UBO");
         return false;
     }
-    g_app.mirror_ubo_mapped = static_cast<MirrorUBO *>(hina_map_buffer(g_app.mirror_ubo));
+    g_app.mirror_ubo_mapped = static_cast<MirrorUBO *>(hina_mapped_buffer_ptr(g_app.mirror_ubo));
 
     hina_buffer_desc debug_ubo_desc = {0};
     debug_ubo_desc.size = sizeof(DebugUBO);
-    debug_ubo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    debug_ubo_desc.memory = HINA_BUFFER_CPU;
+    debug_ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
     g_app.debug_ubo = hina_make_buffer(&debug_ubo_desc);
     if (!hina_buffer_is_valid(g_app.debug_ubo))
@@ -440,7 +440,7 @@ static bool example_init(hina_example_app *app)
         EXAMPLE_LOGE("Failed to create debug UBO");
         return false;
     }
-    g_app.debug_ubo_mapped = static_cast<DebugUBO *>(hina_map_buffer(g_app.debug_ubo));
+    g_app.debug_ubo_mapped = static_cast<DebugUBO *>(hina_mapped_buffer_ptr(g_app.debug_ubo));
 
     // Create Offscreen Framebuffer
     if (!offscreen_init(&g_app.offscreen, OFFSCREEN_WIDTH, OFFSCREEN_HEIGHT))
@@ -508,6 +508,7 @@ static bool example_init(hina_example_app *app)
     model_pip_desc.layout = model_layout;
     model_pip_desc.front_face = HINA_FRONT_FACE_COUNTER_CLOCKWISE;
     model_pip_desc.cull_mode = HINA_CULL_MODE_BACK;
+    model_pip_desc.color_formats[0] = hina_get_surface_format();
     model_pip_desc.depth_format = HINA_FORMAT_D32_SFLOAT;
 
     g_app.model_pipeline = hina_example_make_pipeline_from_hsl(app, phong_shader_path, &model_pip_desc, &error);
@@ -537,6 +538,7 @@ static bool example_init(hina_example_app *app)
     mirror_pip_desc.layout = mirror_layout1;
     mirror_pip_desc.front_face = HINA_FRONT_FACE_COUNTER_CLOCKWISE;
     mirror_pip_desc.cull_mode = HINA_CULL_MODE_BACK;
+    mirror_pip_desc.color_formats[0] = hina_get_surface_format();
     mirror_pip_desc.depth_format = HINA_FORMAT_D32_SFLOAT;
 
     g_app.mirror_pipeline = hina_example_make_pipeline_from_hsl(app, mirror_shader_path, &mirror_pip_desc, &error);
@@ -558,6 +560,7 @@ static bool example_init(hina_example_app *app)
     hina_hsl_pipeline_desc debug_pip_desc = hina_hsl_pipeline_desc_default();
     debug_pip_desc.layout = debug_layout;
     debug_pip_desc.cull_mode = HINA_CULL_MODE_NONE;
+    debug_pip_desc.color_formats[0] = hina_get_surface_format();
     debug_pip_desc.depth.depth_test = false;
     debug_pip_desc.depth.depth_write = false;
 

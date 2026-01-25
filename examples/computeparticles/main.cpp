@@ -121,9 +121,9 @@ static bool example_init(hina_example_app* app) {
     // Storage buffers that can also be used as vertex buffers
     hina_buffer_desc ssbo_desc = {0};
     ssbo_desc.size = sizeof(Particle) * PARTICLE_COUNT;
-    ssbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_STORAGE_BIT | HINA_BUFFER_VERTEX_BIT |
-        HINA_BUFFER_TRANSFER_DST_BIT | HINA_BUFFER_DEVICE_LOCAL_BIT);
+    ssbo_desc.memory = HINA_BUFFER_GPU;
+    ssbo_desc.usage = static_cast<hina_buffer_usage>(
+        HINA_BUFFER_STORAGE | HINA_BUFFER_VERTEX | HINA_BUFFER_TRANSFER_DST);
     ssbo_desc.initial_data = initialParticles.data();
 
     g_app.ssbo_in = hina_make_buffer(&ssbo_desc);
@@ -141,8 +141,8 @@ static bool example_init(hina_example_app* app) {
     // Create Compute UBO
     hina_buffer_desc ubo_desc = {0};
     ubo_desc.size = sizeof(ComputeUBO);
-    ubo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ubo_desc.memory = HINA_BUFFER_CPU;
+    ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
     g_app.compute_ubo = hina_make_buffer(&ubo_desc);
     if (!hina_buffer_is_valid(g_app.compute_ubo)) {
@@ -150,7 +150,7 @@ static bool example_init(hina_example_app* app) {
         return false;
     }
 
-    g_app.ubo = static_cast<ComputeUBO*>(hina_map_buffer(g_app.compute_ubo));
+  g_app.ubo = static_cast<ComputeUBO*>(hina_mapped_buffer_ptr(g_app.compute_ubo));
     if (!g_app.ubo) {
         EXAMPLE_LOGE("Failed to map compute UBO");
         return false;
@@ -195,6 +195,7 @@ static bool example_init(hina_example_app* app) {
     gfx_pip_desc.primitive_topology = HINA_PRIMITIVE_TOPOLOGY_POINT_LIST;
     gfx_pip_desc.cull_mode = HINA_CULL_MODE_NONE;
     gfx_pip_desc.layout = vertex_layout;
+    gfx_pip_desc.color_formats[0] = hina_get_surface_format();
 
     // Additive blending for glowing particles
     gfx_pip_desc.blend[0].enable = true;

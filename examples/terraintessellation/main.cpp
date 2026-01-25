@@ -261,7 +261,8 @@ static bool example_init(hina_example_app* app) {
     // Create Vertex Buffer
     hina_buffer_desc vbo_desc = {0};
     vbo_desc.size = g_app.mesh.vertices.size() * sizeof(Vertex);
-    vbo_desc.flags = static_cast<hina_buffer_flags>(HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    vbo_desc.memory = HINA_BUFFER_CPU;
+    vbo_desc.usage = HINA_BUFFER_VERTEX;
     vbo_desc.initial_data = g_app.mesh.vertices.data();
 
     g_app.vbo = hina_make_buffer(&vbo_desc);
@@ -273,7 +274,8 @@ static bool example_init(hina_example_app* app) {
     // Create Index Buffer
     hina_buffer_desc ibo_desc = {0};
     ibo_desc.size = g_app.mesh.indices.size() * sizeof(uint32_t);
-    ibo_desc.flags = static_cast<hina_buffer_flags>(HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ibo_desc.memory = HINA_BUFFER_CPU;
+    ibo_desc.usage = HINA_BUFFER_INDEX;
     ibo_desc.initial_data = g_app.mesh.indices.data();
 
     g_app.ibo = hina_make_buffer(&ibo_desc);
@@ -315,7 +317,8 @@ static bool example_init(hina_example_app* app) {
     // Create Uniform Buffer
     hina_buffer_desc ubo_desc = {0};
     ubo_desc.size = sizeof(SceneUBO);
-    ubo_desc.flags = static_cast<hina_buffer_flags>(HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ubo_desc.memory = HINA_BUFFER_CPU;
+    ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
     g_app.ubo_buffer = hina_make_buffer(&ubo_desc);
     if (!hina_buffer_is_valid(g_app.ubo_buffer)) {
@@ -323,7 +326,7 @@ static bool example_init(hina_example_app* app) {
         return false;
     }
 
-    g_app.ubo_mapped = static_cast<SceneUBO*>(hina_map_buffer(g_app.ubo_buffer));
+  g_app.ubo_mapped = static_cast<SceneUBO*>(hina_mapped_buffer_ptr(g_app.ubo_buffer));
     if (!g_app.ubo_mapped) {
         EXAMPLE_LOGE("Failed to map uniform buffer");
         return false;
@@ -353,6 +356,7 @@ static bool example_init(hina_example_app* app) {
     pip_desc.front_face = HINA_FRONT_FACE_CLOCKWISE;
     pip_desc.cull_mode = HINA_CULL_MODE_BACK;
     pip_desc.layout = vertex_layout;
+    pip_desc.color_formats[0] = hina_get_surface_format();
     pip_desc.depth_format = HINA_FORMAT_D32_SFLOAT;
 
     // CRITICAL: Set patch topology for tessellation

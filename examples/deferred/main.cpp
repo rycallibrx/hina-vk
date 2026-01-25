@@ -489,8 +489,8 @@ static bool example_init(hina_example_app* app) {
     // Opaque scene VBO/IBO
     hina_buffer_desc vbo_desc = {0};
     vbo_desc.size = g_app.scene.vertices.size() * sizeof(Vertex);
-    vbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    vbo_desc.memory = HINA_BUFFER_CPU;
+    vbo_desc.usage = HINA_BUFFER_VERTEX;
     vbo_desc.initial_data = g_app.scene.vertices.data();
 
     g_app.vbo = hina_make_buffer(&vbo_desc);
@@ -501,8 +501,8 @@ static bool example_init(hina_example_app* app) {
 
     hina_buffer_desc ibo_desc = {0};
     ibo_desc.size = g_app.scene.indices.size() * sizeof(uint32_t);
-    ibo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ibo_desc.memory = HINA_BUFFER_CPU;
+    ibo_desc.usage = HINA_BUFFER_INDEX;
     ibo_desc.initial_data = g_app.scene.indices.data();
 
     g_app.ibo = hina_make_buffer(&ibo_desc);
@@ -514,8 +514,8 @@ static bool example_init(hina_example_app* app) {
     // Light indicator VBO/IBO
     hina_buffer_desc light_vbo_desc = {0};
     light_vbo_desc.size = g_app.light_indicator.vertices.size() * sizeof(Vertex);
-    light_vbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    light_vbo_desc.memory = HINA_BUFFER_CPU;
+    light_vbo_desc.usage = HINA_BUFFER_VERTEX;
     light_vbo_desc.initial_data = g_app.light_indicator.vertices.data();
 
     g_app.light_vbo = hina_make_buffer(&light_vbo_desc);
@@ -526,8 +526,8 @@ static bool example_init(hina_example_app* app) {
 
     hina_buffer_desc light_ibo_desc = {0};
     light_ibo_desc.size = g_app.light_indicator.indices.size() * sizeof(uint32_t);
-    light_ibo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    light_ibo_desc.memory = HINA_BUFFER_CPU;
+    light_ibo_desc.usage = HINA_BUFFER_INDEX;
     light_ibo_desc.initial_data = g_app.light_indicator.indices.data();
 
     g_app.light_ibo = hina_make_buffer(&light_ibo_desc);
@@ -539,8 +539,8 @@ static bool example_init(hina_example_app* app) {
     // Transparent VBO/IBO
     hina_buffer_desc glass_vbo_desc = {0};
     glass_vbo_desc.size = g_app.glass.vertices.size() * sizeof(TransparentVertex);
-    glass_vbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    glass_vbo_desc.memory = HINA_BUFFER_CPU;
+    glass_vbo_desc.usage = HINA_BUFFER_VERTEX;
     glass_vbo_desc.initial_data = g_app.glass.vertices.data();
 
     g_app.glass_vbo = hina_make_buffer(&glass_vbo_desc);
@@ -551,8 +551,8 @@ static bool example_init(hina_example_app* app) {
 
     hina_buffer_desc glass_ibo_desc = {0};
     glass_ibo_desc.size = g_app.glass.indices.size() * sizeof(uint32_t);
-    glass_ibo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    glass_ibo_desc.memory = HINA_BUFFER_CPU;
+    glass_ibo_desc.usage = HINA_BUFFER_INDEX;
     glass_ibo_desc.initial_data = g_app.glass.indices.data();
 
     g_app.glass_ibo = hina_make_buffer(&glass_ibo_desc);
@@ -566,8 +566,8 @@ static bool example_init(hina_example_app* app) {
     // ========================================================================
 
     hina_buffer_desc ubo_desc = {0};
-    ubo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ubo_desc.memory = HINA_BUFFER_CPU;
+    ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
     ubo_desc.size = sizeof(GBufferUBO);
     for (uint32_t i = 0; i < DeferredApp::FRAMES_IN_FLIGHT; i++) {
@@ -576,7 +576,7 @@ static bool example_init(hina_example_app* app) {
             EXAMPLE_LOGE("Failed to create G-buffer UBO %u", i);
             return false;
         }
-        g_app.gbuffer_ubo_mapped[i] = static_cast<GBufferUBO*>(hina_map_buffer(g_app.gbuffer_ubo[i]));
+        g_app.gbuffer_ubo_mapped[i] = static_cast<GBufferUBO*>(hina_mapped_buffer_ptr(g_app.gbuffer_ubo[i]));
     }
 
     ubo_desc.size = sizeof(CompositionUBO);
@@ -586,7 +586,7 @@ static bool example_init(hina_example_app* app) {
             EXAMPLE_LOGE("Failed to create composition UBO %u", i);
             return false;
         }
-        g_app.composition_ubo_mapped[i] = static_cast<CompositionUBO*>(hina_map_buffer(g_app.composition_ubo[i]));
+        g_app.composition_ubo_mapped[i] = static_cast<CompositionUBO*>(hina_mapped_buffer_ptr(g_app.composition_ubo[i]));
     }
 
     ubo_desc.size = sizeof(TransparentUBO);
@@ -596,20 +596,20 @@ static bool example_init(hina_example_app* app) {
             EXAMPLE_LOGE("Failed to create transparent UBO %u", i);
             return false;
         }
-        g_app.transparent_ubo_mapped[i] = static_cast<TransparentUBO*>(hina_map_buffer(g_app.transparent_ubo[i]));
+        g_app.transparent_ubo_mapped[i] = static_cast<TransparentUBO*>(hina_mapped_buffer_ptr(g_app.transparent_ubo[i]));
     }
 
     hina_buffer_desc ssbo_desc = {0};
     ssbo_desc.size = sizeof(Light) * NUM_LIGHTS;
-    ssbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_STORAGE_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ssbo_desc.memory = HINA_BUFFER_CPU;
+    ssbo_desc.usage = HINA_BUFFER_STORAGE;
 
     g_app.lights_ssbo = hina_make_buffer(&ssbo_desc);
     if (!hina_buffer_is_valid(g_app.lights_ssbo)) {
         EXAMPLE_LOGE("Failed to create lights SSBO");
         return false;
     }
-    g_app.lights_mapped = static_cast<Light*>(hina_map_buffer(g_app.lights_ssbo));
+    g_app.lights_mapped = static_cast<Light*>(hina_mapped_buffer_ptr(g_app.lights_ssbo));
     init_lights(g_app.lights_mapped, NUM_LIGHTS);
 
     // ========================================================================
@@ -642,7 +642,7 @@ static bool example_init(hina_example_app* app) {
     tile_layout.subpasses[0].input_count = 0;
     // Subpass 1: Composition (1 color output, 3 tile inputs, depth read-only)
     tile_layout.subpasses[1].color_count = 1;
-    tile_layout.subpasses[1].color_formats[0] = HINA_FORMAT_SWAPCHAIN;
+    tile_layout.subpasses[1].color_formats[0] = hina_get_surface_format();
     tile_layout.subpasses[1].depth_format = HINA_FORMAT_D32_SFLOAT;
     tile_layout.subpasses[1].depth_read_only = true;  // Must match runtime for render pass compatibility
     tile_layout.subpasses[1].input_count = 3;  // Position, normal, albedo from subpass 0
@@ -697,7 +697,7 @@ static bool example_init(hina_example_app* app) {
     comp_pip_desc.cull_mode = HINA_CULL_MODE_NONE;
     comp_pip_desc.depth.depth_test = false;
     comp_pip_desc.depth.depth_write = false;
-    comp_pip_desc.color_formats[0] = HINA_FORMAT_SWAPCHAIN;
+    comp_pip_desc.color_formats[0] = hina_get_surface_format();
     comp_pip_desc.depth_format = HINA_FORMAT_D32_SFLOAT;
     comp_pip_desc.subpass_index = 1;  // Tile pass subpass 1 (composition)
     comp_pip_desc.tile_layout = &tile_layout;  // Required for subpass_index > 0
@@ -749,7 +749,7 @@ static bool example_init(hina_example_app* app) {
     trans_pip_desc.blend[0].dst_color = HINA_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
     trans_pip_desc.blend[0].src_alpha = HINA_BLEND_FACTOR_ONE;
     trans_pip_desc.blend[0].dst_alpha = HINA_BLEND_FACTOR_ZERO;
-    trans_pip_desc.color_formats[0] = HINA_FORMAT_SWAPCHAIN;
+    trans_pip_desc.color_formats[0] = hina_get_surface_format();
     trans_pip_desc.depth_format = HINA_FORMAT_D32_SFLOAT;
     trans_pip_desc.subpass_index = 1;  // Same subpass as composition
     trans_pip_desc.tile_layout = &tile_layout;  // For tile pass render pass compatibility

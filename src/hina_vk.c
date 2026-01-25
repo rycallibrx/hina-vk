@@ -38,13 +38,13 @@
 #define HINA_ASSERT(cond) ((void)sizeof(cond))
 #define HINA_ASSERTF(cond, ...) ((void)sizeof(cond))
 #else
-#define HINA_ASSERT(cond) assert(cond)
+// Forward declare - defined after logging infrastructure
+static void hina_assert_log(const char* file, int line, const char* fmt, ...);
+#define HINA_ASSERT(cond) do { if (!(cond)) { hina_assert_log(__FILE__, __LINE__, "%s", #cond); assert(cond); } } while(0)
 #define HINA_ASSERTF(cond, ...) \
   do { \
     if (!(cond)) { \
-      fprintf(stderr, "[hina][ASSERT FAILED] %s:%d: ", __FILE__, __LINE__); \
-      fprintf(stderr, __VA_ARGS__); \
-      fprintf(stderr, "\n"); \
+      hina_assert_log(__FILE__, __LINE__, __VA_ARGS__); \
       assert(0 && #cond); \
     } \
   } while(0)
@@ -2616,11 +2616,12 @@ typedef struct hina_staging_context
   uint64_t last_submit_ticket;
   // Last graphics submission ticket - wait before reusing gfx_vk_cmd
   uint64_t last_gfx_submit_ticket;
-  // Persistent staging buffer for texture downloads (reused, grows as needed)
+  // Persistent staging buffer for texture/buffer downloads (reused, grows as needed)
   VkBuffer download_staging_buf;
   VkDeviceMemory download_staging_mem;
   void* download_staging_mapped;
   size_t download_staging_size;
+  bool download_staging_coherent; // Cached: skip invalidate if true
 #ifndef NDEBUG
   // Debug: thread affinity check - set on first use, validated on subsequent uses
   thrd_t owner_thread;
@@ -3144,6 +3145,31 @@ static void hina_logf(hina_context* ctx, hina_log_level level, const char* fmt, 
 #define HINA_LOGE(ctx, ...) hina_logf((ctx), HINA_LOG_ERROR, __VA_ARGS__)
 #else
 #define HINA_LOGE(ctx, ...) ((void)0)
+#endif
+
+// Assert logging - uses logging system if available, falls back to stderr
+#ifdef HINA_DEBUG
+static void hina_assert_log(const char* file, int line, const char* fmt, ...)
+{
+  char body[1024];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(body, sizeof(body), fmt, args);
+  va_end(args);
+  body[sizeof(body) - 1] = '\0';
+  // Try to use logging system if context is initialized
+  if (g_hina_ctx.core.device && g_hina_ctx.core.device->config.log_fn)
+  {
+    char buf[1152];
+    snprintf(buf, sizeof(buf), "[hina][ASSERT FAILED] %s:%d: %s", file, line, body);
+    buf[sizeof(buf) - 1] = '\0';
+    g_hina_ctx.core.device->config.log_fn(buf);
+  }
+  // Always also output to stderr for visibility
+  fprintf(stderr, "[hina][ASSERT FAILED] %s:%d: %s\n", file, line, body);
+  fflush(stdout);
+  fflush(stderr);
+}
 #endif
 
 #define HINA_VK_RESULT_CASE(x) case x: return #x
@@ -4180,6 +4206,10 @@ static HINA_INLINE bool hina_debug_has_pending_acquire(hina_cmd* cmd, uint16_t b
 #endif
 static hina_buffer hina_make_buffer_internal(hina_context* ctx, const hina_buffer_desc* desc);
 
+static void* hina_staging_ensure_download_buffer(hina_context* ctx, size_t required_size);
+static VkCommandBuffer hina_staging_ctx_acquire_cmd(hina_context* ctx);
+static hina_ticket hina_staging_ctx_flush(hina_context* ctx);
+
 static hina_swapchain_image hina_ctx_acquire_swapchain_image(hina_context* ctx);
 
 static void hina_ctx_present(hina_context* ctx, hina_swapchain_image image);
@@ -4757,22 +4787,21 @@ static VkDescriptorSet hina_linear_desc_alloc_get(hina_context* ctx, hina_linear
                                                   VkDescriptorSetLayout layout);
 
 // Helpers
-static VkBufferUsageFlags hina_buffer_flags_to_vk_usage(hina_buffer_flags flags)
+static VkBufferUsageFlags hina_buffer_usage_to_vk(hina_buffer_usage usage)
 {
   VkBufferUsageFlags vk_flags = 0;
-  if (flags & HINA_BUFFER_VERTEX_BIT) vk_flags |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-  if (flags & HINA_BUFFER_INDEX_BIT) vk_flags |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-  if (flags & HINA_BUFFER_UNIFORM_BIT) vk_flags |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-  if (flags & HINA_BUFFER_STORAGE_BIT) vk_flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-  if (flags & HINA_BUFFER_INDIRECT_BIT) vk_flags |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-  if (flags & HINA_BUFFER_TRANSFER_SRC_BIT) vk_flags |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-  if (flags & HINA_BUFFER_TRANSFER_DST_BIT) vk_flags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if (usage & HINA_BUFFER_VERTEX) vk_flags |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+  if (usage & HINA_BUFFER_INDEX) vk_flags |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+  if (usage & HINA_BUFFER_UNIFORM) vk_flags |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+  if (usage & HINA_BUFFER_STORAGE) vk_flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  if (usage & HINA_BUFFER_INDIRECT) vk_flags |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+  if (usage & HINA_BUFFER_TRANSFER_SRC) vk_flags |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  if (usage & HINA_BUFFER_TRANSFER_DST) vk_flags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   return vk_flags;
 }
 
 static const VkFormat g_hina_to_vk_format[HINA_FORMAT_ASTC_12x12_SRGB_BLOCK + 1] = {
   [HINA_FORMAT_UNDEFINED] = VK_FORMAT_UNDEFINED,
-  [HINA_FORMAT_SWAPCHAIN] = VK_FORMAT_UNDEFINED, // Sentinel - resolved at runtime to swapchain format
   [HINA_FORMAT_R8_UNORM] = VK_FORMAT_R8_UNORM,
   [HINA_FORMAT_R8_SNORM] = VK_FORMAT_R8_SNORM, [HINA_FORMAT_R8_UINT] = VK_FORMAT_R8_UINT,
   [HINA_FORMAT_R8_SINT] = VK_FORMAT_R8_SINT, [HINA_FORMAT_R8G8_UNORM] = VK_FORMAT_R8G8_UNORM,
@@ -4867,6 +4896,158 @@ static VkFormat hina_format_to_vk(hina_format fmt)
   return g_hina_to_vk_format[fmt];
 }
 
+// Reverse lookup: VkFormat -> hina_format
+// Returns HINA_FORMAT_UNDEFINED if no matching hina_format exists
+static hina_format hina_format_from_vk(VkFormat vk_fmt)
+{
+  if (vk_fmt == VK_FORMAT_UNDEFINED) return HINA_FORMAT_UNDEFINED;
+  // Linear search through the mapping table (small table, infrequent calls)
+  for (uint32_t i = 1; i < HINA_ARRAY_SIZE(g_hina_to_vk_format); i++)
+  {
+    if (g_hina_to_vk_format[i] == vk_fmt) return (hina_format)i;
+  }
+  return HINA_FORMAT_UNDEFINED; // No hina_format equivalent
+}
+
+#ifdef HINA_DEBUG
+// Debug-only format name lookup for readable assert/log messages
+static const char* g_hina_format_names[] = {
+  [HINA_FORMAT_UNDEFINED] = "UNDEFINED",
+  [HINA_FORMAT_R8_UNORM] = "R8_UNORM",
+  [HINA_FORMAT_R8_SNORM] = "R8_SNORM",
+  [HINA_FORMAT_R8_UINT] = "R8_UINT",
+  [HINA_FORMAT_R8_SINT] = "R8_SINT",
+  [HINA_FORMAT_R8G8_UNORM] = "R8G8_UNORM",
+  [HINA_FORMAT_R8G8_SNORM] = "R8G8_SNORM",
+  [HINA_FORMAT_R8G8_UINT] = "R8G8_UINT",
+  [HINA_FORMAT_R8G8_SINT] = "R8G8_SINT",
+  [HINA_FORMAT_R8G8B8_UNORM] = "R8G8B8_UNORM",
+  [HINA_FORMAT_R8G8B8_SNORM] = "R8G8B8_SNORM",
+  [HINA_FORMAT_R8G8B8_UINT] = "R8G8B8_UINT",
+  [HINA_FORMAT_R8G8B8_SINT] = "R8G8B8_SINT",
+  [HINA_FORMAT_R8G8B8A8_UNORM] = "R8G8B8A8_UNORM",
+  [HINA_FORMAT_R8G8B8A8_SNORM] = "R8G8B8A8_SNORM",
+  [HINA_FORMAT_R8G8B8A8_UINT] = "R8G8B8A8_UINT",
+  [HINA_FORMAT_R8G8B8A8_SINT] = "R8G8B8A8_SINT",
+  [HINA_FORMAT_R8G8B8A8_SRGB] = "R8G8B8A8_SRGB",
+  [HINA_FORMAT_B8G8R8A8_UNORM] = "B8G8R8A8_UNORM",
+  [HINA_FORMAT_B8G8R8A8_SRGB] = "B8G8R8A8_SRGB",
+  [HINA_FORMAT_R16_UNORM] = "R16_UNORM",
+  [HINA_FORMAT_R16_SNORM] = "R16_SNORM",
+  [HINA_FORMAT_R16_UINT] = "R16_UINT",
+  [HINA_FORMAT_R16_SINT] = "R16_SINT",
+  [HINA_FORMAT_R16_SFLOAT] = "R16_SFLOAT",
+  [HINA_FORMAT_R16G16_UNORM] = "R16G16_UNORM",
+  [HINA_FORMAT_R16G16_SNORM] = "R16G16_SNORM",
+  [HINA_FORMAT_R16G16_UINT] = "R16G16_UINT",
+  [HINA_FORMAT_R16G16_SINT] = "R16G16_SINT",
+  [HINA_FORMAT_R16G16_SFLOAT] = "R16G16_SFLOAT",
+  [HINA_FORMAT_R16G16B16_UNORM] = "R16G16B16_UNORM",
+  [HINA_FORMAT_R16G16B16_SNORM] = "R16G16B16_SNORM",
+  [HINA_FORMAT_R16G16B16_UINT] = "R16G16B16_UINT",
+  [HINA_FORMAT_R16G16B16_SINT] = "R16G16B16_SINT",
+  [HINA_FORMAT_R16G16B16_SFLOAT] = "R16G16B16_SFLOAT",
+  [HINA_FORMAT_R16G16B16A16_UNORM] = "R16G16B16A16_UNORM",
+  [HINA_FORMAT_R16G16B16A16_SNORM] = "R16G16B16A16_SNORM",
+  [HINA_FORMAT_R16G16B16A16_UINT] = "R16G16B16A16_UINT",
+  [HINA_FORMAT_R16G16B16A16_SINT] = "R16G16B16A16_SINT",
+  [HINA_FORMAT_R16G16B16A16_SFLOAT] = "R16G16B16A16_SFLOAT",
+  [HINA_FORMAT_R32_UINT] = "R32_UINT",
+  [HINA_FORMAT_R32_SINT] = "R32_SINT",
+  [HINA_FORMAT_R32_SFLOAT] = "R32_SFLOAT",
+  [HINA_FORMAT_R32G32_UINT] = "R32G32_UINT",
+  [HINA_FORMAT_R32G32_SINT] = "R32G32_SINT",
+  [HINA_FORMAT_R32G32_SFLOAT] = "R32G32_SFLOAT",
+  [HINA_FORMAT_R32G32B32_UINT] = "R32G32B32_UINT",
+  [HINA_FORMAT_R32G32B32_SINT] = "R32G32B32_SINT",
+  [HINA_FORMAT_R32G32B32_SFLOAT] = "R32G32B32_SFLOAT",
+  [HINA_FORMAT_R32G32B32A32_UINT] = "R32G32B32A32_UINT",
+  [HINA_FORMAT_R32G32B32A32_SINT] = "R32G32B32A32_SINT",
+  [HINA_FORMAT_R32G32B32A32_SFLOAT] = "R32G32B32A32_SFLOAT",
+  [HINA_FORMAT_D16_UNORM] = "D16_UNORM",
+  [HINA_FORMAT_X8_D24_UNORM_PACK32] = "X8_D24_UNORM_PACK32",
+  [HINA_FORMAT_D32_SFLOAT] = "D32_SFLOAT",
+  [HINA_FORMAT_S8_UINT] = "S8_UINT",
+  [HINA_FORMAT_D16_UNORM_S8_UINT] = "D16_UNORM_S8_UINT",
+  [HINA_FORMAT_D24_UNORM_S8_UINT] = "D24_UNORM_S8_UINT",
+  [HINA_FORMAT_D32_SFLOAT_S8_UINT] = "D32_SFLOAT_S8_UINT",
+  [HINA_FORMAT_BC1_RGB_UNORM_BLOCK] = "BC1_RGB_UNORM",
+  [HINA_FORMAT_BC1_RGB_SRGB_BLOCK] = "BC1_RGB_SRGB",
+  [HINA_FORMAT_BC1_RGBA_UNORM_BLOCK] = "BC1_RGBA_UNORM",
+  [HINA_FORMAT_BC1_RGBA_SRGB_BLOCK] = "BC1_RGBA_SRGB",
+  [HINA_FORMAT_BC2_UNORM_BLOCK] = "BC2_UNORM",
+  [HINA_FORMAT_BC2_SRGB_BLOCK] = "BC2_SRGB",
+  [HINA_FORMAT_BC3_UNORM_BLOCK] = "BC3_UNORM",
+  [HINA_FORMAT_BC3_SRGB_BLOCK] = "BC3_SRGB",
+  [HINA_FORMAT_BC4_UNORM_BLOCK] = "BC4_UNORM",
+  [HINA_FORMAT_BC4_SNORM_BLOCK] = "BC4_SNORM",
+  [HINA_FORMAT_BC5_UNORM_BLOCK] = "BC5_UNORM",
+  [HINA_FORMAT_BC5_SNORM_BLOCK] = "BC5_SNORM",
+  [HINA_FORMAT_BC6H_UFLOAT_BLOCK] = "BC6H_UFLOAT",
+  [HINA_FORMAT_BC6H_SFLOAT_BLOCK] = "BC6H_SFLOAT",
+  [HINA_FORMAT_BC7_UNORM_BLOCK] = "BC7_UNORM",
+  [HINA_FORMAT_BC7_SRGB_BLOCK] = "BC7_SRGB",
+  [HINA_FORMAT_ETC2_R8G8B8_UNORM_BLOCK] = "ETC2_R8G8B8_UNORM",
+  [HINA_FORMAT_ETC2_R8G8B8_SRGB_BLOCK] = "ETC2_R8G8B8_SRGB",
+  [HINA_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK] = "ETC2_R8G8B8A1_UNORM",
+  [HINA_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK] = "ETC2_R8G8B8A1_SRGB",
+  [HINA_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK] = "ETC2_R8G8B8A8_UNORM",
+  [HINA_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK] = "ETC2_R8G8B8A8_SRGB",
+  [HINA_FORMAT_EAC_R11_UNORM_BLOCK] = "EAC_R11_UNORM",
+  [HINA_FORMAT_EAC_R11_SNORM_BLOCK] = "EAC_R11_SNORM",
+  [HINA_FORMAT_EAC_R11G11_UNORM_BLOCK] = "EAC_R11G11_UNORM",
+  [HINA_FORMAT_EAC_R11G11_SNORM_BLOCK] = "EAC_R11G11_SNORM",
+  [HINA_FORMAT_ASTC_4x4_UNORM_BLOCK] = "ASTC_4x4_UNORM",
+  [HINA_FORMAT_ASTC_4x4_SRGB_BLOCK] = "ASTC_4x4_SRGB",
+  [HINA_FORMAT_ASTC_5x4_UNORM_BLOCK] = "ASTC_5x4_UNORM",
+  [HINA_FORMAT_ASTC_5x4_SRGB_BLOCK] = "ASTC_5x4_SRGB",
+  [HINA_FORMAT_ASTC_5x5_UNORM_BLOCK] = "ASTC_5x5_UNORM",
+  [HINA_FORMAT_ASTC_5x5_SRGB_BLOCK] = "ASTC_5x5_SRGB",
+  [HINA_FORMAT_ASTC_6x5_UNORM_BLOCK] = "ASTC_6x5_UNORM",
+  [HINA_FORMAT_ASTC_6x5_SRGB_BLOCK] = "ASTC_6x5_SRGB",
+  [HINA_FORMAT_ASTC_6x6_UNORM_BLOCK] = "ASTC_6x6_UNORM",
+  [HINA_FORMAT_ASTC_6x6_SRGB_BLOCK] = "ASTC_6x6_SRGB",
+  [HINA_FORMAT_ASTC_8x5_UNORM_BLOCK] = "ASTC_8x5_UNORM",
+  [HINA_FORMAT_ASTC_8x5_SRGB_BLOCK] = "ASTC_8x5_SRGB",
+  [HINA_FORMAT_ASTC_8x6_UNORM_BLOCK] = "ASTC_8x6_UNORM",
+  [HINA_FORMAT_ASTC_8x6_SRGB_BLOCK] = "ASTC_8x6_SRGB",
+  [HINA_FORMAT_ASTC_8x8_UNORM_BLOCK] = "ASTC_8x8_UNORM",
+  [HINA_FORMAT_ASTC_8x8_SRGB_BLOCK] = "ASTC_8x8_SRGB",
+  [HINA_FORMAT_ASTC_10x5_UNORM_BLOCK] = "ASTC_10x5_UNORM",
+  [HINA_FORMAT_ASTC_10x5_SRGB_BLOCK] = "ASTC_10x5_SRGB",
+  [HINA_FORMAT_ASTC_10x6_UNORM_BLOCK] = "ASTC_10x6_UNORM",
+  [HINA_FORMAT_ASTC_10x6_SRGB_BLOCK] = "ASTC_10x6_SRGB",
+  [HINA_FORMAT_ASTC_10x8_UNORM_BLOCK] = "ASTC_10x8_UNORM",
+  [HINA_FORMAT_ASTC_10x8_SRGB_BLOCK] = "ASTC_10x8_SRGB",
+  [HINA_FORMAT_ASTC_10x10_UNORM_BLOCK] = "ASTC_10x10_UNORM",
+  [HINA_FORMAT_ASTC_10x10_SRGB_BLOCK] = "ASTC_10x10_SRGB",
+  [HINA_FORMAT_ASTC_12x10_UNORM_BLOCK] = "ASTC_12x10_UNORM",
+  [HINA_FORMAT_ASTC_12x10_SRGB_BLOCK] = "ASTC_12x10_SRGB",
+  [HINA_FORMAT_ASTC_12x12_UNORM_BLOCK] = "ASTC_12x12_UNORM",
+  [HINA_FORMAT_ASTC_12x12_SRGB_BLOCK] = "ASTC_12x12_SRGB",
+};
+
+// Convert hina_format to readable name. Safe for any value (returns "UNKNOWN" for invalid).
+static const char* hina_format_debug_name(hina_format fmt)
+{
+  if ((uint32_t)fmt >= HINA_ARRAY_SIZE(g_hina_format_names)) return "UNKNOWN";
+  const char* name = g_hina_format_names[fmt];
+  return name ? name : "UNKNOWN";
+}
+
+// Convert VkFormat to readable name via hina_format lookup.
+// Returns "VkFormat(N)" for formats not in our table.
+static const char* hina_vk_format_debug_name(VkFormat vk_fmt)
+{
+  hina_format hfmt = hina_format_from_vk(vk_fmt);
+  if (hfmt != HINA_FORMAT_UNDEFINED) return hina_format_debug_name(hfmt);
+  // Unknown VkFormat - return generic string with value
+  static _Thread_local char buf[32];
+  snprintf(buf, sizeof(buf), "VkFormat(%d)", (int)vk_fmt);
+  return buf;
+}
+#endif
+
 /**
  * @brief Count color attachments from format array.
  *
@@ -4877,7 +5058,6 @@ static VkFormat hina_format_to_vk(hina_format fmt)
  * @param formats Array of HINA_MAX_COLOR_ATTACHMENTS formats
  * @return Number of valid color attachments (0 to HINA_MAX_COLOR_ATTACHMENTS)
  *
- * @note HINA_FORMAT_SWAPCHAIN counts as a valid format (resolved at bind time)
  * @note Debug builds assert no sparse attachments (UNDEFINED between valid formats)
  */
 static uint32_t hina_count_color_attachments(const hina_format formats[HINA_MAX_COLOR_ATTACHMENTS])
@@ -6462,15 +6642,7 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
     const VkSampleCountFlagBits sp_samples = use_override ? override->samples : hina_samples_to_vk(layout->samples);
     for (uint32_t c = 0; c < sp_color_count; c++)
     {
-      VkFormat color_fmt;
-      if (use_override)
-        color_fmt = sp_color_fmts[c];
-      else if (sub->color_formats[c] == HINA_FORMAT_SWAPCHAIN)
-        color_fmt = ctx->core.device->surface.swapchain.vk.format
-                      ? ctx->core.device->surface.swapchain.vk.format
-                      : VK_FORMAT_B8G8R8A8_UNORM;
-      else
-        color_fmt = hina_format_to_vk(sub->color_formats[c]);
+      VkFormat color_fmt = use_override ? sp_color_fmts[c] : hina_format_to_vk(sub->color_formats[c]);
       if (color_fmt == VK_FORMAT_UNDEFINED) continue;
       subpass_resolve_indices[sp][c] = VK_ATTACHMENT_UNUSED;
       subpass_color_indices[sp][c] = att_count;
@@ -6480,12 +6652,7 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
       if (sp == last_sp && sub->resolve_formats[c] != HINA_FORMAT_UNDEFINED)
       {
         has_resolve = true;
-        if (sub->resolve_formats[c] == HINA_FORMAT_SWAPCHAIN)
-          resolve_format = ctx->core.device->surface.swapchain.vk.format
-                             ? ctx->core.device->surface.swapchain.vk.format
-                             : VK_FORMAT_B8G8R8A8_UNORM;
-        else
-          resolve_format = hina_format_to_vk(sub->resolve_formats[c]);
+        resolve_format = hina_format_to_vk(sub->resolve_formats[c]);
         store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
       }
       attachments[att_count++] = (VkAttachmentDescription){
@@ -8417,8 +8584,8 @@ hina_pipeline_desc hina_pipeline_desc_default(void)
     .depth = hina_depth_stencil_state_default(),
     .primitive_topology = HINA_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, .polygon_mode = HINA_POLYGON_MODE_FILL,
     .cull_mode = HINA_CULL_MODE_BACK, .front_face = HINA_FRONT_FACE_COUNTER_CLOCKWISE,
-    .msaa_samples = HINA_SAMPLE_COUNT_1_BIT,
-    .color_formats = { HINA_FORMAT_SWAPCHAIN }, // First slot = swapchain, rest = UNDEFINED (zero-init)
+    .samples = HINA_SAMPLE_COUNT_1_BIT,
+    // color_formats must be set explicitly - use hina_get_surface_format() for swapchain rendering
   };
 }
 
@@ -8431,7 +8598,7 @@ hina_hsl_pipeline_desc hina_hsl_pipeline_desc_default(void)
     .primitive_topology = HINA_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, .polygon_mode = HINA_POLYGON_MODE_FILL,
     .cull_mode = HINA_CULL_MODE_BACK, .front_face = HINA_FRONT_FACE_COUNTER_CLOCKWISE,
     .samples = HINA_SAMPLE_COUNT_1_BIT,
-    .color_formats = { HINA_FORMAT_SWAPCHAIN }, // First slot = swapchain, rest = UNDEFINED (zero-init)
+    // color_formats must be set explicitly - use hina_get_surface_format() for swapchain rendering
   };
 }
 
@@ -10338,44 +10505,47 @@ void hina_destroy_thread_context(hina_context* ctx)
 static hina_buffer hina_make_buffer_internal(hina_context* ctx, const hina_buffer_desc* desc)
 {
   HINA_ASSERT(desc);
-  // Decode flags once
-  const hina_buffer_flags flags = desc->flags;
-  const bool host_visible = (flags & HINA_BUFFER_HOST_VISIBLE_BIT) != 0;
-  const bool host_coherent = (flags & HINA_BUFFER_HOST_COHERENT_BIT) != 0;
-  const bool device_local = (flags & HINA_BUFFER_DEVICE_LOCAL_BIT) != 0;
+  const bool is_cpu_memory = desc->memory == HINA_BUFFER_CPU;
+  const bool is_cpu_explicit = desc->memory == HINA_BUFFER_CPU_EXPLICIT;
   hina_buffer handle = hina_buffer_slot_alloc();
   HINA_ASSERT(handle.id != HINA_INVALID_HANDLE && "buffer pool exhausted");
   uint16_t idx = hina_id_index(handle.id);
   hina_buffer_hot* hot = HINA_BUF_HOT(idx);
   VkBufferCreateInfo info = {
-    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = desc->size, .usage = hina_buffer_flags_to_vk_usage(flags),
+    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = desc->size, .usage = hina_buffer_usage_to_vk(desc->usage),
     .sharingMode = VK_SHARING_MODE_EXCLUSIVE // Always exclusive - use release/acquire for cross-queue
   };
   // Determine initial owning queue family (default to graphics if not specified)
   hina_queue initial_owner = desc->initial_owner;
   if (initial_owner == 0) initial_owner = HINA_QUEUE_GRAPHICS;
   uint32_t owning_family = hina_queue_to_family(ctx, initial_owner);
-  // Build VMA allocation info using decoded flags
-  VmaAllocationCreateInfo ainfo = {.usage = VMA_MEMORY_USAGE_AUTO};
-  if (host_visible)
+  // Build VMA allocation info - let VMA choose optimal memory type
+  VmaAllocationCreateInfo ainfo = {0};
+  if (is_cpu_memory)
   {
-    ainfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | (host_coherent
-                                                                   ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                                                                   : 0);
+    // CPU-accessible with guaranteed coherency: require HOST_COHERENT
+    ainfo.usage = VMA_MEMORY_USAGE_AUTO;
     ainfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-    ainfo.preferredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    ainfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   }
-  if (device_local)
+  else if (is_cpu_explicit)
   {
-    ainfo.preferredFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    // CPU-accessible with explicit sync: may be non-coherent, user must flush
+    ainfo.usage = VMA_MEMORY_USAGE_AUTO;
+    ainfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+  }
+  else
+  {
+    // GPU-optimal: prefer device-local memory
+    ainfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
   }
   VmaAllocation allocation = NULL;
   VkBuffer buffer = VK_NULL_HANDLE;
   VmaAllocationInfo ares = {0};
+  const char* mem_type_str = is_cpu_memory ? "CPU" : (is_cpu_explicit ? "CPU_EXPLICIT" : "GPU");
   if (!HINA_VK_CHECK_MSG(
     ctx, vmaCreateBuffer(ctx->core.device->allocator.vma, &info, &ainfo, &buffer, &allocation, &ares),
-    "vmaCreateBuffer (size=%zu, usage=0x%x, host_visible=%d coherent=%d device_local=%d)", desc->size, info.usage,
-    host_visible, host_coherent, device_local))
+    "vmaCreateBuffer (size=%zu, usage=0x%x, memory=%s)", desc->size, info.usage, mem_type_str))
   {
     hina_buffer_slot_free(idx);
     return (hina_buffer){HINA_INVALID_HANDLE};
@@ -10388,10 +10558,12 @@ static hina_buffer hina_make_buffer_internal(hina_context* ctx, const hina_buffe
   {
     hina_set_object_namef(ctx, (uint64_t)buffer, VK_OBJECT_TYPE_BUFFER, "hina_buffer[%u]", idx);
   }
-  // Check if we actually got coherent memory
+  // Query actual memory properties to determine if coherent (cached at creation)
   VkMemoryPropertyFlags actual_flags = 0;
   vmaGetAllocationMemoryProperties(ctx->core.device->allocator.vma, allocation, &actual_flags);
+  const bool got_host_visible = (actual_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
   const bool got_coherent = (actual_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+  const bool got_device_local = (actual_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
 #ifdef HINA_DEBUG
   // Tag allocation for leak detection (debug only - snprintf is expensive)
   char alloc_name[64];
@@ -10403,8 +10575,10 @@ static hina_buffer hina_make_buffer_internal(hina_context* ctx, const hina_buffe
   hot->vk.mapped = ares.pMappedData;
   hot->size = desc->size;
   hot->config.usage = info.usage;
-  hot->config.flags_packed = (host_visible ? HINA_BUFFER_HOT_FLAG_HOST_VISIBLE : 0) | (
-    got_coherent ? HINA_BUFFER_HOT_FLAG_HOST_COHERENT : 0) | (device_local ? HINA_BUFFER_HOT_FLAG_DEVICE_LOCAL : 0);
+  // Store actual memory properties (for coherent early-out in flush/invalidate)
+  hot->config.flags_packed = (got_host_visible ? HINA_BUFFER_HOT_FLAG_HOST_VISIBLE : 0) |
+                             (got_coherent ? HINA_BUFFER_HOT_FLAG_HOST_COHERENT : 0) |
+                             (got_device_local ? HINA_BUFFER_HOT_FLAG_DEVICE_LOCAL : 0);
   hot->config.flags_packed = HINA_BUFFER_SET_OWNER(hot->config.flags_packed, owning_family);
   return handle;
 }
@@ -10509,50 +10683,19 @@ void hina_destroy_buffer(hina_buffer buf)
   hina_ctx_destroy_buffer(&g_hina_ctx, buf);
 }
 
-static void* hina_ctx_map_buffer(hina_context* ctx, hina_buffer buf)
+void* hina_mapped_buffer_ptr(hina_buffer buf)
 {
-  HINA_ASSERTF(hina_buffer_slot_valid(buf), "[%s] hina_map_buffer: invalid buffer handle",
+  hina_context* ctx = &g_hina_ctx;
+  HINA_ASSERTF(hina_buffer_slot_valid(buf), "[%s] hina_mapped_buffer_ptr: invalid buffer handle",
                hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
   uint16_t idx = hina_id_index(buf.id);
   hina_buffer_hot* hot = HINA_BUF_HOT(idx);
   HINA_ASSERTF((hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_VISIBLE) != 0,
-               "[%s] hina_map_buffer: buffer is not HOST_VISIBLE",
+               "[%s] hina_mapped_buffer_ptr: only valid for HINA_BUFFER_CPU or HINA_BUFFER_CPU_EXPLICIT buffers",
                hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
   if (hot->vk.mapped) return hot->vk.mapped;
   if (vmaMapMemory(ctx->core.device->allocator.vma, hot->vk.allocation, &hot->vk.mapped) != VK_SUCCESS) return NULL;
   return hot->vk.mapped;
-}
-
-void* hina_map_buffer(hina_buffer buf)
-{
-  return hina_ctx_map_buffer(&g_hina_ctx, buf);
-}
-
-static void hina_ctx_unmap_buffer(hina_context* ctx, hina_buffer buf)
-{
-  HINA_ASSERTF(hina_buffer_slot_valid(buf), "[%s] hina_unmap_buffer: invalid buffer handle",
-               hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
-  uint16_t idx = hina_id_index(buf.id);
-  hina_buffer_hot* hot = HINA_BUF_HOT(idx);
-  HINA_ASSERTF((hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_VISIBLE) == 0,
-               "[%s] hina_unmap_buffer: HOST_VISIBLE buffers are persistently mapped",
-               hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
-  HINA_ASSERTF(hot->vk.mapped, "[%s] hina_unmap_buffer: buffer was never mapped",
-               hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
-  if (hot->vk.mapped)
-  {
-    if (!(hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_COHERENT))
-    {
-      vmaFlushAllocation(ctx->core.device->allocator.vma, hot->vk.allocation, 0, VK_WHOLE_SIZE);
-    }
-    vmaUnmapMemory(ctx->core.device->allocator.vma, hot->vk.allocation);
-    hot->vk.mapped = NULL;
-  }
-}
-
-void hina_unmap_buffer(hina_buffer buf)
-{
-  hina_ctx_unmap_buffer(&g_hina_ctx, buf);
 }
 
 static void hina_ctx_flush_buffer(hina_context* ctx, hina_buffer buf, size_t offset, size_t size)
@@ -10562,15 +10705,10 @@ static void hina_ctx_flush_buffer(hina_context* ctx, hina_buffer buf, size_t off
   uint16_t idx = hina_id_index(buf.id);
   hina_buffer_hot* hot = HINA_BUF_HOT(idx);
   HINA_ASSERTF((hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_VISIBLE) != 0,
-               "[%s] hina_flush_buffer: buffer is not HOST_VISIBLE",
+               "[%s] hina_flush_buffer: buffer is not host-visible (HINA_BUFFER_GPU)",
                hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
-  if (hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_COHERENT)
-  {
-#ifdef HINA_DEBUG
-    HINA_LOGW(ctx, "hina_flush_buffer: HOST_COHERENT buffer flush is redundant");
-#endif
-    return;
-  }
+  // Early-out for coherent memory (no-op, always safe to call)
+  if (hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_COHERENT) return;
   VkDeviceSize flush_size = size ? size : VK_WHOLE_SIZE;
   vmaFlushAllocation(ctx->core.device->allocator.vma, hot->vk.allocation, offset, flush_size);
 }
@@ -10578,6 +10716,66 @@ static void hina_ctx_flush_buffer(hina_context* ctx, hina_buffer buf, size_t off
 void hina_flush_buffer(hina_buffer buf, size_t offset, size_t size)
 {
   hina_ctx_flush_buffer(&g_hina_ctx, buf, offset, size);
+}
+
+static void hina_ctx_invalidate_buffer(hina_context* ctx, hina_buffer buf, size_t offset, size_t size)
+{
+  HINA_ASSERTF(hina_buffer_slot_valid(buf), "[%s] hina_invalidate_buffer: invalid buffer handle",
+               hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
+  uint16_t idx = hina_id_index(buf.id);
+  hina_buffer_hot* hot = HINA_BUF_HOT(idx);
+  HINA_ASSERTF((hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_VISIBLE) != 0,
+               "[%s] hina_invalidate_buffer: buffer is not host-visible (HINA_BUFFER_GPU)",
+               hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
+  // Early-out for coherent memory (no-op, always safe to call)
+  if (hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_COHERENT) return;
+  VkDeviceSize inv_size = size ? size : VK_WHOLE_SIZE;
+  vmaInvalidateAllocation(ctx->core.device->allocator.vma, hot->vk.allocation, offset, inv_size);
+}
+
+void hina_invalidate_buffer(hina_buffer buf, size_t offset, size_t size)
+{
+  hina_ctx_invalidate_buffer(&g_hina_ctx, buf, offset, size);
+}
+
+static void hina_ctx_download_buffer(hina_context* ctx, hina_buffer src, size_t offset, size_t size, void* dst)
+{
+  HINA_ASSERT(ctx && "hina_ctx_download_buffer: ctx is NULL");
+  HINA_ASSERT(dst && size > 0 && "hina_ctx_download_buffer: invalid dst or size");
+  HINA_ASSERTF(hina_buffer_slot_valid(src), "hina_ctx_download_buffer: invalid buffer handle");
+  uint16_t sidx = hina_id_index(src.id);
+  hina_buffer_hot* hot = HINA_BUF_HOT(sidx);
+  HINA_ASSERTF(offset + size <= hot->size, "hina_ctx_download_buffer: range [%zu, %zu) exceeds buffer size %zu",
+               offset, offset + size, hot->size);
+  HINA_ASSERTF((hot->config.usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0,
+               "hina_ctx_download_buffer: buffer missing TRANSFER_SRC usage");
+  // Ensure persistent staging buffer is ready
+  void* staging_mapped = hina_staging_ensure_download_buffer(ctx, size);
+  HINA_ASSERTF(staging_mapped, "hina_ctx_download_buffer: failed to allocate staging buffer");
+  VkBuffer staging_buf = ctx->staging.download_staging_buf;
+  VkBuffer src_buf = hot->vk.buffer;
+  // Acquire command buffer for transfer
+  VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
+  HINA_ASSERTF(xfer_cmd, "hina_ctx_download_buffer: failed to acquire staging command buffer");
+  // Record buffer copy (no layout transitions needed for buffers)
+  VkBufferCopy region = {.srcOffset = offset, .dstOffset = 0, .size = size};
+  vkCmdCopyBuffer(xfer_cmd, src_buf, staging_buf, 1, &region);
+  // Flush staging and wait synchronously
+  hina_ticket ticket = hina_staging_ctx_flush(ctx);
+  HINA_ASSERTF(ticket, "hina_ctx_download_buffer: staging flush failed");
+  hina_ctx_wait_ticket(ctx, ticket);
+  // Invalidate staging buffer before CPU read (skip if coherent)
+  if (!ctx->staging.download_staging_coherent)
+  {
+    vmaInvalidateAllocation(ctx->core.device->allocator.vma, (VmaAllocation)ctx->staging.download_staging_mem, 0, size);
+  }
+  // Copy from staging buffer to user destination
+  memcpy(dst, staging_mapped, size);
+}
+
+void hina_download_buffer(hina_buffer src, size_t offset, size_t size, void* dst)
+{
+  hina_ctx_download_buffer(&g_hina_ctx, src, offset, size, dst);
 }
 
 // Textures / swapchain minimal
@@ -11230,13 +11428,7 @@ static void hina_destroy_texture_cb(hina_context* ctx, void* payload)
 hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* desc)
 {
   HINA_ASSERT(desc);
-  VkFormat format;
-  if (desc->format == HINA_FORMAT_SWAPCHAIN)
-    format = ctx->core.device->surface.swapchain.vk.format
-               ? ctx->core.device->surface.swapchain.vk.format
-               : VK_FORMAT_B8G8R8A8_UNORM;
-  else
-    format = hina_format_to_vk(desc->format);
+  VkFormat format = hina_format_to_vk(desc->format);
   if (format == VK_FORMAT_UNDEFINED) return (hina_texture){HINA_INVALID_HANDLE};
   bool is_compressed = hina_format_is_block_compressed(desc->format);
   if (is_compressed && desc->mip_levels == HINA_MIP_LEVELS_AUTO)
@@ -11733,6 +11925,10 @@ static void* hina_staging_ensure_download_buffer(hina_context* ctx, size_t requi
   sc->download_staging_mem = (VkDeviceMemory)allocation; // Store VmaAllocation as opaque handle
   sc->download_staging_mapped = result_info.pMappedData;
   sc->download_staging_size = alloc_size;
+  // Cache coherency for early-out in invalidate
+  VkMemoryPropertyFlags mem_flags = 0;
+  vmaGetAllocationMemoryProperties(ctx->core.device->allocator.vma, allocation, &mem_flags);
+  sc->download_staging_coherent = (mem_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
   return sc->download_staging_mapped;
 }
 
@@ -11835,6 +12031,12 @@ void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
   HINA_ASSERTF(ticket, "hina_ctx_download_texture: staging flush failed");
   hina_ctx_wait_ticket(ctx, ticket);
+  // Invalidate staging buffer before CPU read (skip if coherent)
+  if (!ctx->staging.download_staging_coherent)
+  {
+    vmaInvalidateAllocation(ctx->core.device->allocator.vma, (VmaAllocation)ctx->staging.download_staging_mem, 0,
+                            required_size);
+  }
   // Copy from staging buffer to user destination
   memcpy(dst, staging_mapped, required_size);
 }
@@ -11943,6 +12145,12 @@ void hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t 
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
   HINA_ASSERTF(ticket, "hina_ctx_download_texture_3d: staging flush failed");
   hina_ctx_wait_ticket(ctx, ticket);
+  // Invalidate staging buffer before CPU read (skip if coherent)
+  if (!ctx->staging.download_staging_coherent)
+  {
+    vmaInvalidateAllocation(ctx->core.device->allocator.vma, (VmaAllocation)ctx->staging.download_staging_mem, 0,
+                            required_size);
+  }
   // Copy from staging buffer to user destination
   memcpy(dst, staging_mapped, required_size);
 }
@@ -13655,7 +13863,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   };
   const VkPipelineMultisampleStateCreateInfo ms = {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-    .rasterizationSamples = hina_samples_to_vk(desc->msaa_samples)
+    .rasterizationSamples = hina_samples_to_vk(desc->samples)
   };
   const VkBool32 stencil_test = desc->depth.stencil_test ? VK_TRUE : VK_FALSE;
   const VkPipelineDepthStencilStateCreateInfo ds = {
@@ -13734,18 +13942,10 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     .pDynamicStates = dyn_states
   };
   // Build color attachment formats from desc
-  // HINA_FORMAT_SWAPCHAIN = resolve to swapchain format at runtime
   // Note: color_attachment_count was already computed above for blend state
   VkFormat color_formats[HINA_MAX_COLOR_ATTACHMENTS];
   for (uint32_t i = 0; i < color_attachment_count; ++i)
-  {
-    if (desc->color_formats[i] == HINA_FORMAT_SWAPCHAIN)
-      color_formats[i] = ctx->core.device->surface.swapchain.vk.format
-                           ? ctx->core.device->surface.swapchain.vk.format
-                           : VK_FORMAT_B8G8R8A8_UNORM;
-    else
-      color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
-  }
+    color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
   // Convert depth/stencil formats
   VkFormat depth_fmt = desc->depth_format != HINA_FORMAT_UNDEFINED
                          ? hina_format_to_vk(desc->depth_format)
@@ -13858,7 +14058,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
       // specifying formats in tile_layout for the current subpass
       hina_tile_template_override override = {
         .subpass_index = desc->subpass_index, .color_count = color_attachment_count, .depth_format = depth_fmt,
-        .samples = hina_samples_to_vk(desc->msaa_samples)
+        .samples = hina_samples_to_vk(desc->samples)
       };
       for (uint32_t i = 0; i < color_attachment_count; i++) override.color_formats[i] = color_formats[i];
       rp = hina_legacy_get_cached_tile_template_render_pass(ctx, desc->tile_layout, &override);
@@ -13871,7 +14071,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
       VkFormat legacy_depth_fmt = depth_fmt;
       // Use COLOR_ATTACHMENT_OPTIMAL as final layout - explicit transitions handle the rest
       // Per Vulkan spec, initial/final layouts don't affect render pass compatibility
-      VkSampleCountFlagBits vk_samples = hina_samples_to_vk(desc->msaa_samples);
+      VkSampleCountFlagBits vk_samples = hina_samples_to_vk(desc->samples);
       HINA_LOGI(ctx, "Creating pipeline render pass: color_fmt=%d, depth_fmt=%d, samples=%d", (int)legacy_color_fmt,
                 (int)legacy_depth_fmt, (int)vk_samples);
       rp = hina_legacy_get_cached_render_pass(ctx, legacy_color_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
@@ -13947,7 +14147,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   e->required_set_mask = hina_compute_required_set_mask(e->reflection);
   {
     hina_format depth_format = desc->depth_format != HINA_FORMAT_UNDEFINED ? desc->depth_format : desc->stencil_format;
-    uint32_t samples = desc->msaa_samples ? (uint32_t)desc->msaa_samples : 1u;
+    uint32_t samples = desc->samples ? (uint32_t)desc->samples : 1u;
     e->kind_data.graphics.pass_layout = hina_pass_layout_make(desc->color_formats, color_attachment_count, depth_format,
                                                               samples);
   }
@@ -15313,17 +15513,9 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     .pDynamicStates = dyn_states
   };
   // Build color attachment formats for dynamic rendering
-  // HINA_FORMAT_SWAPCHAIN = resolve to swapchain format at runtime
   VkFormat vk_color_formats[HINA_MAX_COLOR_ATTACHMENTS];
   for (uint32_t i = 0; i < color_count; ++i)
-  {
-    if (desc->color_formats[i] == HINA_FORMAT_SWAPCHAIN)
-      vk_color_formats[i] = ctx->core.device->surface.swapchain.vk.format
-                              ? ctx->core.device->surface.swapchain.vk.format
-                              : VK_FORMAT_B8G8R8A8_UNORM;
-    else
-      vk_color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
-  }
+    vk_color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
   // Dynamic rendering local read: chain attachment location/input index info for tile passes
   uint32_t hsl_dyn_locations[HINA_MAX_COLOR_ATTACHMENTS];
   uint32_t hsl_dyn_input_indices[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
@@ -17401,23 +17593,12 @@ static void hina_debug_check_pipeline_formats(hina_cmd* cmd, const hina_pipeline
     hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
     if (!view_slot) continue;
     hina_format expected_format = hina_pass_layout_color_format(layout, i);
-    VkFormat expected_vk = VK_FORMAT_UNDEFINED;
-    if (expected_format == HINA_FORMAT_SWAPCHAIN)
-    {
-      // HINA_FORMAT_SWAPCHAIN = resolve to swapchain format at runtime
-      expected_vk = (ctx && ctx->core.device && ctx->core.device->surface.swapchain.vk.format)
-                      ? ctx->core.device->surface.swapchain.vk.format
-                      : VK_FORMAT_B8G8R8A8_UNORM;
-    }
-    else if (expected_format != HINA_FORMAT_UNDEFINED)
-    {
-      expected_vk = hina_format_to_vk(expected_format);
-    }
+    VkFormat expected_vk = hina_format_to_vk(expected_format);
     if (expected_vk != VK_FORMAT_UNDEFINED && view_slot->format != expected_vk)
     {
       HINA_ASSERTF(
-        false, "hina_cmd_bind_pipeline: color format mismatch (pipeline=%u, attachment=%u, expected=%d, actual=%d)",
-        cmd->current_pipeline.id, i, (int)expected_vk, (int)view_slot->format);
+        false, "hina_cmd_bind_pipeline: color format mismatch (pipeline=%u, attachment=%u, expected=%s, actual=%s)",
+        cmd->current_pipeline.id, i, hina_vk_format_debug_name(expected_vk), hina_vk_format_debug_name(view_slot->format));
     }
   }
   hina_format expected_depth = hina_pass_layout_depth_format(layout);
@@ -17438,8 +17619,8 @@ static void hina_debug_check_pipeline_formats(hina_cmd* cmd, const hina_pipeline
       VkFormat expected_vk = hina_format_to_vk(expected_depth);
       if (view_slot->format != expected_vk)
       {
-        HINA_ASSERTF(false, "hina_cmd_bind_pipeline: depth format mismatch (pipeline=%u, expected=%d, actual=%d)",
-                     cmd->current_pipeline.id, (int)expected_vk, (int)view_slot->format);
+        HINA_ASSERTF(false, "hina_cmd_bind_pipeline: depth format mismatch (pipeline=%u, expected=%s, actual=%s)",
+                     cmd->current_pipeline.id, hina_vk_format_debug_name(expected_vk), hina_vk_format_debug_name(view_slot->format));
       }
     }
   }
@@ -18070,6 +18251,7 @@ void hina_cmd_bind_transient_group(hina_cmd* cmd, uint32_t set, hina_transient_b
                (unsigned long long)tbg.internal.frame_index, (unsigned long long)cmd->ctx->frame.frame_index);
 #endif
   VkDescriptorSet vk_set = tbg.internal.set;
+  cmd->group_dynamic_counts[set] = 0; // Transient groups don't support dynamic offsets
   // Store for later binding during flush
   // We use a special marker to indicate this is a transient group (direct VkDescriptorSet)
   // By setting bound_groups to an invalid handle but storing the VkDescriptorSet separately,
@@ -18162,6 +18344,14 @@ static void hina_flush_explicit_groups(hina_cmd* cmd)
         sets[i] = cmd->bound_sets[i];
       }
     }
+#ifdef HINA_DEBUG
+    // Validate no NULL gaps remain - caller must bind all sets in the range
+    for (uint32_t i = first_set; i <= last_set; i++)
+    {
+      HINA_ASSERTF(sets[i] != VK_NULL_HANDLE,
+                   "Descriptor set gap at %u in range [%u..%u]: set was never bound", i, first_set, last_set);
+    }
+#endif
     vkCmdBindDescriptorSets(cmd->vk_cmd, bind_point, cmd->current_layout, first_set, last_set - first_set + 1,
                             &sets[first_set], total_offsets, all_offsets);
     // Update bound_sets cache
@@ -21268,6 +21458,24 @@ float hina_get_swapchain_prerotation(void)
   return g_hina_ctx.core.device->surface.prerotation_degrees;
 }
 
+hina_format hina_get_surface_format(void)
+{
+  hina_context* ctx = &g_hina_ctx;
+  // Return the actual swapchain format if swapchain exists
+  if (ctx->core.device && ctx->core.device->surface.swapchain.vk.format)
+    return hina_format_from_vk(ctx->core.device->surface.swapchain.vk.format);
+  // No swapchain yet - return UNDEFINED (caller should defer pipeline creation)
+  return HINA_FORMAT_UNDEFINED;
+}
+
+hina_format hina_get_texture_format(hina_texture tex)
+{
+  if (!hina_texture_slot_valid(tex)) return HINA_FORMAT_UNDEFINED;
+  uint16_t idx = hina_id_index(tex.id);
+  hina_texture_hot* hot = HINA_TEX_HOT(idx);
+  return hina_format_from_vk(hot->dims.format);
+}
+
 // Swapchain API
 // COLD PATH: Handle VK_ERROR_OUT_OF_DATE_KHR by recreating swapchain and retrying acquire
 // Extracted to NOINLINE to keep acquire hot path compact
@@ -21475,8 +21683,7 @@ bool hina_ctx_recreate_surface(hina_context* ctx, void* native_window, void* nat
   hina_set_object_namef(ctx, (uint64_t)ctx->core.device->surface.surface, VK_OBJECT_TYPE_SURFACE_KHR,
                         "hina_surface_ctx=%p", (void*)ctx);
   // Create new swapchain
-  const hina_swapchain_desc* sd = &ctx->core.device->surface.swapchain_desc;
-  if (!hina_create_swapchain(ctx, sd))
+  if (!hina_create_swapchain(ctx, &ctx->core.device->surface.swapchain_desc))
   {
     HINA_LOGE(ctx, "Failed to create swapchain after surface recreation");
     return false;

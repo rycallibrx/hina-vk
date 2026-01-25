@@ -1239,7 +1239,7 @@ inline bool hina_msaa_buffers_init(hina_msaa_buffers* msaa, uint32_t width, uint
                                     hina_sample_count samples = HINA_SAMPLE_COUNT_4_BIT) {
     hina_texture_desc color_desc = {};
     color_desc.type = HINA_TEX_TYPE_2D;
-    color_desc.format = HINA_FORMAT_SWAPCHAIN;  // Match swapchain format automatically
+    color_desc.format = hina_get_surface_format();  // Match swapchain format
     color_desc.width = width;
     color_desc.height = height;
     color_desc.layers = 1;
@@ -1342,7 +1342,8 @@ static inline bool hina_uniform_ring_init(hina_uniform_ring* ring, size_t size_p
 
     hina_buffer_desc desc = {0};
     desc.size = size_per_frame;
-    desc.flags = (hina_buffer_flags)(HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    desc.memory = HINA_BUFFER_CPU;
+    desc.usage = HINA_BUFFER_UNIFORM;
 
     for (uint32_t i = 0; i < HINA_EXAMPLE_MAX_FRAMES_IN_FLIGHT; ++i) {
         ring->buffers[i] = hina_make_buffer(&desc);
@@ -1350,7 +1351,7 @@ static inline bool hina_uniform_ring_init(hina_uniform_ring* ring, size_t size_p
             hina_uniform_ring_shutdown(ring);
             return false;
         }
-        ring->mapped[i] = hina_map_buffer(ring->buffers[i]);
+        ring->mapped[i] = hina_mapped_buffer_ptr(ring->buffers[i]);
         if (!ring->mapped[i]) {
             hina_uniform_ring_shutdown(ring);
             return false;
@@ -1724,7 +1725,8 @@ inline bool hina_ktx_load(hina_example_app* app, hina_ktx_texture* out, const ch
 
     hina_buffer_desc staging_desc = {0};
     staging_desc.size = static_cast<size_t>(ktx_size);
-    staging_desc.flags = static_cast<hina_buffer_flags>(HINA_BUFFER_TRANSFER_SRC_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    staging_desc.memory = HINA_BUFFER_CPU;
+    staging_desc.usage = HINA_BUFFER_TRANSFER_SRC;
     staging_desc.initial_data = ktx_data;
 
     hina_buffer staging_buffer = hina_make_buffer(&staging_desc);
@@ -2149,6 +2151,7 @@ FragOut FSMain(Varyings in) {
     hina_hsl_pipeline_desc pip_desc = hina_hsl_pipeline_desc_default();
     pip_desc.layout = vertex_layout;
     pip_desc.cull_mode = HINA_CULL_MODE_NONE;
+    pip_desc.color_formats[0] = hina_get_surface_format();
     pip_desc.depth.depth_test = false;
     pip_desc.depth.depth_write = false;
     pip_desc.blend[0].enable = true;
@@ -2176,17 +2179,17 @@ FragOut FSMain(Varyings in) {
     for (int i = 0; i < HINA_IMGUI_FRAMES_IN_FLIGHT; i++) {
         hina_buffer_desc vb_desc = {0};
         vb_desc.size = HINA_IMGUI_MAX_VERTEX_COUNT * sizeof(ImDrawVert);
-        vb_desc.flags = static_cast<hina_buffer_flags>(
-            HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+        vb_desc.memory = HINA_BUFFER_CPU;
+        vb_desc.usage = HINA_BUFFER_VERTEX;
         app->imgui_frames[i].vertex_buffer = hina_make_buffer(&vb_desc);
-        app->imgui_frames[i].vertex_mapped = hina_map_buffer(app->imgui_frames[i].vertex_buffer);
+        app->imgui_frames[i].vertex_mapped = hina_mapped_buffer_ptr(app->imgui_frames[i].vertex_buffer);
 
         hina_buffer_desc ib_desc = {0};
         ib_desc.size = HINA_IMGUI_MAX_INDEX_COUNT * sizeof(ImDrawIdx);
-        ib_desc.flags = static_cast<hina_buffer_flags>(
-            HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+        ib_desc.memory = HINA_BUFFER_CPU;
+        ib_desc.usage = HINA_BUFFER_INDEX;
         app->imgui_frames[i].index_buffer = hina_make_buffer(&ib_desc);
-        app->imgui_frames[i].index_mapped = hina_map_buffer(app->imgui_frames[i].index_buffer);
+        app->imgui_frames[i].index_mapped = hina_mapped_buffer_ptr(app->imgui_frames[i].index_buffer);
 
         if (!app->imgui_frames[i].vertex_mapped || !app->imgui_frames[i].index_mapped) {
             EXAMPLE_LOGE("[ImGui] Failed to create/map frame buffers");

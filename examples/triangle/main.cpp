@@ -71,8 +71,8 @@ static bool example_init(hina_example_app* app) {
     // Vertex buffer
     hina_buffer_desc vbo_desc = {0};
     vbo_desc.size = sizeof(vertices);
-    vbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    vbo_desc.memory = HINA_BUFFER_CPU;
+    vbo_desc.usage = HINA_BUFFER_VERTEX;
     vbo_desc.initial_data = vertices;
     g_app.vbo = hina_make_buffer(&vbo_desc);
     if (!hina_buffer_is_valid(g_app.vbo)) {
@@ -83,8 +83,8 @@ static bool example_init(hina_example_app* app) {
     // Index buffer
     hina_buffer_desc ibo_desc = {0};
     ibo_desc.size = sizeof(indices);
-    ibo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ibo_desc.memory = HINA_BUFFER_CPU;
+    ibo_desc.usage = HINA_BUFFER_INDEX;
     ibo_desc.initial_data = indices;
     g_app.ibo = hina_make_buffer(&ibo_desc);
     if (!hina_buffer_is_valid(g_app.ibo)) {
@@ -95,8 +95,8 @@ static bool example_init(hina_example_app* app) {
     // Uniform buffer
     hina_buffer_desc ubo_desc = {0};
     ubo_desc.size = sizeof(UBO);
-    ubo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ubo_desc.memory = HINA_BUFFER_CPU;
+    ubo_desc.usage = HINA_BUFFER_UNIFORM;
     g_app.ubo_buffer = hina_make_buffer(&ubo_desc);
     if (!hina_buffer_is_valid(g_app.ubo_buffer)) {
         EXAMPLE_LOGE("Failed to create uniform buffer");
@@ -143,6 +143,7 @@ static bool example_init(hina_example_app* app) {
     hina_hsl_pipeline_desc pip_desc = hina_hsl_pipeline_desc_default();
     pip_desc.cull_mode = HINA_CULL_MODE_NONE;
     pip_desc.layout = vertex_layout;
+    pip_desc.color_formats[0] = hina_get_surface_format();
     pip_desc.depth_format = HINA_FORMAT_D32_SFLOAT;
 
     g_app.pipeline = hina_make_pipeline_from_module(module, &pip_desc, NULL);
@@ -200,7 +201,7 @@ static void example_render(hina_example_app* app) {
     float aspect = static_cast<float>(w) / static_cast<float>(h);
 
     // Update uniform buffer
-    UBO* ubo = static_cast<UBO*>(hina_map_buffer(g_app.ubo_buffer));
+    UBO* ubo = static_cast<UBO*>(hina_mapped_buffer_ptr(g_app.ubo_buffer));
     if (ubo) {
         glm::mat4 rotM = glm::mat4(1.0f);
         rotM = glm::rotate(rotM, glm::radians(g_app.rotation_x), glm::vec3(1.0f, 0.0f, 0.0f));

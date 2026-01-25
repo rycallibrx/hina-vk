@@ -1082,8 +1082,8 @@ int main(int argc, char** argv) {
 
     hina_buffer_desc vbo_desc = {0};
     vbo_desc.size = scene.vertices.size() * sizeof(GltfVertex);
-    vbo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_TRANSFER_DST_BIT | HINA_BUFFER_DEVICE_LOCAL_BIT);
+    vbo_desc.memory = HINA_BUFFER_GPU;
+    vbo_desc.usage = static_cast<hina_buffer_usage>(HINA_BUFFER_VERTEX | HINA_BUFFER_TRANSFER_DST);
     vbo_desc.initial_data = scene.vertices.data();
 
     hina_buffer vertex_buffer = hina_make_buffer(&vbo_desc);
@@ -1095,8 +1095,8 @@ int main(int argc, char** argv) {
 
     hina_buffer_desc ibo_desc = {0};
     ibo_desc.size = scene.indices.size() * sizeof(uint32_t);
-    ibo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_INDEX_BIT | HINA_BUFFER_TRANSFER_DST_BIT | HINA_BUFFER_DEVICE_LOCAL_BIT);
+    ibo_desc.memory = HINA_BUFFER_GPU;
+    ibo_desc.usage = static_cast<hina_buffer_usage>(HINA_BUFFER_INDEX | HINA_BUFFER_TRANSFER_DST);
     ibo_desc.initial_data = scene.indices.data();
 
     hina_buffer index_buffer = hina_make_buffer(&ibo_desc);
@@ -1136,8 +1136,8 @@ int main(int argc, char** argv) {
 
     hina_buffer_desc obj_desc = {0};
     obj_desc.size = objects.size() * sizeof(ObjectData);
-    obj_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_STORAGE_BIT | HINA_BUFFER_TRANSFER_DST_BIT | HINA_BUFFER_DEVICE_LOCAL_BIT);
+    obj_desc.memory = HINA_BUFFER_GPU;
+    obj_desc.usage = static_cast<hina_buffer_usage>(HINA_BUFFER_STORAGE | HINA_BUFFER_TRANSFER_DST);
     obj_desc.initial_data = objects.data();
 
     hina_buffer object_buffer = hina_make_buffer(&obj_desc);
@@ -1149,8 +1149,8 @@ int main(int argc, char** argv) {
 
     hina_buffer_desc bounds_desc = {0};
     bounds_desc.size = bounds.size() * sizeof(ObjectBounds);
-    bounds_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_STORAGE_BIT | HINA_BUFFER_TRANSFER_DST_BIT | HINA_BUFFER_DEVICE_LOCAL_BIT);
+    bounds_desc.memory = HINA_BUFFER_GPU;
+    bounds_desc.usage = static_cast<hina_buffer_usage>(HINA_BUFFER_STORAGE | HINA_BUFFER_TRANSFER_DST);
     bounds_desc.initial_data = bounds.data();
 
     hina_buffer bounds_buffer = hina_make_buffer(&bounds_desc);
@@ -1162,9 +1162,9 @@ int main(int argc, char** argv) {
 
     hina_buffer_desc draw_desc = {0};
     draw_desc.size = draw_commands.size() * sizeof(DrawCommand);
-    draw_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_STORAGE_BIT | HINA_BUFFER_INDIRECT_BIT |
-        HINA_BUFFER_TRANSFER_DST_BIT | HINA_BUFFER_DEVICE_LOCAL_BIT);
+    draw_desc.memory = HINA_BUFFER_GPU;
+    draw_desc.usage = static_cast<hina_buffer_usage>(
+        HINA_BUFFER_STORAGE | HINA_BUFFER_INDIRECT | HINA_BUFFER_TRANSFER_DST);
     draw_desc.initial_data = draw_commands.data();
     draw_desc.initial_owner = HINA_QUEUE_COMPUTE;  // Compute uses it first; acquire from graphics on subsequent frames
 
@@ -1187,8 +1187,8 @@ int main(int argc, char** argv) {
 
     hina_buffer_desc scene_ubo_desc = {0};
     scene_ubo_desc.size = sizeof(SceneUBO);
-    scene_ubo_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    scene_ubo_desc.memory = HINA_BUFFER_CPU;
+    scene_ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
     hina_buffer scene_ubo_buffer = hina_make_buffer(&scene_ubo_desc);
     if (!hina_buffer_is_valid(scene_ubo_buffer)) {
@@ -1197,7 +1197,7 @@ int main(int argc, char** argv) {
     }
     HINA_SCOPE_EXIT(hina_destroy_buffer(scene_ubo_buffer));
 
-    SceneUBO* scene_ubo = static_cast<SceneUBO*>(hina_map_buffer(scene_ubo_buffer));
+    SceneUBO* scene_ubo = static_cast<SceneUBO*>(hina_mapped_buffer_ptr(scene_ubo_buffer));
     if (!scene_ubo) {
         EXAMPLE_LOGE("Failed to map scene UBO buffer");
         return 1;
@@ -1205,8 +1205,8 @@ int main(int argc, char** argv) {
 
     hina_buffer_desc cull_params_desc = {0};
     cull_params_desc.size = sizeof(CullingParams);
-    cull_params_desc.flags = static_cast<hina_buffer_flags>(
-        HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    cull_params_desc.memory = HINA_BUFFER_CPU;
+    cull_params_desc.usage = HINA_BUFFER_UNIFORM;
 
     hina_buffer cull_params_buffer = hina_make_buffer(&cull_params_desc);
     if (!hina_buffer_is_valid(cull_params_buffer)) {
@@ -1215,7 +1215,7 @@ int main(int argc, char** argv) {
     }
     HINA_SCOPE_EXIT(hina_destroy_buffer(cull_params_buffer));
 
-    CullingParams* cull_params = static_cast<CullingParams*>(hina_map_buffer(cull_params_buffer));
+    CullingParams* cull_params = static_cast<CullingParams*>(hina_mapped_buffer_ptr(cull_params_buffer));
     if (!cull_params) {
         EXAMPLE_LOGE("Failed to map culling params buffer");
         return 1;
@@ -1381,6 +1381,7 @@ int main(int argc, char** argv) {
 
     hina_hsl_pipeline_desc pbr_desc = hina_hsl_pipeline_desc_default();
     pbr_desc.layout = vertex_layout;
+    pbr_desc.color_formats[0] = hina_get_surface_format();
     pbr_desc.depth_format = HINA_FORMAT_D32_SFLOAT;
     pbr_desc.cull_mode = HINA_CULL_MODE_BACK;
 
@@ -1573,8 +1574,8 @@ int main(int argc, char** argv) {
 
         hina_buffer_desc mat_desc = {0};
         mat_desc.size = sizeof(MaterialUBO);
-        mat_desc.flags = static_cast<hina_buffer_flags>(
-            HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+        mat_desc.memory = HINA_BUFFER_CPU;
+        mat_desc.usage = HINA_BUFFER_UNIFORM;
         mat_desc.initial_data = &ubo;
 
         materials[i].ubo_buffer = hina_make_buffer(&mat_desc);

@@ -86,7 +86,7 @@
  * These functions only access thread-safe global pools or make thread-safe Vulkan calls:
  * - **Resource Creation**: `hina_make_buffer`, `hina_make_texture`, `hina_make_sampler`,
  *   `hina_make_pipeline_ex`, `hina_make_query_pool`, `hina_create_bind_group_layout`
- * - **Buffer Memory**: `hina_map_buffer`, `hina_unmap_buffer`, `hina_flush_buffer`
+ * - **Buffer Memory**: `hina_mapped_buffer_ptr`, `hina_flush_buffer`
  *   (thread-safe for different buffers; same buffer requires external sync)
  *
  * ### NOT Thread-Safe (main thread only)
@@ -423,11 +423,6 @@ typedef enum
  *   In `color_formats[]` arrays, the first UNDEFINED terminates the list.
  *   Sparse attachments (UNDEFINED between valid formats) are NOT supported.
  *
- * - **HINA_FORMAT_SWAPCHAIN (1)**: Auto-resolves to the swapchain color format at runtime.
- *   Use this for pipelines/textures that render to or match the swapchain.
- *   Falls back to B8G8R8A8_UNORM if swapchain not yet created.
- *   Supported in: pipeline color_formats, texture creation, tile pass layouts.
- *
  * @section format_mapping Vulkan Mapping
  * All other values map 1:1 to VkFormat via a lookup table. The enum values
  * are stable and can be serialized. Adding new formats appends to the enum.
@@ -435,7 +430,6 @@ typedef enum
 typedef enum
 {
   HINA_FORMAT_UNDEFINED = 0,  /**< No attachment / unused slot (terminates color_formats array) */
-  HINA_FORMAT_SWAPCHAIN,      /**< Use swapchain color format (resolved at runtime) */
   HINA_FORMAT_R8_UNORM,
   HINA_FORMAT_R8_SNORM,
   HINA_FORMAT_R8_UINT,
@@ -1160,6 +1154,38 @@ HINA_API void hina_configure_swapchain(const hina_swapchain_desc* desc);
 // When non-zero, apply rotation to projection matrix: proj = rotate_z(radians(angle)) * proj
 HINA_API float hina_get_swapchain_prerotation(void);
 
+/**
+ * @brief Get the preferred surface format for swapchain-compatible rendering.
+ *
+ * Returns the format that will be used for the swapchain. This is determined by
+ * querying surface capabilities when the surface is created.
+ *
+ * Use this to create intermediate textures (e.g., render targets, post-process buffers)
+ * that need to match the swapchain format for efficient blitting or compositing.
+ *
+ * @return The swapchain format, or HINA_FORMAT_UNDEFINED if swapchain doesn't exist yet.
+ *
+ * @note On Android, returns UNDEFINED until native window is provided and swapchain created.
+ *
+ * Example:
+ * @code
+ *   hina_format fmt = hina_get_surface_format();
+ *   if (fmt != HINA_FORMAT_UNDEFINED) {
+ *       texture_desc.format = fmt;  // Create texture matching swapchain
+ *       pipeline_desc.color_formats[0] = fmt;  // Pipeline for that texture
+ *   }
+ * @endcode
+ */
+HINA_API hina_format hina_get_surface_format(void);
+
+/**
+ * @brief Get the format of a texture.
+ *
+ * @param tex The texture handle
+ * @return The texture's format, or HINA_FORMAT_UNDEFINED if invalid handle.
+ */
+HINA_API hina_format hina_get_texture_format(hina_texture tex);
+
 // Surface lost state (for Android lifecycle handling)
 // Returns true if surface was lost and needs recreation via hina_recreate_surface()
 HINA_API bool hina_is_surface_lost(void);
@@ -1197,49 +1223,50 @@ HINA_API uint64_t hina_get_completed_frame_index(void);
 // ===========================================================================
 //  Buffers
 // ===========================================================================
+
+// Memory placement - where the buffer lives (enum, not combinable)
 typedef enum
 {
-  // -------------------------------------------------------------------------
-  // Memory placement flags (bits 0-3)
-  // -------------------------------------------------------------------------
-  // HOST_VISIBLE: CPU can read/write this buffer directly via mapped pointer.
-  // The buffer is persistently mapped at creation - just write to the pointer
-  // returned by hina_map_buffer(). Do NOT call hina_unmap_buffer() on these
-  // buffers (it will assert). Good for: uniform buffers, staging buffers.
-  HINA_BUFFER_HOST_VISIBLE_BIT  = HINA_FLAG_BIT(0),
+  // GPU-optimal memory. Not intended to be mapped by CPU.
+  // On UMA/ReBAR systems, VMA may still return mappable memory - this is fine,
+  // but the API contract is: upload via staging or initial_data, don't assume mappability.
+  // Good for: static vertex/index data, GPU-only storage buffers.
+  HINA_BUFFER_GPU = 0,
 
-  // HOST_COHERENT: Writes are immediately visible to GPU without explicit flush.
-  // Only meaningful with HOST_VISIBLE. Without this flag, you must call
-  // hina_flush_buffer() after writing. Most HOST_VISIBLE memory is coherent
-  // on desktop, but mobile GPUs may not be.
-  HINA_BUFFER_HOST_COHERENT_BIT = HINA_FLAG_BIT(1),
-  // DEVICE_LOCAL: Buffer lives in fast GPU memory (VRAM on discrete GPUs).
-  // Cannot be mapped by CPU. Use with TRANSFER_DST and upload via staging
-  // buffer or initial_data. Good for: vertex/index buffers, textures.
-  HINA_BUFFER_DEVICE_LOCAL_BIT  = HINA_FLAG_BIT(2),
+  // CPU-accessible memory, persistently mapped at creation.
+  // GUARANTEED COHERENT: Writes are immediately visible to GPU, no flush needed.
+  // VMA picks the best available coherent memory (ReBAR if beneficial).
+  // Good for: uniform buffers, dynamic vertex data - the common case.
+  HINA_BUFFER_CPU,
 
-  // -------------------------------------------------------------------------
-  // Usage flags (bits 4-10) - what the buffer will be used for
-  // -------------------------------------------------------------------------
+  // CPU-accessible memory with explicit synchronization.
+  // May be non-coherent: user MUST call hina_flush_buffer() after CPU writes
+  // and hina_invalidate_buffer() before CPU reads after GPU writes.
+  // Only use this if you need fine-grained control (e.g., mobile optimization).
+  // Good for: advanced users who want to batch flushes for performance.
+  HINA_BUFFER_CPU_EXPLICIT,
+} hina_buffer_memory;
 
-  HINA_BUFFER_VERTEX_BIT        = HINA_FLAG_BIT(4),  // Vertex buffer
-  HINA_BUFFER_INDEX_BIT         = HINA_FLAG_BIT(5),  // Index buffer
-  HINA_BUFFER_UNIFORM_BIT       = HINA_FLAG_BIT(6),  // Uniform buffer (UBO)
-  HINA_BUFFER_STORAGE_BIT       = HINA_FLAG_BIT(7),  // Storage buffer (SSBO)
-  HINA_BUFFER_INDIRECT_BIT      = HINA_FLAG_BIT(8),  // Indirect draw/dispatch commands
-  HINA_BUFFER_TRANSFER_SRC_BIT  = HINA_FLAG_BIT(9),  // Source for copy operations
-  HINA_BUFFER_TRANSFER_DST_BIT  = HINA_FLAG_BIT(10)  // Destination for copy operations
-} hina_buffer_flags;
+// Usage flags - what the buffer will be used for (combinable bits)
+typedef enum
+{
+  HINA_BUFFER_VERTEX       = HINA_FLAG_BIT(0),  // Vertex buffer
+  HINA_BUFFER_INDEX        = HINA_FLAG_BIT(1),  // Index buffer
+  HINA_BUFFER_UNIFORM      = HINA_FLAG_BIT(2),  // Uniform buffer (UBO)
+  HINA_BUFFER_STORAGE      = HINA_FLAG_BIT(3),  // Storage buffer (SSBO)
+  HINA_BUFFER_INDIRECT     = HINA_FLAG_BIT(4),  // Indirect draw/dispatch commands
+  HINA_BUFFER_TRANSFER_SRC = HINA_FLAG_BIT(5),  // Source for copy operations
+  HINA_BUFFER_TRANSFER_DST = HINA_FLAG_BIT(6),  // Destination for copy operations
+} hina_buffer_usage;
 
 typedef struct hina_buffer_desc
 {
-  // 8-byte aligned fields first (no padding between them)
   size_t size;
-  const void* initial_data; // If non-NULL, data is uploaded via staging buffer
-  const char* label; // Optional debug label (shows in RenderDoc, validation layers)
-  // 4-byte fields grouped together
-  hina_buffer_flags flags;
-  hina_queue initial_owner; // Queue that initially owns this buffer (default: HINA_QUEUE_GRAPHICS)
+  const void* initial_data;      // If non-NULL, data is uploaded via staging buffer
+  const char* label;             // Optional debug label (shows in RenderDoc, validation layers)
+  hina_buffer_memory memory;     // Where the buffer lives (default: HINA_BUFFER_GPU)
+  hina_buffer_usage usage;       // What the buffer is used for (combinable flags)
+  hina_queue initial_owner;      // Queue that initially owns this buffer (default: HINA_QUEUE_GRAPHICS)
 } hina_buffer_desc;
 
 // Zero-initialize hina_buffer_desc; all fields default to 0/NULL.
@@ -1250,11 +1277,22 @@ HINA_API hina_buffer hina_make_buffer(const hina_buffer_desc* desc);
 
 HINA_API void hina_destroy_buffer(hina_buffer buf);
 
-HINA_API void* hina_map_buffer(hina_buffer buf); // Returns persistent pointer for HOST_VISIBLE
+// Returns persistent mapped pointer for HINA_BUFFER_CPU or HINA_BUFFER_CPU_EXPLICIT buffers.
+HINA_API void* hina_mapped_buffer_ptr(hina_buffer buf);
 
-HINA_API void hina_unmap_buffer(hina_buffer buf); // Only for non-HOST_VISIBLE buffers
+// Flush CPU writes to make them visible to GPU.
+// Required for HINA_BUFFER_CPU_EXPLICIT after CPU writes, before GPU reads.
+// No-op for HINA_BUFFER_CPU (always coherent). Asserts on HINA_BUFFER_GPU.
+HINA_API void hina_flush_buffer(hina_buffer buf, size_t offset, size_t size);
 
-HINA_API void hina_flush_buffer(hina_buffer buf, size_t offset, size_t size); // Only needed without HOST_COHERENT
+// Invalidate CPU cache to see GPU writes.
+// Required for HINA_BUFFER_CPU_EXPLICIT before CPU reads, after GPU writes.
+// No-op for HINA_BUFFER_CPU (always coherent). Asserts on HINA_BUFFER_GPU.
+HINA_API void hina_invalidate_buffer(hina_buffer buf, size_t offset, size_t size);
+
+// One-shot GPU→CPU readback. Handles staging buffer and sync internally.
+// Source buffer must have HINA_BUFFER_TRANSFER_SRC usage.
+HINA_API void hina_download_buffer(hina_buffer src, size_t offset, size_t size, void* dst);
 
 HINA_API hina_ticket hina_flush_staging(void); // Flush internal staging buffers
 // Context API (for functions requiring per-context frame state)
@@ -1956,6 +1994,8 @@ HINA_API void hina_cmd_bind_transient_group(hina_cmd* cmd, uint32_t set, hina_tr
 //
 // The shader module is a standalone compilation library that can be used
 // independently of the Vulkan rendering module. It handles:
+// Threading: Shader compilation is not thread-safe. Call hslc_compile* from one
+// thread at a time.
 // - HSL (Hina Shader Language) preprocessing
 // - GLSL to SPIR-V compilation via glslang
 // - SPIR-V reflection via spirv-reflect
@@ -2516,9 +2556,9 @@ typedef struct hina_tile_pass_layout hina_tile_pass_layout;
  * @section color_formats Color Attachment Formats
  * The `color_formats[]` array specifies render target formats:
  * - First HINA_FORMAT_UNDEFINED terminates the list (count derived automatically)
- * - HINA_FORMAT_SWAPCHAIN auto-resolves to swapchain format at pipeline creation
+ * - Use hina_get_surface_format() to get the swapchain format for swapchain rendering
  * - Sparse attachments (UNDEFINED between valid formats) trigger debug assertion
- * - Default: color_formats[0] = HINA_FORMAT_SWAPCHAIN, rest = UNDEFINED
+ * - Default: all color_formats = HINA_FORMAT_UNDEFINED (must be set explicitly)
  */
 typedef struct hina_pipeline_desc
 {
@@ -2549,13 +2589,13 @@ typedef struct hina_pipeline_desc
   /**
    * Render target formats for dynamic rendering.
    * - HINA_FORMAT_UNDEFINED: No attachment (first UNDEFINED terminates list)
-   * - HINA_FORMAT_SWAPCHAIN: Auto-resolve to swapchain format at pipeline creation
+   * - Use hina_get_surface_format() for swapchain-compatible pipelines
    * - Count derived automatically; sparse attachments are not allowed
    */
   hina_format color_formats[HINA_MAX_COLOR_ATTACHMENTS];
   hina_format depth_format;
   hina_format stencil_format;
-  hina_sample_count msaa_samples; // MSAA sample count (0 or 1 = no MSAA)
+  hina_sample_count samples; // MSAA sample count (0 or 1 = no MSAA)
   uint32_t patch_control_points; // Tessellation patch control points (0 = unused)
   uint32_t subpass_index; // For tile pass pipelines (default 0)
   const hina_tile_pass_layout* tile_layout; // Required when subpass_index > 0 (subpass_index < subpass_count)
@@ -2591,7 +2631,7 @@ typedef struct hina_pipeline_desc
 //           .samples = HINA_SAMPLE_COUNT_1_BIT,
 //           .blend[0..3] = hina_blend_state_default() (per-attachment, 1:1 with color_formats)
 //           .depth = (see hina_depth_stencil_state defaults),
-//           .color_formats[0] = HINA_FORMAT_SWAPCHAIN, [1..3] = HINA_FORMAT_UNDEFINED
+//           .color_formats[0..3] = HINA_FORMAT_UNDEFINED (must set explicitly)
 HINA_API hina_pipeline_desc hina_pipeline_desc_default(void);
 
 typedef struct hina_compute_pipeline_desc
@@ -2649,7 +2689,7 @@ HINA_API void hina_ctx_destroy_pipeline(hina_context* ctx, hina_pipeline pip);
  * @section color_formats Color Attachment Formats
  * Same behavior as hina_pipeline_desc:
  * - First UNDEFINED terminates the list
- * - SWAPCHAIN auto-resolves to swapchain format
+ * - Use hina_get_surface_format() for swapchain-compatible pipelines
  * - Sparse attachments trigger debug assertion
  *
  * @note The library no longer compiles HSL at runtime. Use hina_shader
@@ -2686,7 +2726,7 @@ typedef struct hina_hsl_pipeline_desc
   /**
    * Render target formats for dynamic rendering.
    * - First UNDEFINED terminates list (count derived automatically)
-   * - SWAPCHAIN auto-resolves to swapchain format
+   * - Use hina_get_surface_format() for swapchain-compatible pipelines
    * - Sparse attachments trigger debug assertion
    */
   hina_format color_formats[HINA_MAX_COLOR_ATTACHMENTS];

@@ -225,7 +225,8 @@ static bool example_init(hina_example_app* app) {
     // Create Vertex Buffer
     hina_buffer_desc vbo_desc = {0};
     vbo_desc.size = g_app.mesh.vertices.size() * sizeof(Vertex);
-    vbo_desc.flags = static_cast<hina_buffer_flags>(HINA_BUFFER_VERTEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    vbo_desc.memory = HINA_BUFFER_CPU;
+    vbo_desc.usage = HINA_BUFFER_VERTEX;
     vbo_desc.initial_data = g_app.mesh.vertices.data();
 
     g_app.vbo = hina_make_buffer(&vbo_desc);
@@ -237,7 +238,8 @@ static bool example_init(hina_example_app* app) {
     // Create Index Buffer
     hina_buffer_desc ibo_desc = {0};
     ibo_desc.size = g_app.mesh.indices.size() * sizeof(uint32_t);
-    ibo_desc.flags = static_cast<hina_buffer_flags>(HINA_BUFFER_INDEX_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+    ibo_desc.memory = HINA_BUFFER_CPU;
+    ibo_desc.usage = HINA_BUFFER_INDEX;
     ibo_desc.initial_data = g_app.mesh.indices.data();
 
     g_app.ibo = hina_make_buffer(&ibo_desc);
@@ -331,7 +333,8 @@ static bool example_init(hina_example_app* app) {
     for (int i = 0; i < 2; i++) {
         hina_buffer_desc ubo_desc = {0};
         ubo_desc.size = sizeof(CubeUBO);
-        ubo_desc.flags = static_cast<hina_buffer_flags>(HINA_BUFFER_UNIFORM_BIT | HINA_BUFFER_HOST_VISIBLE_BIT | HINA_BUFFER_HOST_COHERENT_BIT);
+        ubo_desc.memory = HINA_BUFFER_CPU;
+        ubo_desc.usage = HINA_BUFFER_UNIFORM;
 
         g_app.cubes[i].ubo_buffer = hina_make_buffer(&ubo_desc);
         if (!hina_buffer_is_valid(g_app.cubes[i].ubo_buffer)) {
@@ -339,7 +342,7 @@ static bool example_init(hina_example_app* app) {
             return false;
         }
 
-        g_app.cubes[i].ubo_mapped = static_cast<CubeUBO*>(hina_map_buffer(g_app.cubes[i].ubo_buffer));
+        g_app.cubes[i].ubo_mapped = static_cast<CubeUBO*>(hina_mapped_buffer_ptr(g_app.cubes[i].ubo_buffer));
         if (!g_app.cubes[i].ubo_mapped) {
             EXAMPLE_LOGE("Failed to map UBO for cube %d", i);
         }
@@ -363,6 +366,7 @@ static bool example_init(hina_example_app* app) {
     hina_hsl_pipeline_desc pip_desc_1x = hina_hsl_pipeline_desc_default();
     pip_desc_1x.front_face = HINA_FRONT_FACE_CLOCKWISE;
     pip_desc_1x.layout = vertex_layout;
+    pip_desc_1x.color_formats[0] = hina_get_surface_format();
     pip_desc_1x.depth_format = HINA_FORMAT_D32_SFLOAT;
     pip_desc_1x.samples = HINA_SAMPLE_COUNT_1_BIT;
 
@@ -379,6 +383,7 @@ static bool example_init(hina_example_app* app) {
     hina_hsl_pipeline_desc pip_desc_4x = hina_hsl_pipeline_desc_default();
     pip_desc_4x.front_face = HINA_FRONT_FACE_CLOCKWISE;
     pip_desc_4x.layout = vertex_layout;
+    pip_desc_4x.color_formats[0] = hina_get_surface_format();
     pip_desc_4x.depth_format = HINA_FORMAT_D32_SFLOAT;
     pip_desc_4x.samples = HINA_SAMPLE_COUNT_4_BIT;
 
