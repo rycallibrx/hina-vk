@@ -2570,8 +2570,6 @@ typedef struct hina_staging_context
   // Thread-local page cache (L1 reserve) - avoids global pool lock contention
   hina_staging_page* local_cache[2];
   uint8_t local_cache_count;
-  uint8_t pad_cache_[7];
-
   // Retired pages (SoA layout for cache-friendly fence scanning)
   struct
   {
@@ -2594,14 +2592,17 @@ typedef struct hina_staging_context
   VkCommandPool cmd_pool;
   // Dedicated graphics command pool for staging finalization (mips/layout)
   VkCommandPool gfx_cmd_pool;
+  // Dedicated compute command pool for staging finalization (compute ownership)
+  VkCommandPool comp_cmd_pool;
   // Queue family + lane used for staging submissions (transfer if available)
   uint32_t queue_family;
   uint8_t lane_idx;
-  uint8_t pad_lane_[3];
   // Graphics queue family + lane for staging finalization
   uint32_t gfx_queue_family;
   uint8_t gfx_lane_idx;
-  uint8_t pad_gfx_[3];
+  // Compute queue family + lane for staging finalization
+  uint32_t comp_queue_family;
+  uint8_t comp_lane_idx;
   // Pending command buffer (allocated from cmd_pool)
   hina_cmd* pending_cmd;
   // Command buffer handle (we reuse a single cmd buffer, reset between uses)
@@ -2610,12 +2611,22 @@ typedef struct hina_staging_context
   hina_cmd* gfx_pending_cmd;
   // Graphics command buffer handle (reused, reset between uses)
   VkCommandBuffer gfx_vk_cmd;
+  // Pending compute command buffer (allocated from comp_cmd_pool)
+  hina_cmd* comp_pending_cmd;
+  // Compute command buffer handle (reused, reset between uses)
+  VkCommandBuffer comp_vk_cmd;
   // Binary semaphore for transfer->graphics staging sync (legacy path)
   VkSemaphore xfer_to_gfx_sem;
+  // Binary semaphore for transfer->compute staging sync (legacy path)
+  VkSemaphore xfer_to_comp_sem;
+  // Binary semaphore for graphics->compute staging chain (legacy path)
+  VkSemaphore gfx_to_comp_sem;
   // Last submission ticket - we must wait for this before reusing vk_cmd
   uint64_t last_submit_ticket;
   // Last graphics submission ticket - wait before reusing gfx_vk_cmd
   uint64_t last_gfx_submit_ticket;
+  // Last compute submission ticket - wait before reusing comp_vk_cmd
+  uint64_t last_comp_submit_ticket;
   // Persistent staging buffer for texture/buffer downloads (reused, grows as needed)
   VkBuffer download_staging_buf;
   VkDeviceMemory download_staging_mem;
@@ -2685,7 +2696,6 @@ typedef struct hina_cmd_list
     uint32_t count;
     uint32_t used;
     uint32_t capacity;
-    uint8_t pad_[4];
   } state;
 } hina_cmd_list;
 
@@ -2702,7 +2712,6 @@ typedef struct hina_frame_item
 {
   hina_cmd* cmd;
   uint8_t submit_flags;
-  uint8_t pad_[3];
   uint32_t wait_count;
   hina_frame_wait_ref waits[HINA_MAX_SUBMISSION_WAITS];
 } hina_frame_item;
@@ -2715,7 +2724,6 @@ typedef struct hina_frame_state
   uint32_t pending_wait_count[HINA_QUEUE_COUNT];
   hina_swapchain_image swapchain;
   bool swapchain_acquired;
-  uint8_t pad_[7];
 } hina_frame_state;
 
 // CONTEXT: Device (semantic namespaces)
@@ -2731,7 +2739,6 @@ typedef struct hina_device
     bool owns_instance; // 1
     bool owns_device; // 1
     bool initialized; // 1
-    uint8_t pad_[5]; // 5 (pad to 8)
     union
     {
       hina_backend_dyn dyn;
@@ -3695,7 +3702,7 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx);
 static void hina_flush_pending_staging_for_destroy(hina_context* ctx)
 {
   hina_staging_context* sc = &ctx->staging;
-  bool has_pending = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL;
+  bool has_pending = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
   bool has_staged = sc->staged_buffers.count > 0 || sc->staged_textures.count > 0;
   if (has_pending || has_staged)
   {
@@ -4444,6 +4451,38 @@ static HINA_NOINLINE void hina_buffer_barrier_legacy(VkCommandBuffer cmd, VkPipe
   vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 1, &b, 0, NULL);
 }
 
+// Queue family ownership transfer barrier helpers (for exclusive sharing)
+static HINA_NOINLINE void hina_buffer_barrier_qfot_sync2(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage,
+                                                         VkPipelineStageFlags2 dst_stage, VkAccessFlags2 src_access,
+                                                         VkAccessFlags2 dst_access, uint32_t src_family,
+                                                         uint32_t dst_family, VkBuffer buffer, VkDeviceSize offset,
+                                                         VkDeviceSize size)
+{
+  VkBufferMemoryBarrier2 b = {
+    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, .srcStageMask = src_stage, .dstStageMask = dst_stage,
+    .srcAccessMask = src_access, .dstAccessMask = dst_access, .srcQueueFamilyIndex = src_family,
+    .dstQueueFamilyIndex = dst_family, .buffer = buffer, .offset = offset, .size = size
+  };
+  VkDependencyInfo dep = {
+    .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &b
+  };
+  vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+static HINA_NOINLINE void hina_buffer_barrier_qfot_legacy(VkCommandBuffer cmd, VkPipelineStageFlags src_stage,
+                                                          VkPipelineStageFlags dst_stage, VkAccessFlags src_access,
+                                                          VkAccessFlags dst_access, uint32_t src_family,
+                                                          uint32_t dst_family, VkBuffer buffer, VkDeviceSize offset,
+                                                          VkDeviceSize size)
+{
+  VkBufferMemoryBarrier b = {
+    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = src_access, .dstAccessMask = dst_access,
+    .srcQueueFamilyIndex = src_family, .dstQueueFamilyIndex = dst_family, .buffer = buffer, .offset = offset,
+    .size = size
+  };
+  vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 1, &b, 0, NULL);
+}
+
 #define HINA_BUFFER_BARRIER(cmd, src_stage, dst_stage, src_access, dst_access, buffer, offset, size) \
   do { \
     if (vkCmdPipelineBarrier2) \
@@ -4451,6 +4490,19 @@ static HINA_NOINLINE void hina_buffer_barrier_legacy(VkCommandBuffer cmd, VkPipe
     else \
       hina_buffer_barrier_legacy(cmd, (VkPipelineStageFlags)(src_stage), (VkPipelineStageFlags)(dst_stage), \
                                  (VkAccessFlags)(src_access), (VkAccessFlags)(dst_access), buffer, offset, size); \
+  } while (0)
+
+#define HINA_BUFFER_BARRIER_QFOT(cmd, src_stage, dst_stage, src_access, dst_access, \
+  src_family, dst_family, buffer, offset, size) \
+  do { \
+    if (vkCmdPipelineBarrier2) \
+      hina_buffer_barrier_qfot_sync2(cmd, src_stage, dst_stage, src_access, dst_access, \
+                                     src_family, dst_family, buffer, offset, size); \
+    else \
+      hina_buffer_barrier_qfot_legacy(cmd, (VkPipelineStageFlags)(src_stage), \
+                                      (VkPipelineStageFlags)(dst_stage), \
+                                      (VkAccessFlags)(src_access), (VkAccessFlags)(dst_access), \
+                                      src_family, dst_family, buffer, offset, size); \
   } while (0)
 
 // Memory barrier helpers (sync2 with legacy fallback)
@@ -4772,6 +4824,8 @@ static void hina_staging_ctx_wait(hina_context* ctx, hina_ticket ticket);
 static VkCommandBuffer hina_staging_ctx_acquire_cmd(hina_context* ctx);
 
 static VkCommandBuffer hina_staging_ctx_acquire_gfx_cmd(hina_context* ctx);
+
+static VkCommandBuffer hina_staging_ctx_acquire_comp_cmd(hina_context* ctx);
 
 static void hina_page_pool_shutdown(hina_context* ctx);
 
@@ -5416,6 +5470,51 @@ static hina_format hina_vk_format_to_hina(VkFormat fmt)
   case VK_FORMAT_D32_SFLOAT_S8_UINT: return HINA_FORMAT_D32_SFLOAT_S8_UINT;
   default: return HINA_FORMAT_UNDEFINED;
   }
+}
+
+static HINA_INLINE bool hina_format_is_integer(hina_format fmt)
+{
+  switch (fmt)
+  {
+  case HINA_FORMAT_R8_UINT:
+  case HINA_FORMAT_R8_SINT:
+  case HINA_FORMAT_R8G8_UINT:
+  case HINA_FORMAT_R8G8_SINT:
+  case HINA_FORMAT_R8G8B8_UINT:
+  case HINA_FORMAT_R8G8B8_SINT:
+  case HINA_FORMAT_R8G8B8A8_UINT:
+  case HINA_FORMAT_R8G8B8A8_SINT:
+  case HINA_FORMAT_R16_UINT:
+  case HINA_FORMAT_R16_SINT:
+  case HINA_FORMAT_R16G16_UINT:
+  case HINA_FORMAT_R16G16_SINT:
+  case HINA_FORMAT_R16G16B16_UINT:
+  case HINA_FORMAT_R16G16B16_SINT:
+  case HINA_FORMAT_R16G16B16A16_UINT:
+  case HINA_FORMAT_R16G16B16A16_SINT:
+  case HINA_FORMAT_R32_UINT:
+  case HINA_FORMAT_R32_SINT:
+  case HINA_FORMAT_R32G32_UINT:
+  case HINA_FORMAT_R32G32_SINT:
+  case HINA_FORMAT_R32G32B32_UINT:
+  case HINA_FORMAT_R32G32B32_SINT:
+  case HINA_FORMAT_R32G32B32A32_UINT:
+  case HINA_FORMAT_R32G32B32A32_SINT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static HINA_INLINE bool hina_vk_format_is_integer(VkFormat fmt)
+{
+  hina_format hfmt = hina_vk_format_to_hina(fmt);
+  return hfmt != HINA_FORMAT_UNDEFINED && hina_format_is_integer(hfmt);
+}
+
+static HINA_INLINE VkResolveModeFlagBits hina_resolve_mode_for_format(VkFormat fmt)
+{
+  return hina_vk_format_is_integer(fmt) ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
 }
 
 // Format name for logging
@@ -6135,6 +6234,20 @@ static void hina_validate_tile_pass_desc(const hina_tile_pass_desc* desc)
         HINA_ASSERTF(samples == pass_samples, "tile_pass_desc mixed sample counts (depth sp=%u)", sp);
       }
     }
+    if (subpass->depth_input)
+    {
+      HINA_ASSERTF(subpass->has_depth, "tile_subpass[%u] depth_input requires has_depth=true", sp);
+      bool found_prior_depth = false;
+      for (uint32_t prev = 0; prev < sp; prev++)
+      {
+        if (desc->subpasses[prev].has_depth && !desc->subpasses[prev].depth_read_only)
+        {
+          found_prior_depth = true;
+          break;
+        }
+      }
+      HINA_ASSERTF(found_prior_depth, "tile_subpass[%u] depth_input requires prior subpass with writable depth", sp);
+    }
   }
 }
 
@@ -6188,6 +6301,22 @@ static void hina_validate_tile_pass_layout(const hina_tile_pass_layout* layout)
                    "tile_layout_input[%u][%u] attachment out of range", sp, ti);
       HINA_ASSERTF(input->attachment_index < HINA_MAX_COLOR_ATTACHMENTS,
                    "tile_layout_input[%u][%u] attachment exceeds max", sp, ti);
+    }
+    if (subpass->depth_input)
+    {
+      HINA_ASSERTF(subpass->depth_format != HINA_FORMAT_UNDEFINED,
+                   "tile_layout_subpass[%u] depth_input requires depth_format", sp);
+      bool found_prior_depth = false;
+      for (uint32_t prev = 0; prev < sp; prev++)
+      {
+        if (layout->subpasses[prev].depth_format != HINA_FORMAT_UNDEFINED && !layout->subpasses[prev].depth_read_only)
+        {
+          found_prior_depth = true;
+          break;
+        }
+      }
+      HINA_ASSERTF(found_prior_depth,
+                   "tile_layout_subpass[%u] depth_input requires prior subpass with writable depth", sp);
     }
   }
   if (!has_msaa)
@@ -6469,7 +6598,7 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
   VkSubpassDescription subpasses[HINA_MAX_TILE_SUBPASSES];
   VkAttachmentReference color_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   VkAttachmentReference resolve_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
-  VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS];
+  VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS + 1]; // +1 for depth input
   VkAttachmentReference depth_refs[HINA_MAX_TILE_SUBPASSES];
   for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
@@ -6499,6 +6628,13 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
 #endif
       input_refs[sp][input_count++] = (VkAttachmentReference){
         .attachment = subpass_color_indices[src_sp][src_att], .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      };
+    }
+    // Depth input attachment reference
+    if (sp_desc->depth_input && depth_att_idx >= 0)
+    {
+      input_refs[sp][input_count++] = (VkAttachmentReference){
+        .attachment = (uint32_t)depth_att_idx, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
       };
     }
     // Depth attachment reference
@@ -6538,11 +6674,13 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
   {
     const hina_tile_subpass* prev_subpass = &desc->subpasses[sp - 1];
     const hina_tile_subpass* next_subpass = &desc->subpasses[sp];
+    const bool depth_sync = prev_subpass->has_depth && next_subpass->has_depth;
+    const bool depth_input = next_subpass->depth_input;
     VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     VkAccessFlags dst_access = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-    if (prev_subpass->has_depth && next_subpass->has_depth)
+    if (depth_sync || depth_input)
     {
       const VkPipelineStageFlags depth_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
@@ -6550,7 +6688,8 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
       dst_stage |= depth_stages;
       src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
       dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-      if (!next_subpass->depth_read_only) dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+      if (depth_sync && !next_subpass->depth_read_only)
+        dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     }
     dependencies[dep_count++] = (VkSubpassDependency){
       .srcSubpass = sp - 1, .dstSubpass = sp, .srcStageMask = src_stage, .dstStageMask = dst_stage,
@@ -6694,8 +6833,9 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
   VkSubpassDescription subpasses[HINA_MAX_TILE_SUBPASSES];
   VkAttachmentReference color_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
   VkAttachmentReference resolve_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
-  VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS];
+  VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS + 1]; // +1 for depth input
   VkAttachmentReference depth_refs[HINA_MAX_TILE_SUBPASSES];
+  uint32_t input_counts[HINA_MAX_TILE_SUBPASSES] = {0};
   for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass_layout* sub = &layout->subpasses[sp];
@@ -6714,6 +6854,7 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
       };
     }
     // Input attachment references - reference previous subpass outputs
+    uint32_t input_count = 0;
     for (uint32_t ti = 0; ti < sub->input_count; ti++)
     {
       const hina_tile_input* input = &sub->tile_inputs[ti];
@@ -6730,10 +6871,18 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
                                          : layout->subpasses[src_sp].color_count;
       HINA_ASSERTF(src_att < src_color_count, "tile_layout_input[%u][%u] attachment out of range", sp, ti);
 #endif
-      input_refs[sp][ti] = (VkAttachmentReference){
+      input_refs[sp][input_count++] = (VkAttachmentReference){
         .attachment = src_att, .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
       };
     }
+    // Depth input attachment reference
+    if (sub->depth_input && depth_att_idx >= 0)
+    {
+      input_refs[sp][input_count++] = (VkAttachmentReference){
+        .attachment = (uint32_t)depth_att_idx, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+      };
+    }
+    input_counts[sp] = input_count;
     // Depth attachment reference
     if (sp_depth_fmt != VK_FORMAT_UNDEFINED && depth_att_idx >= 0)
     {
@@ -6742,8 +6891,8 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
       };
     }
     subpasses[sp] = (VkSubpassDescription){
-      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = sub->input_count,
-      .pInputAttachments = sub->input_count > 0 ? input_refs[sp] : NULL, .colorAttachmentCount = sp_color_count,
+      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = input_count,
+      .pInputAttachments = input_count > 0 ? input_refs[sp] : NULL, .colorAttachmentCount = sp_color_count,
       .pColorAttachments = sp_color_count > 0 ? color_refs[sp] : NULL,
       .pResolveAttachments = subpass_has_resolve[sp] ? resolve_refs[sp] : NULL,
       .pDepthStencilAttachment = (sp_depth_fmt != VK_FORMAT_UNDEFINED && depth_att_idx >= 0) ? &depth_refs[sp] : NULL,
@@ -6773,7 +6922,9 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
     VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     VkAccessFlags dst_access = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-    if (prev_subpass->depth_format != HINA_FORMAT_UNDEFINED && next_subpass->depth_format != HINA_FORMAT_UNDEFINED)
+    const bool depth_sync = prev_subpass->depth_format != HINA_FORMAT_UNDEFINED && next_subpass->depth_format != HINA_FORMAT_UNDEFINED;
+    const bool depth_input = next_subpass->depth_input;
+    if (depth_sync || depth_input)
     {
       const VkPipelineStageFlags depth_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
@@ -7528,7 +7679,12 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   const bool wants_surface = ctx->core.device->surface.surface != VK_NULL_HANDLE || desc->native_window != NULL;
   const char* const* dev_exts = NULL;
   uint32_t dev_ext_count = 0;
+  uint32_t default_ext_count = 0;
   const char* default_exts[16]; // Increased for internal extension support
+  enum { HINA_MAX_STACK_DEVICE_EXTS = 64 };
+  const char* merged_exts_stack[HINA_MAX_STACK_DEVICE_EXTS];
+  const char** merged_exts = NULL;
+  bool merged_exts_heap = false;
   // Version-based extension requirements:
   // - Vulkan 1.3+: dynamic_rendering is core, no extensions needed
   // - Vulkan 1.2:  dynamic_rendering needs VK_KHR_dynamic_rendering + VK_KHR_depth_stencil_resolve (as extension)
@@ -7548,138 +7704,179 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
         return false;
       }
     }
-    dev_exts = desc->device_exts;
-    dev_ext_count = desc->device_ext_count;
+  }
+  if (wants_surface)
+  {
+    default_exts[default_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+  }
+  // Dynamic rendering extension setup based on Vulkan version
+  if (g_device_caps.has_dynamic_rendering)
+  {
+    if (is_vk13_plus)
+    {
+      // Vulkan 1.3+: dynamic rendering is core, no extensions needed
+      HINA_LOGI(ctx, "Using Vulkan 1.3 core dynamic rendering");
+    }
+    else if (is_vk12 || is_vk11)
+    {
+      // Check if VK_KHR_dynamic_rendering extension is actually available
+      if (!hina_has_device_extension(ctx->core.device->core.phys, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME))
+      {
+        HINA_LOGW(ctx, "VK_KHR_dynamic_rendering not available, falling back to legacy");
+        g_device_caps.has_dynamic_rendering = false;
+      }
+      else if (is_vk12)
+      {
+        // Vulkan 1.2: need dynamic rendering extension + depth_stencil_resolve extension
+        HINA_LOGI(ctx, "Using VK_KHR_dynamic_rendering extension (Vulkan 1.2 path)");
+        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+          VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
+        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+          VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME;
+        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+          VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
+      }
+      else
+      {
+        // Vulkan 1.1: need full extension chain
+        HINA_LOGI(ctx, "Using VK_KHR_dynamic_rendering extension (Vulkan 1.1 path)");
+        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+          VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
+        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+          VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME;
+        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+          VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
+        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+          VK_KHR_MULTIVIEW_EXTENSION_NAME;
+        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+          VK_KHR_MAINTENANCE2_EXTENSION_NAME;
+      }
+    }
+    else
+    {
+      // Vulkan 1.0: dynamic rendering not available
+      HINA_LOGW(ctx, "Dynamic rendering not available on Vulkan 1.0");
+      g_device_caps.has_dynamic_rendering = false;
+    }
+  }
+  if (g_device_caps.has_dynamic_state2 && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  {
+    default_exts[default_ext_count++] = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
+  }
+  if (g_debug_caps.has_device_fault && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  {
+    default_exts[default_ext_count++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
+  }
+  // Timeline semaphore extension for Vulkan 1.1 (core in 1.2+)
+  if (g_device_caps.has_timeline_semaphore && !is_vk13_plus && !is_vk12)
+  {
+    if (hina_has_device_extension(ctx->core.device->core.phys, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))
+    {
+      if (default_ext_count < HINA_ARRAY_SIZE(default_exts))
+      {
+        default_exts[default_ext_count++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
+        HINA_LOGI(ctx, "Enabling VK_KHR_timeline_semaphore extension for Vulkan 1.1");
+      }
+    }
+    else
+    {
+      HINA_LOGW(ctx, "VK_KHR_timeline_semaphore extension not available, disabling timeline semaphores");
+      vkWaitSemaphores = false;
+    }
+  }
+  // Synchronization2 extension for Vulkan 1.1/1.2 (core in 1.3+)
+  if (g_debug_caps.has_synchronization2 && !is_vk13_plus)
+  {
+    if (default_ext_count < HINA_ARRAY_SIZE(default_exts))
+    {
+      default_exts[default_ext_count++] = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
+      HINA_LOGI(ctx, "Enabling VK_KHR_synchronization2 extension");
+    }
+  }
+  // Pipeline creation feedback for Vulkan 1.1/1.2 (core in 1.3+)
+  if (g_debug_caps.has_pipeline_creation_feedback && !is_vk13_plus)
+  {
+    if (default_ext_count < HINA_ARRAY_SIZE(default_exts))
+    {
+      default_exts[default_ext_count++] = VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME;
+    }
+  }
+  // VK_EXT_memory_budget: pure extension for accurate GPU memory tracking (VMA uses it)
+  if (g_debug_caps.has_memory_budget && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  {
+    default_exts[default_ext_count++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+  }
+  // VK_KHR_maintenance4 for Vulkan 1.1/1.2 (core in 1.3+)
+  if (g_debug_caps.has_maintenance4 && !is_vk13_plus && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  {
+    default_exts[default_ext_count++] = VK_KHR_MAINTENANCE_4_EXTENSION_NAME;
+  }
+  // VK_KHR_maintenance5 (not core yet, always extension)
+  if (g_debug_caps.has_maintenance5 && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  {
+    default_exts[default_ext_count++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+  }
+  // VK_EXT_dynamic_rendering_unused_attachments: allows mismatched colorAttachmentCount
+  // between pipeline and rendering (useful for tile pass with dynamic_rendering_local_read)
+  if (hina_has_device_extension(ctx->core.device->core.phys,
+                                VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME))
+  {
+    if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+      VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME;
+  }
+  // VK_KHR_dynamic_rendering_local_read: enables input attachments with dynamic rendering
+  if (hina_has_device_extension(ctx->core.device->core.phys,
+                                VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
+  {
+    if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
+      VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
+  }
+  if (desc->device_exts && desc->device_ext_count)
+  {
+    uint32_t max_ext_count = default_ext_count + desc->device_ext_count;
+    if (max_ext_count <= HINA_MAX_STACK_DEVICE_EXTS)
+    {
+      merged_exts = merged_exts_stack;
+    }
+    else
+    {
+      merged_exts = (const char**)hina_alloc_host(max_ext_count * sizeof(char*));
+      merged_exts_heap = true;
+    }
+    if (!merged_exts)
+    {
+      HINA_LOGE(ctx, "failed to allocate device extension list");
+      return false;
+    }
+    uint32_t merged_count = 0;
+    for (uint32_t i = 0; i < default_ext_count; ++i)
+    {
+      merged_exts[merged_count++] = default_exts[i];
+    }
+    for (uint32_t i = 0; i < desc->device_ext_count; ++i)
+    {
+      const char* ext = desc->device_exts[i];
+      bool duplicate = false;
+      for (uint32_t j = 0; j < merged_count; ++j)
+      {
+        if (strcmp(merged_exts[j], ext) == 0)
+        {
+          duplicate = true;
+          break;
+        }
+      }
+      if (!duplicate)
+      {
+        merged_exts[merged_count++] = ext;
+      }
+    }
+    dev_exts = merged_exts;
+    dev_ext_count = merged_count;
   }
   else
   {
-    if (wants_surface)
-    {
-      default_exts[dev_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    }
-    // Dynamic rendering extension setup based on Vulkan version
-    if (g_device_caps.has_dynamic_rendering)
-    {
-      if (is_vk13_plus)
-      {
-        // Vulkan 1.3+: dynamic rendering is core, no extensions needed
-        HINA_LOGI(ctx, "Using Vulkan 1.3 core dynamic rendering");
-      }
-      else if (is_vk12 || is_vk11)
-      {
-        // Check if VK_KHR_dynamic_rendering extension is actually available
-        if (!hina_has_device_extension(ctx->core.device->core.phys, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME))
-        {
-          HINA_LOGW(ctx, "VK_KHR_dynamic_rendering not available, falling back to legacy");
-          g_device_caps.has_dynamic_rendering = false;
-        }
-        else if (is_vk12)
-        {
-          // Vulkan 1.2: need dynamic rendering extension + depth_stencil_resolve extension
-          HINA_LOGI(ctx, "Using VK_KHR_dynamic_rendering extension (Vulkan 1.2 path)");
-          if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-            VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
-          if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-            VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME;
-          if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-            VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
-        }
-        else
-        {
-          // Vulkan 1.1: need full extension chain
-          HINA_LOGI(ctx, "Using VK_KHR_dynamic_rendering extension (Vulkan 1.1 path)");
-          if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-            VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
-          if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-            VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME;
-          if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-            VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
-          if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-            VK_KHR_MULTIVIEW_EXTENSION_NAME;
-          if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-            VK_KHR_MAINTENANCE2_EXTENSION_NAME;
-        }
-      }
-      else
-      {
-        // Vulkan 1.0: dynamic rendering not available
-        HINA_LOGW(ctx, "Dynamic rendering not available on Vulkan 1.0");
-        g_device_caps.has_dynamic_rendering = false;
-      }
-    }
-    if (g_device_caps.has_dynamic_state2 && dev_ext_count < HINA_ARRAY_SIZE(default_exts))
-    {
-      default_exts[dev_ext_count++] = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
-    }
-    if (g_debug_caps.has_device_fault && dev_ext_count < HINA_ARRAY_SIZE(default_exts))
-    {
-      default_exts[dev_ext_count++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
-    }
-    // Timeline semaphore extension for Vulkan 1.1 (core in 1.2+)
-    if (g_device_caps.has_timeline_semaphore && !is_vk13_plus && !is_vk12)
-    {
-      if (hina_has_device_extension(ctx->core.device->core.phys, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))
-      {
-        if (dev_ext_count < HINA_ARRAY_SIZE(default_exts))
-        {
-          default_exts[dev_ext_count++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
-          HINA_LOGI(ctx, "Enabling VK_KHR_timeline_semaphore extension for Vulkan 1.1");
-        }
-      }
-      else
-      {
-        HINA_LOGW(ctx, "VK_KHR_timeline_semaphore extension not available, disabling timeline semaphores");
-        vkWaitSemaphores = false;
-      }
-    }
-    // Synchronization2 extension for Vulkan 1.1/1.2 (core in 1.3+)
-    if (g_debug_caps.has_synchronization2 && !is_vk13_plus)
-    {
-      if (dev_ext_count < HINA_ARRAY_SIZE(default_exts))
-      {
-        default_exts[dev_ext_count++] = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
-        HINA_LOGI(ctx, "Enabling VK_KHR_synchronization2 extension");
-      }
-    }
-    // Pipeline creation feedback for Vulkan 1.1/1.2 (core in 1.3+)
-    if (g_debug_caps.has_pipeline_creation_feedback && !is_vk13_plus)
-    {
-      if (dev_ext_count < HINA_ARRAY_SIZE(default_exts))
-      {
-        default_exts[dev_ext_count++] = VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME;
-      }
-    }
-    // VK_EXT_memory_budget: pure extension for accurate GPU memory tracking (VMA uses it)
-    if (g_debug_caps.has_memory_budget && dev_ext_count < HINA_ARRAY_SIZE(default_exts))
-    {
-      default_exts[dev_ext_count++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
-    }
-    // VK_KHR_maintenance4 for Vulkan 1.1/1.2 (core in 1.3+)
-    if (g_debug_caps.has_maintenance4 && !is_vk13_plus && dev_ext_count < HINA_ARRAY_SIZE(default_exts))
-    {
-      default_exts[dev_ext_count++] = VK_KHR_MAINTENANCE_4_EXTENSION_NAME;
-    }
-    // VK_KHR_maintenance5 (not core yet, always extension)
-    if (g_debug_caps.has_maintenance5 && dev_ext_count < HINA_ARRAY_SIZE(default_exts))
-    {
-      default_exts[dev_ext_count++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
-    }
-    // VK_EXT_dynamic_rendering_unused_attachments: allows mismatched colorAttachmentCount
-    // between pipeline and rendering (useful for tile pass with dynamic_rendering_local_read)
-    if (hina_has_device_extension(ctx->core.device->core.phys,
-                                  VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME))
-    {
-      if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-        VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME;
-    }
-    // VK_KHR_dynamic_rendering_local_read: enables input attachments with dynamic rendering
-    if (hina_has_device_extension(ctx->core.device->core.phys,
-                                  VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
-    {
-      if (dev_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[dev_ext_count++] =
-        VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
-    }
     dev_exts = default_exts;
+    dev_ext_count = default_ext_count;
   }
   // Log enabled device extensions
   HINA_LOGI(ctx, "Enabling %u device extensions:", dev_ext_count);
@@ -7846,8 +8043,17 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   dci.pQueueCreateInfos = qcis;
   dci.enabledExtensionCount = dev_ext_count;
   dci.ppEnabledExtensionNames = dev_exts;
-  HINA_VK_CHECK_MSG_RET(ctx, vkCreateDevice(ctx->core.device->core.phys, &dci, NULL, &ctx->core.device->core.device),
-                        false, "creating logical device");
+  if (!HINA_VK_CHECK_MSG(ctx, vkCreateDevice(ctx->core.device->core.phys, &dci, NULL, &ctx->core.device->core.device),
+                         "creating logical device"))
+  {
+    if (merged_exts_heap) hina_free_host((void*)merged_exts);
+    return false;
+  }
+  if (merged_exts_heap)
+  {
+    hina_free_host((void*)merged_exts);
+    merged_exts = NULL;
+  }
   ctx->core.owns_device = true;
   volkLoadDevice(ctx->core.device->core.device);
   // Patch volk function pointers: map KHR variants to core names when core is NULL.
@@ -8985,6 +9191,16 @@ static bool hina_staging_ctx_init(hina_context* ctx, hina_staging_context* sc)
   sc->gfx_pending_cmd = NULL;
   sc->xfer_to_gfx_sem = VK_NULL_HANDLE;
   sc->last_gfx_submit_ticket = 0;
+  sc->comp_queue_family = ctx->core.device->queue.compute_family;
+  int8_t comp_lane = ctx->core.device->queue.lanes.indices.compute_idx;
+  if (comp_lane < 0) comp_lane = gfx_lane;
+  sc->comp_lane_idx = (uint8_t)(comp_lane < 0 ? 0 : comp_lane);
+  sc->comp_cmd_pool = VK_NULL_HANDLE;
+  sc->comp_vk_cmd = VK_NULL_HANDLE;
+  sc->comp_pending_cmd = NULL;
+  sc->xfer_to_comp_sem = VK_NULL_HANDLE;
+  sc->gfx_to_comp_sem = VK_NULL_HANDLE;
+  sc->last_comp_submit_ticket = 0;
   VkCommandPoolCreateInfo pool_info = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
     .queueFamilyIndex = sc->queue_family
@@ -9068,6 +9284,7 @@ static bool hina_staging_ctx_init(hina_context* ctx, hina_staging_context* sc)
     hina_set_object_namef(ctx, (uint64_t)sc->xfer_to_gfx_sem, VK_OBJECT_TYPE_SEMAPHORE,
                           "hina_sem_staging_xfer_to_gfx_ctx=%p", (void*)ctx);
   }
+  // Compute staging resources are created lazily on first use.
   return true;
 }
 
@@ -9112,11 +9329,27 @@ static void hina_staging_ctx_destroy(hina_context* ctx, hina_staging_context* sc
     vkDestroySemaphore(ctx->core.device->core.device, sc->xfer_to_gfx_sem, NULL);
     sc->xfer_to_gfx_sem = VK_NULL_HANDLE;
   }
+  if (sc->gfx_to_comp_sem && ctx->core.device && ctx->core.device->core.device)
+  {
+    vkDestroySemaphore(ctx->core.device->core.device, sc->gfx_to_comp_sem, NULL);
+    sc->gfx_to_comp_sem = VK_NULL_HANDLE;
+  }
+  if (sc->xfer_to_comp_sem && ctx->core.device && ctx->core.device->core.device)
+  {
+    vkDestroySemaphore(ctx->core.device->core.device, sc->xfer_to_comp_sem, NULL);
+    sc->xfer_to_comp_sem = VK_NULL_HANDLE;
+  }
   if (sc->gfx_cmd_pool && ctx->core.device && ctx->core.device->core.device)
   {
     vkDestroyCommandPool(ctx->core.device->core.device, sc->gfx_cmd_pool, NULL);
     sc->gfx_cmd_pool = VK_NULL_HANDLE;
     sc->gfx_vk_cmd = VK_NULL_HANDLE;
+  }
+  if (sc->comp_cmd_pool && ctx->core.device && ctx->core.device->core.device)
+  {
+    vkDestroyCommandPool(ctx->core.device->core.device, sc->comp_cmd_pool, NULL);
+    sc->comp_cmd_pool = VK_NULL_HANDLE;
+    sc->comp_vk_cmd = VK_NULL_HANDLE;
   }
   // Destroy persistent download staging buffer (allocated via VMA)
   if (sc->download_staging_buf && ctx->core.device && ctx->core.device->allocator.vma)
@@ -9129,6 +9362,7 @@ static void hina_staging_ctx_destroy(hina_context* ctx, hina_staging_context* sc
   sc->download_staging_size = 0;
   sc->pending_cmd = NULL;
   sc->gfx_pending_cmd = NULL;
+  sc->comp_pending_cmd = NULL;
 }
 
 // Destroy the global page pool (device shutdown)
@@ -9387,6 +9621,7 @@ static void* hina_staging_ctx_alloc(hina_context* ctx, uint32_t size, uint32_t a
     // Save whether command buffers were recording before flush
     bool was_xfer_recording = sc->pending_cmd != NULL;
     bool was_gfx_recording = sc->gfx_pending_cmd != NULL;
+    bool was_comp_recording = sc->comp_pending_cmd != NULL;
     hina_ticket flush_ticket = hina_staging_ctx_flush(ctx);
     hina_staging_ctx_wait(ctx, flush_ticket);
     hina_staging_ctx_process_retired(ctx);
@@ -9410,6 +9645,14 @@ static void* hina_staging_ctx_alloc(hina_context* ctx, uint32_t size, uint32_t a
       if (!hina_staging_ctx_acquire_gfx_cmd(ctx))
       {
         HINA_LOGE(ctx, "failed to re-begin staging gfx command buffer after pool recovery");
+        return NULL;
+      }
+    }
+    if (was_comp_recording)
+    {
+      if (!hina_staging_ctx_acquire_comp_cmd(ctx))
+      {
+        HINA_LOGE(ctx, "failed to re-begin staging comp command buffer after pool recovery");
         return NULL;
       }
     }
@@ -9516,14 +9759,19 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
   hina_staging_context* sc = &ctx->staging;
   bool has_xfer_pending = sc->pending_cmd != NULL;
   bool has_gfx_pending = sc->gfx_pending_cmd != NULL;
-  if (!has_xfer_pending && !has_gfx_pending)
+  bool has_comp_pending = sc->comp_pending_cmd != NULL;
+  if (!has_xfer_pending && !has_gfx_pending && !has_comp_pending)
   {
     return (uint64_t)hina_atomic_load64(&ctx->core.device->sync.timeline.value);
   }
-  bool split = hina_staging_use_split(ctx, sc);
+  bool split_gfx = hina_staging_use_split(ctx, sc);
+  bool split_comp = sc->comp_cmd_pool && sc->comp_vk_cmd && sc->queue_family != sc->comp_queue_family;
+  // If both gfx + comp are pending, chain comp after gfx via semaphore (legacy path).
+  bool chain_comp_after_gfx = has_gfx_pending && has_comp_pending;
   bool has_timeline = vkWaitSemaphores != NULL;
   hina_ticket transfer_ticket = 0;
   hina_ticket gfx_ticket = 0;
+  hina_ticket comp_ticket = 0;
   if (has_xfer_pending)
   {
     sc->pending_cmd = NULL;
@@ -9539,6 +9787,15 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
     if (vkEndCommandBuffer(sc->gfx_vk_cmd) != VK_SUCCESS)
     {
       HINA_LOGE(ctx, "Failed to end staging graphics command buffer");
+      return 0;
+    }
+  }
+  if (has_comp_pending)
+  {
+    sc->comp_pending_cmd = NULL;
+    if (vkEndCommandBuffer(sc->comp_vk_cmd) != VK_SUCCESS)
+    {
+      HINA_LOGE(ctx, "Failed to end staging compute command buffer");
       return 0;
     }
   }
@@ -9574,7 +9831,7 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
       hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
       VkSemaphore wait_sem = VK_NULL_HANDLE;
       uint64_t wait_value = 0;
-      if (split && transfer_ticket)
+      if (split_gfx && transfer_ticket)
       {
         uint8_t dep_lane = hina_ticket_lane(transfer_ticket);
         uint64_t dep_value = hina_ticket_value(transfer_ticket);
@@ -9604,6 +9861,55 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
       gfx_ticket = hina_ticket_encode((uint8_t)lane_idx, signal_value);
       sc->last_gfx_submit_ticket = gfx_ticket;
     }
+    if (has_comp_pending)
+    {
+      int8_t lane_idx = (int8_t)sc->comp_lane_idx;
+      if (lane_idx < 0) lane_idx = 0;
+      hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
+      VkSemaphore wait_sem = VK_NULL_HANDLE;
+      uint64_t wait_value = 0;
+      VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+      if (chain_comp_after_gfx && gfx_ticket)
+      {
+        uint8_t dep_lane = hina_ticket_lane(gfx_ticket);
+        uint64_t dep_value = hina_ticket_value(gfx_ticket);
+        hina_queue_lane* dep = &ctx->core.device->queue.lanes.lanes[dep_lane];
+        if (dep->valid && dep->timeline)
+        {
+          wait_sem = dep->timeline;
+          wait_value = dep_value;
+        }
+      }
+      else if (split_comp && transfer_ticket)
+      {
+        uint8_t dep_lane = hina_ticket_lane(transfer_ticket);
+        uint64_t dep_value = hina_ticket_value(transfer_ticket);
+        hina_queue_lane* dep = &ctx->core.device->queue.lanes.lanes[dep_lane];
+        if (dep->valid && dep->timeline)
+        {
+          wait_sem = dep->timeline;
+          wait_value = dep_value;
+        }
+      }
+      hina_lane_lock(lane);
+      uint64_t signal_value = lane->last_signaled + 1;
+      VkResult result = hina_staging_submit_timeline_impl(lane, sc->comp_vk_cmd, wait_sem, wait_value, wait_stage,
+                                                          signal_value);
+      if (result == VK_SUCCESS)
+      {
+        lane->last_signaled = signal_value;
+        lane->submit_count++;
+      }
+      hina_lane_unlock(lane);
+      if (result != VK_SUCCESS)
+      {
+        HINA_LOGE(ctx, "Staging compute submit failed: %d", result);
+        return 0;
+      }
+      hina_atomic_inc64(&ctx->core.device->sync.timeline.value);
+      comp_ticket = hina_ticket_encode((uint8_t)lane_idx, signal_value);
+      sc->last_comp_submit_ticket = comp_ticket;
+    }
   }
   else
   {
@@ -9617,16 +9923,32 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
     }
     VkResult reset_result = vkResetFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging);
     HINA_ASSERTF(reset_result == VK_SUCCESS, "vkResetFences failed in staging flush: %d", reset_result);
-    bool use_gfx_fence = has_gfx_pending;
+    bool use_comp_fence = has_comp_pending;
+    bool use_gfx_fence = has_gfx_pending && !use_comp_fence;
+    if (chain_comp_after_gfx && !sc->gfx_to_comp_sem)
+    {
+      if (!hina_staging_ctx_ensure_gfx_to_comp_sem(ctx, sc))
+      {
+        return 0;
+      }
+    }
     if (has_xfer_pending)
     {
       int8_t lane_idx = (int8_t)sc->lane_idx;
       hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
-      VkFence fence = use_gfx_fence ? VK_NULL_HANDLE : ctx->core.device->sync.fence.staging;
-      bool signal_sem = split && has_gfx_pending && sc->xfer_to_gfx_sem;
+      VkFence fence = (use_gfx_fence || use_comp_fence) ? VK_NULL_HANDLE : ctx->core.device->sync.fence.staging;
+      VkSemaphore signal_sem = VK_NULL_HANDLE;
+      if (split_gfx && has_gfx_pending && sc->xfer_to_gfx_sem)
+      {
+        signal_sem = sc->xfer_to_gfx_sem;
+      }
+      else if (split_comp && has_comp_pending && !has_gfx_pending && sc->xfer_to_comp_sem)
+      {
+        signal_sem = sc->xfer_to_comp_sem;
+      }
       hina_lane_lock(lane);
       VkResult result = hina_staging_submit_fence_impl(lane, sc->vk_cmd, VK_NULL_HANDLE, 0,
-                                                       signal_sem ? sc->xfer_to_gfx_sem : VK_NULL_HANDLE, fence);
+                                                       signal_sem, fence);
       lane->submit_count++;
       hina_lane_unlock(lane);
       if (result != VK_SUCCESS)
@@ -9634,7 +9956,7 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
         HINA_LOGE(ctx, "Staging submit failed (no timeline): %d", result);
         return 0;
       }
-      if (!use_gfx_fence)
+      if (!use_gfx_fence && !use_comp_fence)
       {
         hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 1);
         transfer_ticket = (uint64_t)hina_atomic_inc64(&ctx->core.device->sync.submission_counter);
@@ -9645,12 +9967,13 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
     {
       int8_t lane_idx = (int8_t)sc->gfx_lane_idx;
       hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
-      bool wait_sem = split && has_xfer_pending && sc->xfer_to_gfx_sem;
+      VkSemaphore wait_sem = (split_gfx && has_xfer_pending && sc->xfer_to_gfx_sem) ? sc->xfer_to_gfx_sem
+        : VK_NULL_HANDLE;
+      VkSemaphore signal_sem = (chain_comp_after_gfx && sc->gfx_to_comp_sem) ? sc->gfx_to_comp_sem : VK_NULL_HANDLE;
+      VkFence fence = use_gfx_fence ? ctx->core.device->sync.fence.staging : VK_NULL_HANDLE;
       hina_lane_lock(lane);
       VkResult result = hina_staging_submit_fence_impl(lane, sc->gfx_vk_cmd,
-                                                       wait_sem ? sc->xfer_to_gfx_sem : VK_NULL_HANDLE,
-                                                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_NULL_HANDLE,
-                                                       ctx->core.device->sync.fence.staging);
+                                                       wait_sem, VK_PIPELINE_STAGE_TRANSFER_BIT, signal_sem, fence);
       lane->submit_count++;
       hina_lane_unlock(lane);
       if (result != VK_SUCCESS)
@@ -9658,17 +9981,58 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
         HINA_LOGE(ctx, "Staging graphics submit failed (no timeline): %d", result);
         return 0;
       }
+      if (use_gfx_fence)
+      {
+        hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 1);
+        gfx_ticket = (uint64_t)hina_atomic_inc64(&ctx->core.device->sync.submission_counter);
+        sc->last_submit_ticket = gfx_ticket;
+        sc->last_gfx_submit_ticket = gfx_ticket;
+      }
+    }
+    if (has_comp_pending)
+    {
+      int8_t lane_idx = (int8_t)sc->comp_lane_idx;
+      hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
+      VkSemaphore wait_sem = VK_NULL_HANDLE;
+      VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+      if (chain_comp_after_gfx && sc->gfx_to_comp_sem)
+      {
+        wait_sem = sc->gfx_to_comp_sem;
+      }
+      else if (split_comp && has_xfer_pending && sc->xfer_to_comp_sem)
+      {
+        wait_sem = sc->xfer_to_comp_sem;
+      }
+      hina_lane_lock(lane);
+      VkResult result = hina_staging_submit_fence_impl(lane, sc->comp_vk_cmd, wait_sem, wait_stage, VK_NULL_HANDLE,
+                                                       ctx->core.device->sync.fence.staging);
+      lane->submit_count++;
+      hina_lane_unlock(lane);
+      if (result != VK_SUCCESS)
+      {
+        HINA_LOGE(ctx, "Staging compute submit failed (no timeline): %d", result);
+        return 0;
+      }
       hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 1);
-      gfx_ticket = (uint64_t)hina_atomic_inc64(&ctx->core.device->sync.submission_counter);
-      sc->last_submit_ticket = gfx_ticket;
-      sc->last_gfx_submit_ticket = gfx_ticket;
+      comp_ticket = (uint64_t)hina_atomic_inc64(&ctx->core.device->sync.submission_counter);
+      sc->last_submit_ticket = comp_ticket;
+      sc->last_comp_submit_ticket = comp_ticket;
+      if (has_gfx_pending)
+      {
+        sc->last_gfx_submit_ticket = comp_ticket;
+      }
+    }
+    // Legacy path uses a single fence; alias per-queue tickets to the fence ticket when chained.
+    if (has_gfx_pending && !sc->last_gfx_submit_ticket && sc->last_submit_ticket)
+    {
+      sc->last_gfx_submit_ticket = sc->last_submit_ticket;
+    }
+    if (has_comp_pending && !sc->last_comp_submit_ticket && sc->last_submit_ticket)
+    {
+      sc->last_comp_submit_ticket = sc->last_submit_ticket;
     }
   }
-  if (!gfx_ticket)
-  {
-    gfx_ticket = transfer_ticket;
-  }
-  hina_ticket retire_ticket = transfer_ticket ? transfer_ticket : gfx_ticket;
+  hina_ticket retire_ticket = transfer_ticket ? transfer_ticket : (gfx_ticket ? gfx_ticket : comp_ticket);
   if (retire_ticket)
   {
     // Only update pages from pending_start to count (O(pending) not O(total))
@@ -9680,7 +10044,8 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
     sc->retired.pending_start = sc->retired.count;
     if (sc->active_page && sc->active_page->used > 0) hina_staging_ctx_retire_active(ctx, retire_ticket);
   }
-  return gfx_ticket ? gfx_ticket : transfer_ticket;
+  hina_ticket flush_ticket = comp_ticket ? comp_ticket : (gfx_ticket ? gfx_ticket : transfer_ticket);
+  return flush_ticket;
 }
 
 static void hina_staging_ctx_wait(hina_context* ctx, hina_ticket ticket)
@@ -9921,6 +10286,174 @@ static VkCommandBuffer hina_staging_ctx_acquire_gfx_cmd(hina_context* ctx)
   }
   sc->gfx_pending_cmd = (hina_cmd*)1;
   return sc->gfx_vk_cmd;
+}
+
+static bool hina_staging_ctx_init_comp(hina_context* ctx, hina_staging_context* sc)
+{
+  HINA_ASSERT(sc);
+  if (sc->queue_family == sc->comp_queue_family || sc->comp_queue_family == sc->gfx_queue_family) return false;
+  bool created_pool = false;
+  if (!sc->comp_cmd_pool)
+  {
+    VkCommandPoolCreateInfo comp_pool_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+      .queueFamilyIndex = sc->comp_queue_family
+    };
+    if (vkCreateCommandPool(ctx->core.device->core.device, &comp_pool_info, NULL, &sc->comp_cmd_pool) != VK_SUCCESS)
+    {
+      HINA_LOGE(ctx, "Failed to create staging compute command pool");
+      return false;
+    }
+    created_pool = true;
+    hina_set_object_namef(ctx, (uint64_t)sc->comp_cmd_pool, VK_OBJECT_TYPE_COMMAND_POOL,
+                          "hina_cmd_pool_staging_comp_ctx=%p", (void*)ctx);
+  }
+  if (!sc->comp_vk_cmd)
+  {
+    VkCommandBufferAllocateInfo comp_alloc = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = sc->comp_cmd_pool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1
+    };
+    if (vkAllocateCommandBuffers(ctx->core.device->core.device, &comp_alloc, &sc->comp_vk_cmd) != VK_SUCCESS)
+    {
+      HINA_LOGE(ctx, "Failed to allocate staging compute command buffer");
+      if (created_pool)
+      {
+        vkDestroyCommandPool(ctx->core.device->core.device, sc->comp_cmd_pool, NULL);
+        sc->comp_cmd_pool = VK_NULL_HANDLE;
+      }
+      return false;
+    }
+    hina_set_object_namef(ctx, (uint64_t)sc->comp_vk_cmd, VK_OBJECT_TYPE_COMMAND_BUFFER,
+                          "hina_cmd_staging_comp_ctx=%p", (void*)ctx);
+  }
+  if (!vkWaitSemaphores && !sc->xfer_to_comp_sem)
+  {
+    VkSemaphoreCreateInfo sem_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    if (vkCreateSemaphore(ctx->core.device->core.device, &sem_info, NULL, &sc->xfer_to_comp_sem) != VK_SUCCESS)
+    {
+      HINA_LOGE(ctx, "Failed to create staging transfer->compute semaphore");
+      if (created_pool)
+      {
+        vkDestroyCommandPool(ctx->core.device->core.device, sc->comp_cmd_pool, NULL);
+        sc->comp_cmd_pool = VK_NULL_HANDLE;
+        sc->comp_vk_cmd = VK_NULL_HANDLE;
+      }
+      return false;
+    }
+    hina_set_object_namef(ctx, (uint64_t)sc->xfer_to_comp_sem, VK_OBJECT_TYPE_SEMAPHORE,
+                          "hina_sem_staging_xfer_to_comp_ctx=%p", (void*)ctx);
+  }
+  return true;
+}
+
+static bool hina_staging_ctx_ensure_gfx_to_comp_sem(hina_context* ctx, hina_staging_context* sc)
+{
+  if (sc->gfx_to_comp_sem) return true;
+  VkSemaphoreCreateInfo sem_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+  if (vkCreateSemaphore(ctx->core.device->core.device, &sem_info, NULL, &sc->gfx_to_comp_sem) != VK_SUCCESS)
+  {
+    HINA_LOGE(ctx, "Failed to create staging graphics->compute semaphore");
+    return false;
+  }
+  hina_set_object_namef(ctx, (uint64_t)sc->gfx_to_comp_sem, VK_OBJECT_TYPE_SEMAPHORE,
+                        "hina_sem_staging_gfx_to_comp_ctx=%p", (void*)ctx);
+  return true;
+}
+
+// Get the staging compute command buffer (for split transfer->compute path)
+static VkCommandBuffer hina_staging_ctx_acquire_comp_cmd(hina_context* ctx)
+{
+  hina_staging_context* sc = &ctx->staging;
+  if (!sc->comp_cmd_pool || !sc->comp_vk_cmd || (!vkWaitSemaphores && !sc->xfer_to_comp_sem))
+  {
+    if (!hina_staging_ctx_init_comp(ctx, sc))
+    {
+      HINA_LOGE(ctx, "Staging compute command pool not initialized");
+      return VK_NULL_HANDLE;
+    }
+  }
+#ifndef NDEBUG
+  thrd_t current = thrd_current();
+  if (!sc->owner_thread_set)
+  {
+    sc->owner_thread = current;
+    sc->owner_thread_set = true;
+  }
+  else
+  {
+    HINA_ASSERT(
+      thrd_equal(sc->owner_thread, current) && "hina_context is not thread-safe! Use one context per thread.");
+  }
+#endif
+  if (sc->comp_pending_cmd)
+  {
+    HINA_ASSERTF(sc->comp_vk_cmd != VK_NULL_HANDLE, "staging comp_pending_cmd set but comp_vk_cmd is NULL");
+    return sc->comp_vk_cmd;
+  }
+
+  if (sc->last_comp_submit_ticket > 0)
+  {
+    if (vkWaitSemaphores)
+    {
+      uint8_t lane_idx = hina_ticket_lane(sc->last_comp_submit_ticket);
+      uint64_t raw_value = hina_ticket_value(sc->last_comp_submit_ticket);
+      hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
+      HINA_ASSERT(lane->valid);
+      if (lane->timeline)
+      {
+        VkSemaphoreWaitInfo wi = {
+          .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &lane->timeline,
+          .pValues = &raw_value
+        };
+        VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+        HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
+                     "vkWaitSemaphores failed in staging comp acquire: %d", wait_result);
+      }
+    }
+    else
+    {
+      if (hina_atomic_load32(&ctx->core.device->sync.fence.staging_busy))
+      {
+        VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging,
+                                               VK_TRUE, UINT64_MAX);
+        HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
+                     "vkWaitForFences failed in staging comp acquire: %d", wait_result);
+        hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 0);
+      }
+    }
+  }
+  VkResult reset_result = vkResetCommandPool(ctx->core.device->core.device, sc->comp_cmd_pool, 0);
+  HINA_ASSERTF(reset_result == VK_SUCCESS, "vkResetCommandPool failed in staging comp acquire: %d", reset_result);
+  VkCommandBufferBeginInfo begin = {
+    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+  };
+  if (vkBeginCommandBuffer(sc->comp_vk_cmd, &begin) != VK_SUCCESS)
+  {
+    HINA_LOGE(ctx, "Failed to begin staging compute command buffer");
+    return VK_NULL_HANDLE;
+  }
+  sc->comp_pending_cmd = (hina_cmd*)1;
+  return sc->comp_vk_cmd;
+}
+
+static VkCommandBuffer hina_staging_ctx_acquire_owner_cmd(hina_context* ctx, uint32_t owner_family)
+{
+  hina_staging_context* sc = &ctx->staging;
+  if (owner_family == sc->queue_family)
+  {
+    return hina_staging_ctx_acquire_cmd(ctx);
+  }
+  if (owner_family == sc->gfx_queue_family)
+  {
+    return hina_staging_ctx_acquire_gfx_cmd(ctx);
+  }
+  if (owner_family == sc->comp_queue_family)
+  {
+    return hina_staging_ctx_acquire_comp_cmd(ctx);
+  }
+  HINA_LOGE(ctx, "Staging owner family %u not supported", owner_family);
+  return VK_NULL_HANDLE;
 }
 
 hina_ticket hina_ctx_flush_staging(hina_context* ctx)
@@ -10472,7 +11005,7 @@ void hina_destroy_thread_context(hina_context* ctx)
     ctx->hierarchy.parent = NULL;
   }
   // Ensure all submissions and staging work from this context are complete
-  if (ctx->staging.pending_cmd || ctx->staging.gfx_pending_cmd)
+  if (ctx->staging.pending_cmd || ctx->staging.gfx_pending_cmd || ctx->staging.comp_pending_cmd)
   {
     hina_staging_ctx_flush(ctx);
   }
@@ -10480,6 +11013,8 @@ void hina_destroy_thread_context(hina_context* ctx)
   ctx->staging.last_submit_ticket = 0;
   hina_staging_ctx_wait(ctx, ctx->staging.last_gfx_submit_ticket);
   ctx->staging.last_gfx_submit_ticket = 0;
+  hina_staging_ctx_wait(ctx, ctx->staging.last_comp_submit_ticket);
+  ctx->staging.last_comp_submit_ticket = 0;
   for (;;)
   {
     hina_ticket ticket = 0;
@@ -10585,13 +11120,20 @@ static hina_buffer hina_make_buffer_internal(hina_context* ctx, const hina_buffe
 
 // Chunked staging upload - handles uploads larger than a single staging page
 // by splitting into multiple copy commands
-static bool hina_staging_upload_chunked(hina_context* ctx, VkBuffer dst_buffer, uint64_t dst_offset,
+static bool hina_staging_upload_chunked(hina_context* ctx, hina_buffer_hot* hot, uint64_t dst_offset,
                                         const void* src_data, uint64_t size)
 {
-  HINA_ASSERT(src_data && size > 0);
+  HINA_ASSERT(hot && src_data && size > 0);
   const uint8_t* src_bytes = src_data;
   uint64_t remaining = size;
   uint64_t current_dst_offset = dst_offset;
+  VkBuffer dst_buffer = hot->vk.buffer;
+  VkCommandBuffer vk_cmd = hina_staging_ctx_acquire_cmd(ctx);
+  if (!vk_cmd)
+  {
+    HINA_LOGE(ctx, "failed to begin staging command buffer for buffer upload");
+    return false;
+  }
   // Use page size as chunk limit (leave some margin for alignment)
   const uint32_t max_chunk = HINA_MAIN_STAGING_SIZE - 256;
   while (remaining > 0)
@@ -10609,15 +11151,29 @@ static bool hina_staging_upload_chunked(hina_context* ctx, VkBuffer dst_buffer, 
     // Copy CPU -> staging
     memcpy(staging_ptr, src_bytes, chunk_size);
     // Record copy command (staging -> GPU)
-    VkCommandBuffer vk_cmd = hina_staging_ctx_acquire_cmd(ctx);
-    if (vk_cmd)
-    {
-      hina_copy_buffer(vk_cmd, staging_buffer, dst_buffer, staging_offset, current_dst_offset, chunk_size);
-    }
+    hina_copy_buffer(vk_cmd, staging_buffer, dst_buffer, staging_offset, current_dst_offset, chunk_size);
     // Advance
     remaining -= chunk_size;
     src_bytes += chunk_size;
     current_dst_offset += chunk_size;
+  }
+  uint32_t owner_family = HINA_BUFFER_GET_OWNER(hot->config.flags_packed);
+  uint32_t xfer_family = ctx->staging.queue_family;
+  if (owner_family != xfer_family)
+  {
+    VkCommandBuffer owner_cmd = hina_staging_ctx_acquire_owner_cmd(ctx, owner_family);
+    if (!owner_cmd)
+    {
+      HINA_LOGE(ctx, "failed to begin owner command buffer for buffer upload");
+      return false;
+    }
+    HINA_BUFFER_BARRIER_QFOT(vk_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             VK_ACCESS_TRANSFER_WRITE_BIT, 0, xfer_family, owner_family, dst_buffer, 0,
+                             VK_WHOLE_SIZE);
+    HINA_BUFFER_BARRIER_QFOT(owner_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, xfer_family, owner_family,
+                             dst_buffer, 0, VK_WHOLE_SIZE);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 2);
   }
   return true;
 }
@@ -10647,7 +11203,7 @@ hina_buffer hina_ctx_make_buffer(hina_context* ctx, const hina_buffer_desc* desc
   }
   // Staging path - use chunked upload for any size
   // Data is copied to staging buffer but NOT submitted yet (deferred/batched)
-  if (!hina_staging_upload_chunked(ctx, hot->vk.buffer, 0, desc->initial_data, desc->size))
+  if (!hina_staging_upload_chunked(ctx, hot, 0, desc->initial_data, desc->size))
   {
     HINA_LOGW(ctx, "failed to stage buffer data (%" PRIu64 " bytes)", (uint64_t)desc->size);
     // Staging failed - leave ready bit cleared (it's 0 by default)
@@ -10780,7 +11336,7 @@ void hina_download_buffer(hina_buffer src, size_t offset, size_t size, void* dst
 
 // Textures / swapchain minimal
 static void hina_record_generate_mips(hina_context* ctx, VkCommandBuffer vk_cmd, hina_texture_hot* hot, uint32_t layers,
-                                      VkImageAspectFlags aspect)
+                                      VkImageAspectFlags aspect, VkPipelineStageFlags final_stage)
 {
   bool is_3d = hot->texture_dim == HINA_TEX_DIM_3D;
   uint32_t array_layers = is_3d ? 1u : layers;
@@ -10842,7 +11398,7 @@ static void hina_record_generate_mips(hina_context* ctx, VkCommandBuffer vk_cmd,
   }
   // Transition all mip levels to SHADER_READ_ONLY_OPTIMAL
   // Levels 0..N-2 are in TRANSFER_SRC, level N-1 is in TRANSFER_DST
-  const VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  const VkPipelineStageFlags dst_stages = final_stage;
   if (mip_levels > 1)
   {
     const VkImageMemoryBarrier post[2] = {
@@ -10929,20 +11485,27 @@ static bool hina_upload_texture_initial(hina_context* ctx, hina_texture_hot* hot
   }
   uint64_t slice_stride = src_stride * (uint64_t)block_rows;
   // Acquire staging command buffer up front
-  bool split = hina_staging_use_split(ctx, &ctx->staging);
   VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
   if (!xfer_cmd)
   {
     HINA_LOGE(ctx, "failed to begin command buffer for texture upload");
     return false;
   }
-  VkCommandBuffer gfx_cmd = xfer_cmd;
-  if (split)
+  uint32_t owner_family = (uint32_t)hot->owning_family;
+  uint32_t gfx_family = ctx->core.device->queue.graphics_family;
+  uint32_t comp_family = ctx->core.device->queue.compute_family;
+  VkPipelineStageFlags final_stage = (owner_family == comp_family && owner_family != gfx_family)
+                                       ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                       : (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  VkCommandBuffer owner_cmd = xfer_cmd;
+  uint32_t xfer_family = ctx->staging.queue_family;
+  bool needs_qfot = xfer_family != owner_family;
+  if (needs_qfot)
   {
-    gfx_cmd = hina_staging_ctx_acquire_gfx_cmd(ctx);
-    if (!gfx_cmd)
+    owner_cmd = hina_staging_ctx_acquire_owner_cmd(ctx, owner_family);
+    if (!owner_cmd)
     {
-      HINA_LOGE(ctx, "failed to begin graphics command buffer for texture upload");
+      HINA_LOGE(ctx, "failed to begin owner command buffer for texture upload");
       return false;
     }
   }
@@ -11009,54 +11572,46 @@ static bool hina_upload_texture_initial(hina_context* ctx, hina_texture_hot* hot
       row_index += rows;
     }
   }
-  // Queue family ownership transfer for split mode (exclusive sharing)
-  // In split mode: copy on xfer_cmd (transfer queue), final barrier on gfx_cmd (graphics queue)
-  uint32_t xfer_family = ctx->staging.queue_family;
-  uint32_t gfx_family = ctx->staging.gfx_queue_family;
-  bool needs_qfot = split && xfer_family != gfx_family;
+  // Queue family ownership transfer for exclusive sharing
+  // Copy on xfer_cmd (transfer queue), finalization on owner_cmd (graphics/compute)
+  uint32_t mip_count = generate_mips ? hot->mip_levels : 1u;
+  VkImageSubresourceRange full_range = {aspect, 0, mip_count, 0, is_3d ? 1u : layers};
   if (needs_qfot)
   {
     // Release barrier on transfer queue: give up ownership
     HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, xfer_family, gfx_family, hot->vk.image,
-                            ((VkImageSubresourceRange){hina_aspect_from_format(hot->dims.format), 0, generate_mips ? hot
-                              ->mip_levels : 1, 0, is_3d ? 1u : layers}));
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, xfer_family, owner_family, hot->vk.image,
+                            full_range);
     HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   }
   if (generate_mips)
   {
     if (needs_qfot)
     {
-      HINA_IMAGE_BARRIER_QFOT(gfx_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+      HINA_IMAGE_BARRIER_QFOT(owner_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, xfer_family,
-                              gfx_family, hot->vk.image,
-                              ((VkImageSubresourceRange){hina_aspect_from_format(hot->dims.format), 0, hot->mip_levels,
-                                0, is_3d ? 1u : layers}));
+                              owner_family, hot->vk.image, full_range);
       HINA_DEBUG_ADD_BARRIERS(ctx, 1);
     }
-    hina_record_generate_mips(ctx, gfx_cmd, hot, is_3d ? 1u : layers, hina_aspect_from_format(hot->dims.format));
+    hina_record_generate_mips(ctx, owner_cmd, hot, is_3d ? 1u : layers, aspect, final_stage);
   }
   else
   {
     if (needs_qfot)
     {
-      HINA_IMAGE_BARRIER_QFOT(gfx_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                              VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, xfer_family, gfx_family, hot->vk.image,
-                              ((VkImageSubresourceRange){hina_aspect_from_format(hot->dims.format), 0, 1, 0, is_3d ? 1u
-                                : layers}));
+      HINA_IMAGE_BARRIER_QFOT(owner_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, final_stage, 0, VK_ACCESS_SHADER_READ_BIT,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              xfer_family, owner_family, hot->vk.image,
+                              ((VkImageSubresourceRange){aspect, 0, 1, 0, is_3d ? 1u : layers}));
     }
     else
     {
-      HINA_IMAGE_BARRIER(gfx_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      HINA_IMAGE_BARRIER(owner_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, final_stage, VK_ACCESS_TRANSFER_WRITE_BIT,
+                         VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, hot->vk.image,
-                         ((VkImageSubresourceRange){hina_aspect_from_format(hot->dims.format), 0, 1, 0, is_3d ? 1u :
-                           layers}));
+                         ((VkImageSubresourceRange){aspect, 0, 1, 0, is_3d ? 1u : layers}));
     }
     HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   }
@@ -11502,6 +12057,12 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
   hina_queue initial_owner = desc->initial_owner;
   if (initial_owner == 0) initial_owner = HINA_QUEUE_GRAPHICS;
   uint32_t owning_family = hina_queue_to_family(ctx, initial_owner);
+  if (desc->initial_data && owning_family == ctx->core.device->queue.transfer_family &&
+      ctx->core.device->queue.transfer_family != ctx->core.device->queue.graphics_family)
+  {
+    HINA_LOGW(ctx, "initial_owner=TRANSFER not supported for texture upload; defaulting to graphics");
+    owning_family = ctx->core.device->queue.graphics_family;
+  }
   VmaAllocationCreateInfo ainfo = {0};
   ainfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
   ainfo.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -11589,6 +12150,12 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
   bool upload_succeeded = false;
   if (desc->initial_data)
   {
+    VkPipelineStageFlags owner_shader_stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    if (owning_family == ctx->core.device->queue.compute_family &&
+        owning_family != ctx->core.device->queue.graphics_family)
+    {
+      owner_shader_stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    }
     upload_succeeded = hina_upload_texture_initial(ctx, hot, desc);
     if (upload_succeeded)
     {
@@ -11597,7 +12164,7 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
       hina_staging_add_texture(ctx, idx);
       hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       hot->state.access = VK_ACCESS_SHADER_READ_BIT;
-      hot->state.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      hot->state.stages = owner_shader_stages;
     }
     if (!upload_succeeded)
     {
@@ -11623,7 +12190,7 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
         // If submit failed, leave ready bit cleared (will block on first use)
         hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         hot->state.access = VK_ACCESS_SHADER_READ_BIT;
-        hot->state.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        hot->state.stages = owner_shader_stages;
       }
       // If cmd allocation failed, leave ready bit cleared (will block on first use)
     }
@@ -12231,7 +12798,8 @@ hina_ticket hina_ctx_generate_mips(hina_context* ctx, hina_texture tex)
                      VK_ACCESS_TRANSFER_WRITE_BIT, hot->state.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      hot->vk.image, ((VkImageSubresourceRange){aspect, 0, hot->mip_levels, 0, layers}));
   HINA_DEBUG_ADD_BARRIERS(cmd->ctx, 1);
-  hina_record_generate_mips(cmd->ctx, cmd->vk_cmd, hot, layers, aspect);
+  hina_record_generate_mips(cmd->ctx, cmd->vk_cmd, hot, layers, aspect,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   VkImageLayout final_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   VkAccessFlags final_access = VK_ACCESS_SHADER_READ_BIT;
   VkPipelineStageFlags final_stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -13954,7 +14522,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
                            ? hina_format_to_vk(desc->stencil_format)
                            : VK_FORMAT_UNDEFINED;
   // Dynamic rendering local read: chain attachment location/input index info for tile passes
-  uint32_t dyn_local_read_locations[HINA_MAX_COLOR_ATTACHMENTS];
+  uint32_t dyn_local_read_locations[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
   uint32_t dyn_local_read_input_indices[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
   VkRenderingAttachmentLocationInfo dyn_att_location_info = {
     .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO
@@ -13994,6 +14562,9 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     }
     dyn_input_att_info.colorAttachmentCount = total_attachments;
     dyn_input_att_info.pColorAttachmentInputIndices = dyn_local_read_input_indices;
+    // Depth input attachment (index 0 = single depth attachment, NULL if not reading depth)
+    uint32_t depth_input_idx = 0;
+    dyn_input_att_info.pDepthInputAttachmentIndex = sp_layout->depth_input ? &depth_input_idx : NULL;
     dyn_att_location_info.pNext = &dyn_input_att_info;
     // Blend state uses flattened attachment indices, not fragment output locations
     for (uint32_t i = 0; i < total_attachments; i++)
@@ -15517,7 +16088,7 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   for (uint32_t i = 0; i < color_count; ++i)
     vk_color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
   // Dynamic rendering local read: chain attachment location/input index info for tile passes
-  uint32_t hsl_dyn_locations[HINA_MAX_COLOR_ATTACHMENTS];
+  uint32_t hsl_dyn_locations[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
   uint32_t hsl_dyn_input_indices[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
   VkRenderingAttachmentLocationInfo hsl_att_location_info = {
     .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO
@@ -15554,6 +16125,9 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     }
     hsl_input_att_info.colorAttachmentCount = total_attachments;
     hsl_input_att_info.pColorAttachmentInputIndices = hsl_dyn_input_indices;
+    // Depth input attachment (index 0 = single depth attachment, NULL if not reading depth)
+    uint32_t hsl_depth_input_idx = 0;
+    hsl_input_att_info.pDepthInputAttachmentIndex = sp_layout->depth_input ? &hsl_depth_input_idx : NULL;
     hsl_att_location_info.pNext = &hsl_input_att_info;
     for (uint32_t i = 0; i < total_attachments; i++)
     {
@@ -16361,7 +16935,7 @@ HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_sync2(hina_cmd* cmd, const
           resolve_hot->state.access = resolve_target.access;
           resolve_hot->state.stages = resolve_target.stages;
         }
-        att.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        att.resolveMode = hina_resolve_mode_for_format(resolve_hot->dims.format);
         att.resolveImageView = resolve_view;
         att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
       }
@@ -16563,7 +17137,7 @@ HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_legacy(hina_cmd* cmd, cons
           resolve_hot->state.access = resolve_target.access;
           resolve_hot->state.stages = resolve_target.stages;
         }
-        att.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        att.resolveMode = hina_resolve_mode_for_format(resolve_hot->dims.format);
         att.resolveImageView = resolve_view;
         att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
       }
@@ -16725,6 +17299,18 @@ HINA_NOINLINE static void hina_cmd_end_pass_legacy(hina_cmd* cmd)
       resolve_hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       resolve_hot->state.access = VK_ACCESS_SHADER_READ_BIT;
       resolve_hot->state.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    }
+  }
+  if (hina_texture_view_slot_valid(cmd->depth_view))
+  {
+    uint16_t view_idx = hina_id_index(cmd->depth_view.id);
+    hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
+    hina_texture_hot* depth_hot = HINA_TEX_HOT(view_slot->parent_idx);
+    if (depth_hot->owns_image)
+    {
+      depth_hot->state.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+      depth_hot->state.access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+      depth_hot->state.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     }
   }
   cmd->color_count = 0;
@@ -16993,13 +17579,19 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
             r_hot->state.access = resolve_target.access;
             r_hot->state.stages = resolve_target.stages;
           }
-          att.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+          att.resolveMode = hina_resolve_mode_for_format(r_hot->dims.format);
           att.resolveImageView = r_slot->view;
           att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         }
       }
       color_atts[total_color_count++] = att;
     }
+  }
+  // Check if any subpass uses depth as input attachment
+  bool any_depth_input = false;
+  for (uint32_t sp = 1; sp < subpass_count; sp++)
+  {
+    if (desc->subpasses[sp].depth_input) { any_depth_input = true; break; }
   }
   // Collect depth attachment (use first subpass that has one)
   VkRenderingAttachmentInfo depth_att = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -17013,7 +17605,9 @@ static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_des
       hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
       hina_texture_hot* tex_hot = HINA_TEX_HOT(view_slot->parent_idx);
       if (!tex_hot->owns_image) uses_swapchain = true;
-      VkImageLayout depth_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+      VkImageLayout depth_layout = any_depth_input
+        ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR
+        : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
       if (tex_hot->state.layout != depth_layout)
       {
         barriers[barrier_count++] = (VkImageMemoryBarrier2){
@@ -17135,13 +17729,14 @@ static void hina_tile_pass_next_dynamic(hina_cmd* cmd, const hina_tile_pass_desc
   const hina_tile_subpass* prev_subpass = &desc->subpasses[next_sp - 1];
   const hina_tile_subpass* next_subpass = &desc->subpasses[next_sp];
   const bool depth_sync = prev_subpass->has_depth && next_subpass->has_depth;
-  // Memory barrier: color writes → fragment shader reads, depth writes → depth tests
+  const bool depth_input = next_subpass->depth_input;
+  // Memory barrier: color writes → fragment shader reads, depth writes → depth tests/input reads
   VkMemoryBarrier2 mem_barrier = {
     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
     .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
     .dstAccessMask = VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT
   };
-  if (depth_sync)
+  if (depth_sync || depth_input)
   {
     const VkPipelineStageFlags2 depth_stages = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
       VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -17149,7 +17744,8 @@ static void hina_tile_pass_next_dynamic(hina_cmd* cmd, const hina_tile_pass_desc
     mem_barrier.srcAccessMask |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     mem_barrier.dstStageMask |= depth_stages;
     mem_barrier.dstAccessMask |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-    if (!next_subpass->depth_read_only) mem_barrier.dstAccessMask |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    if (depth_sync && !next_subpass->depth_read_only)
+      mem_barrier.dstAccessMask |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
   }
   VkDependencyInfo dep = {
     .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
@@ -17179,9 +17775,11 @@ static void hina_tile_pass_next_dynamic(hina_cmd* cmd, const hina_tile_pass_desc
     uint32_t global_idx = color_att_map[input->subpass_output_index][input->attachment_index];
     input_indices[global_idx] = ti;
   }
+  uint32_t depth_input_index = 0;
   VkRenderingInputAttachmentIndexInfo input_info = {
     .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO, .colorAttachmentCount = total_color_count,
-    .pColorAttachmentInputIndices = input_indices
+    .pColorAttachmentInputIndices = input_indices,
+    .pDepthInputAttachmentIndex = subpass->depth_input ? &depth_input_index : NULL
   };
   vkCmdSetRenderingInputAttachmentIndices(cmd->vk_cmd, &input_info);
   uint32_t color_locations[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
@@ -19623,7 +20221,7 @@ static bool hina_buffer_upload_ready(hina_context* ctx, uint16_t idx)
   // as that would end the command buffer mid-recording and cause validation errors
   hina_staging_context* sc = &ctx->staging;
   bool has_staged = sc->staged_buffers.count > 0 || sc->staged_textures.count > 0;
-  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL;
+  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
   if (has_staged && !is_recording)
   {
     hina_auto_flush_staged(ctx);
@@ -19640,6 +20238,10 @@ static bool hina_buffer_upload_ready(hina_context* ctx, uint16_t idx)
     if (sc->last_gfx_submit_ticket > 0)
     {
       hina_staging_ctx_wait(ctx, sc->last_gfx_submit_ticket);
+    }
+    if (sc->last_comp_submit_ticket > 0)
+    {
+      hina_staging_ctx_wait(ctx, sc->last_comp_submit_ticket);
     }
     // Mark as ready only if we actually waited
     hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
@@ -19663,7 +20265,7 @@ static bool hina_texture_upload_ready(hina_context* ctx, uint16_t idx)
   // as that would end the command buffer mid-recording and cause validation errors
   hina_staging_context* sc = &ctx->staging;
   bool has_staged = sc->staged_buffers.count > 0 || sc->staged_textures.count > 0;
-  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL;
+  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
   if (has_staged && !is_recording)
   {
     hina_auto_flush_staged(ctx);
@@ -19680,6 +20282,10 @@ static bool hina_texture_upload_ready(hina_context* ctx, uint16_t idx)
     if (sc->last_gfx_submit_ticket > 0)
     {
       hina_staging_ctx_wait(ctx, sc->last_gfx_submit_ticket);
+    }
+    if (sc->last_comp_submit_ticket > 0)
+    {
+      hina_staging_ctx_wait(ctx, sc->last_comp_submit_ticket);
     }
     // Mark as ready only if we actually waited
     hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;

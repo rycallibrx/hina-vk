@@ -2947,6 +2947,7 @@ typedef struct hina_tile_subpass
   hina_depth_attachment depth;
   bool has_depth;
   bool depth_read_only; // Preserve depth from previous subpass (read-only)
+  bool depth_input;     // Read depth from prior subpass as input attachment
 } hina_tile_subpass;
 
 /**
@@ -2994,6 +2995,7 @@ typedef struct hina_tile_subpass_layout
   uint32_t color_count; // Must be <= HINA_MAX_COLOR_ATTACHMENTS
   hina_format depth_format; // HINA_FORMAT_UNDEFINED = no depth (for other subpasses)
   bool depth_read_only; // Must match runtime for render pass compatibility
+  bool depth_input;     // Read depth from prior subpass as input attachment
   hina_tile_input tile_inputs[HINA_MAX_TILE_INPUTS]; // Input attachment mappings
   uint32_t input_count; // Must be <= HINA_MAX_TILE_INPUTS
 } hina_tile_subpass_layout;
