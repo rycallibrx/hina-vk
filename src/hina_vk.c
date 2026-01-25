@@ -4827,6 +4827,8 @@ static VkCommandBuffer hina_staging_ctx_acquire_gfx_cmd(hina_context* ctx);
 
 static VkCommandBuffer hina_staging_ctx_acquire_comp_cmd(hina_context* ctx);
 
+static bool hina_staging_ctx_ensure_gfx_to_comp_sem(hina_context* ctx, hina_staging_context* sc);
+
 static void hina_page_pool_shutdown(hina_context* ctx);
 
 static void hina_poll_lane_completions(hina_context* ctx);
@@ -14562,8 +14564,8 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     }
     dyn_input_att_info.colorAttachmentCount = total_attachments;
     dyn_input_att_info.pColorAttachmentInputIndices = dyn_local_read_input_indices;
-    // Depth input attachment (index 0 = single depth attachment, NULL if not reading depth)
-    uint32_t depth_input_idx = 0;
+    // Depth input: index follows color inputs (matches legacy subpass input attachment order)
+    uint32_t depth_input_idx = sp_layout->input_count;
     dyn_input_att_info.pDepthInputAttachmentIndex = sp_layout->depth_input ? &depth_input_idx : NULL;
     dyn_att_location_info.pNext = &dyn_input_att_info;
     // Blend state uses flattened attachment indices, not fragment output locations
@@ -16125,8 +16127,8 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     }
     hsl_input_att_info.colorAttachmentCount = total_attachments;
     hsl_input_att_info.pColorAttachmentInputIndices = hsl_dyn_input_indices;
-    // Depth input attachment (index 0 = single depth attachment, NULL if not reading depth)
-    uint32_t hsl_depth_input_idx = 0;
+    // Depth input: index follows color inputs (matches legacy subpass input attachment order)
+    uint32_t hsl_depth_input_idx = sp_layout->input_count;
     hsl_input_att_info.pDepthInputAttachmentIndex = sp_layout->depth_input ? &hsl_depth_input_idx : NULL;
     hsl_att_location_info.pNext = &hsl_input_att_info;
     for (uint32_t i = 0; i < total_attachments; i++)
@@ -17775,7 +17777,8 @@ static void hina_tile_pass_next_dynamic(hina_cmd* cmd, const hina_tile_pass_desc
     uint32_t global_idx = color_att_map[input->subpass_output_index][input->attachment_index];
     input_indices[global_idx] = ti;
   }
-  uint32_t depth_input_index = 0;
+  // Depth input: index follows color inputs (matches legacy subpass input attachment order)
+  uint32_t depth_input_index = subpass->tile_input_count;
   VkRenderingInputAttachmentIndexInfo input_info = {
     .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO, .colorAttachmentCount = total_color_count,
     .pColorAttachmentInputIndices = input_indices,
