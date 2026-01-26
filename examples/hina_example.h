@@ -84,7 +84,6 @@ struct ImDrawData;
 inline bool hina_example_imgui_init(hina_example_app* app);
 inline void hina_example_imgui_shutdown(hina_example_app* app);
 inline bool hina_example_begin_ui(hina_example_app* app);
-inline void hina_example_render_ui(hina_example_app* app, hina_cmd* cmd);
 inline void hina_example_draw_imgui_data(hina_example_app* app, hina_cmd* cmd, ImDrawData* draw_data, uint32_t fb_width, uint32_t fb_height);
 inline void hina_example_draw_imgui_data(hina_example_app* app, hina_cmd* cmd, ImDrawData* draw_data);  // Legacy overload
 inline bool hina_example_ui_want_mouse(hina_example_app* app);
@@ -103,7 +102,6 @@ struct hina_cmd;
 inline bool hina_example_imgui_init(hina_example_app* app);
 inline void hina_example_imgui_shutdown(hina_example_app* app);
 inline bool hina_example_begin_ui(hina_example_app* app);
-inline void hina_example_render_ui(hina_example_app* app, hina_cmd* cmd);
 inline bool hina_example_ui_want_mouse(hina_example_app* app);
 
 #endif // HINA_EXAMPLE_HAS_IMGUI
@@ -307,19 +305,19 @@ inline void hina_example_print_usage(const char* prog_name) {
     printf("  --validation          Enable Vulkan validation layers (default)\n");
     printf("  --no-validation       Disable validation layers\n");
     printf("  --legacy-renderpass   Use legacy VkRenderPass\n");
-    printf("  --dynamic-rendering   Use dynamic rendering (VK 1.3+)\n");
+    printf("  --dynamic-rendering   Use dynamic rendering (VK 1.3+ or VK_KHR_dynamic_rendering)\n");
     printf("  --timeline-semaphore  Use timeline semaphores (default)\n");
     printf("  --no-timeline-semaphore  Use fence-based synchronization\n");
     printf("  --single-queue        Force compute/transfer onto graphics queue\n");
+    printf("  --no-single-queue     Allow separate compute/transfer queues\n");
     printf("  --vsync / --no-vsync  Enable/disable vsync\n");
     printf("  --frames=N            Exit after N frames\n");
     printf("  --duration=N          Exit after N seconds\n");
     printf("  --width=N --height=N  Window dimensions\n");
     printf("  --debug-no-sync2      Force legacy vkQueueSubmit/vkCmdPipelineBarrier\n");
     printf("  --separate-families   Force compute to separate queue family (tests ownership)\n");
-    printf("  --debug-no-copy2      Force legacy copy commands\n");
-    printf("  --debug-no-host-query-reset  Force legacy query reset\n");
-    printf("  --debug-no-renderpass2  Force legacy vkCreateRenderPass\n");
+    printf("  --legacy-tile-pass    Force legacy multi-subpass tile pass\n");
+    printf("  --dynamic-tile-pass   Force dynamic rendering tile pass\n");
     printf("  --help                Show this help\n");
 }
 
@@ -2680,16 +2678,6 @@ inline void hina_example_draw_imgui_data(hina_example_app* app, hina_cmd* cmd, I
 }
 
 /**
- * Legacy render function - kept for compatibility.
- * @deprecated Use hina_example_present_frame() instead, which handles everything automatically.
- */
-inline void hina_example_render_ui(hina_example_app* app, hina_cmd* cmd) {
-    (void)app;
-    (void)cmd;
-    // This function is now a no-op - all ImGui rendering is handled by present_frame
-}
-
-/**
  * Get ImTextureID for a hina_texture (for use with ImGui::Image).
  */
 inline ImTextureID hina_example_imgui_texture_id(hina_example_app* app, hina_texture tex) {
@@ -2717,7 +2705,6 @@ inline ImTextureID hina_example_imgui_texture_id(hina_example_app* app, hina_tex
 inline bool hina_example_imgui_init(hina_example_app*) { return true; }
 inline void hina_example_imgui_shutdown(hina_example_app*) {}
 inline bool hina_example_begin_ui(hina_example_app*) { return false; }
-inline void hina_example_render_ui(hina_example_app*, hina_cmd*) {}
 inline bool hina_example_ui_settings_open(hina_example_app*) { return false; }
 inline bool hina_example_ui_want_mouse(hina_example_app*) { return false; }
 inline bool hina_example_ui_want_keyboard(hina_example_app*) { return false; }

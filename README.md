@@ -240,7 +240,7 @@ hina_cmd_draw_indexed(cmd, index_count, 1, 0, 0, 0);
 hina_cmd_end_pass(cmd);
 ```
 
-Under the hood this uses dynamic rendering on 1.3+, or hashes render passes on older versions.
+Under the hood this uses dynamic rendering when available (VK 1.3+ core or VK_KHR_dynamic_rendering), and hashes render passes otherwise.
 
 ### Commands
 

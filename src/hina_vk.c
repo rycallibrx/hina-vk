@@ -2383,7 +2383,7 @@ typedef struct hina_reflected_binding
   VkShaderStageFlags stages; // 4B
 } hina_reflected_binding;
 
-// Fixed capacity for reflected bindings - matches HSL_MAX_BINDINGS (compiler-enforced limit)
+// Fixed capacity for reflected bindings - matches HSL_MAX_BINDINGS_TOTAL
 // No dynamic growth needed since HSL compiler rejects shaders exceeding this limit
 #define HINA_REFL_MAX_BINDINGS 128u
 
@@ -6346,6 +6346,12 @@ static void hina_validate_tile_pass_layout(const hina_tile_pass_layout* layout)
   }
 }
 #endif
+static HINA_INLINE void hina_fnv1a_mix_u64(uint64_t* h, uint64_t v)
+{
+  *h ^= v;
+  *h *= 0x100000001b3ULL;
+}
+
 // FNV-1a hash for tile render pass cache key
 static uint64_t hina_tile_rp_cache_key(const hina_tile_pass_desc* desc, uint32_t subpass_count,
                                        const VkFormat* color_fmts,
@@ -6354,40 +6360,38 @@ static uint64_t hina_tile_rp_cache_key(const hina_tile_pass_desc* desc, uint32_t
                                        VkFormat depth_fmt, VkSampleCountFlagBits depth_samples)
 {
   uint64_t h = 0xcbf29ce484222325ULL;
-#define FNV_MIX(v) do { h ^= (uint64_t)(v); h *= 0x100000001b3ULL; } while(0)
-  FNV_MIX(subpass_count);
+  hina_fnv1a_mix_u64(&h, subpass_count);
   for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass* s = &desc->subpasses[sp];
-    FNV_MIX(s->color_count);
+    hina_fnv1a_mix_u64(&h, s->color_count);
     for (uint32_t c = 0; c < s->color_count; c++)
     {
       uint32_t idx = sp * HINA_MAX_COLOR_ATTACHMENTS + c;
-      FNV_MIX(color_fmts[idx]);
-      FNV_MIX(color_samples[idx]);
-      FNV_MIX(resolve_fmts[idx]);
-      FNV_MIX(s->color[c].load_op);
-      FNV_MIX(s->color[c].store_op);
+      hina_fnv1a_mix_u64(&h, color_fmts[idx]);
+      hina_fnv1a_mix_u64(&h, color_samples[idx]);
+      hina_fnv1a_mix_u64(&h, resolve_fmts[idx]);
+      hina_fnv1a_mix_u64(&h, s->color[c].load_op);
+      hina_fnv1a_mix_u64(&h, s->color[c].store_op);
     }
-    FNV_MIX(s->tile_input_count);
+    hina_fnv1a_mix_u64(&h, s->tile_input_count);
     for (uint32_t ti = 0; ti < s->tile_input_count; ti++)
     {
-      FNV_MIX(s->tile_inputs[ti].subpass_output_index);
-      FNV_MIX(s->tile_inputs[ti].attachment_index);
+      hina_fnv1a_mix_u64(&h, s->tile_inputs[ti].subpass_output_index);
+      hina_fnv1a_mix_u64(&h, s->tile_inputs[ti].attachment_index);
     }
     if (s->has_depth)
     {
-      FNV_MIX(0x10000);
-      FNV_MIX(s->depth.load_op);
-      FNV_MIX(s->depth.store_op);
+      hina_fnv1a_mix_u64(&h, 0x10000);
+      hina_fnv1a_mix_u64(&h, s->depth.load_op);
+      hina_fnv1a_mix_u64(&h, s->depth.store_op);
     }
     // depth_read_only and depth_input affect subpass dependencies and attachment layouts
-    FNV_MIX(s->depth_read_only);
-    FNV_MIX(s->depth_input);
+    hina_fnv1a_mix_u64(&h, s->depth_read_only);
+    hina_fnv1a_mix_u64(&h, s->depth_input);
   }
-  FNV_MIX(depth_fmt);
-  FNV_MIX(depth_samples);
-#undef FNV_MIX
+  hina_fnv1a_mix_u64(&h, depth_fmt);
+  hina_fnv1a_mix_u64(&h, depth_samples);
   return h;
 }
 
@@ -7005,11 +7009,10 @@ static VkRenderPass hina_legacy_get_cached_tile_template_render_pass(hina_contex
   const uint32_t subpass_count = hina_count_tile_subpasses_layout(layout);
   // Build cache key from layout (use FNV-1a for consistency)
   uint64_t key = 0xcbf29ce484222325ULL;
-#define FNV_MIX(v) do { key ^= (uint64_t)(v); key *= 0x100000001b3ULL; } while(0)
   // Mark as template to avoid collision with runtime tile pass keys
-  FNV_MIX(0xFFFFFFFFu); // Template marker
-  FNV_MIX(subpass_count);
-  FNV_MIX(layout->samples);
+  hina_fnv1a_mix_u64(&key, 0xFFFFFFFFu); // Template marker
+  hina_fnv1a_mix_u64(&key, subpass_count);
+  hina_fnv1a_mix_u64(&key, layout->samples);
   for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass_layout* sub = &layout->subpasses[sp];
@@ -7017,24 +7020,23 @@ static VkRenderPass hina_legacy_get_cached_tile_template_render_pass(hina_contex
     const bool use_override = override && sp == override->subpass_index;
     const uint32_t sp_color_count = use_override ? override->color_count : sub->color_count;
     const VkFormat sp_depth = use_override ? override->depth_format : hina_format_to_vk(sub->depth_format);
-    FNV_MIX(sp_color_count);
-    FNV_MIX(sp_depth);
-    FNV_MIX(sub->depth_read_only);
-    FNV_MIX(sub->depth_input);
+    hina_fnv1a_mix_u64(&key, sp_color_count);
+    hina_fnv1a_mix_u64(&key, sp_depth);
+    hina_fnv1a_mix_u64(&key, sub->depth_read_only);
+    hina_fnv1a_mix_u64(&key, sub->depth_input);
     for (uint32_t c = 0; c < sp_color_count; c++)
     {
       VkFormat color_fmt = use_override ? override->color_formats[c] : hina_format_to_vk(sub->color_formats[c]);
-      FNV_MIX(color_fmt);
-      FNV_MIX(sub->resolve_formats[c]);
+      hina_fnv1a_mix_u64(&key, color_fmt);
+      hina_fnv1a_mix_u64(&key, sub->resolve_formats[c]);
     }
-    FNV_MIX(sub->input_count);
+    hina_fnv1a_mix_u64(&key, sub->input_count);
     for (uint32_t ti = 0; ti < sub->input_count; ti++)
     {
-      FNV_MIX(sub->tile_inputs[ti].subpass_output_index);
-      FNV_MIX(sub->tile_inputs[ti].attachment_index);
+      hina_fnv1a_mix_u64(&key, sub->tile_inputs[ti].subpass_output_index);
+      hina_fnv1a_mix_u64(&key, sub->tile_inputs[ti].attachment_index);
     }
   }
-#undef FNV_MIX
   // Use unified rp cache
   hina_rp_cache_table* table = hina_atomic_load_ptr(&dev->core.backend.legacy.rp.table);
   if (table)
@@ -23052,13 +23054,12 @@ double hina_timestamp_to_ns(uint64_t timestamp_delta)
 extern bool hina_spirv_lint(const uint32_t* spirv_words, size_t word_count);
 extern const char* hina_spirv_lint_get_warnings(void);
 extern void hina_spirv_lint_cleanup(void);
-// Minimal VkShaderStageFlags bits to keep the shader module decoupled from Vulkan headers.
-#define HINA_VK_STAGE_VERTEX_BIT            0x00000001u
-#define HINA_VK_STAGE_TESS_CONTROL_BIT      0x00000002u
-#define HINA_VK_STAGE_TESS_EVALUATION_BIT   0x00000004u
-#define HINA_VK_STAGE_GEOMETRY_BIT          0x00000008u
-#define HINA_VK_STAGE_FRAGMENT_BIT          0x00000010u
-#define HINA_VK_STAGE_COMPUTE_BIT           0x00000020u
+HINA_STATIC_ASSERT(HINA_STAGE_VERTEX == 0x00000001u, hina_stage_vertex_bit);
+HINA_STATIC_ASSERT(HINA_STAGE_TESS_CONTROL == 0x00000002u, hina_stage_tess_control_bit);
+HINA_STATIC_ASSERT(HINA_STAGE_TESS_EVAL == 0x00000004u, hina_stage_tess_eval_bit);
+HINA_STATIC_ASSERT(HINA_STAGE_GEOMETRY == 0x00000008u, hina_stage_geometry_bit);
+HINA_STATIC_ASSERT(HINA_STAGE_FRAGMENT == 0x00000010u, hina_stage_fragment_bit);
+HINA_STATIC_ASSERT(HINA_STAGE_COMPUTE == 0x00000020u, hina_stage_compute_bit);
 
 // Shader Module State
 static struct
@@ -23412,11 +23413,11 @@ static bool hslc_is_in_include_stack(hsl_include_context* ctx, const char* filen
 // This is the new HSL format that replaces the old #hina_ directive syntax.
 // Format uses #hina...#hina_end header blocks and #hina_stage...#hina_end stages.
 // HSL Limits (Vulkan 1.0 Core Compatibility)
-#define HSL_MAX_GROUPS              4     // maxBoundDescriptorSets
-#define HSL_MAX_BINDINGS_TOTAL      128   // Total bindings across all groups
+#define HSL_MAX_GROUPS              HINA_MAX_DESCRIPTOR_SETS
+#define HSL_MAX_BINDINGS_TOTAL      HINA_REFL_MAX_BINDINGS
 #define HSL_MAX_BINDINGS_PER_GROUP  32    // Per-group binding limit
-#define HSL_MAX_IO_LOCATIONS        16    // Max in/out location slots
-#define HSL_MAX_SPEC_CONSTS         16    // Specialization constants
+#define HSL_MAX_IO_LOCATIONS        HINA_MAX_VERTEX_ATTRS
+#define HSL_MAX_SPEC_CONSTS         HINA_MAX_SPECIALIZATION_CONSTANTS
 #define HSL_MAX_SNIPPETS            16    // Shared code snippets
 #define HSL_MAX_SHARED_DECLS        32    // Shared memory declarations
 #define HSL_MAX_SHARED_DIMS         4     // Max array dimensions for shared
@@ -27691,17 +27692,17 @@ static bool hslc_compile_stage(const char* source, const char* filename, hina_sh
             uint32_t stage_flags = 0;
             switch (stage)
             {
-            case HINA_SHADER_STAGE_VERTEX: stage_flags = HINA_VK_STAGE_VERTEX_BIT;
+            case HINA_SHADER_STAGE_VERTEX: stage_flags = HINA_STAGE_VERTEX;
               break;
-            case HINA_SHADER_STAGE_TESS_CONTROL: stage_flags = HINA_VK_STAGE_TESS_CONTROL_BIT;
+            case HINA_SHADER_STAGE_TESS_CONTROL: stage_flags = HINA_STAGE_TESS_CONTROL;
               break;
-            case HINA_SHADER_STAGE_TESS_EVAL: stage_flags = HINA_VK_STAGE_TESS_EVALUATION_BIT;
+            case HINA_SHADER_STAGE_TESS_EVAL: stage_flags = HINA_STAGE_TESS_EVAL;
               break;
-            case HINA_SHADER_STAGE_GEOMETRY: stage_flags = HINA_VK_STAGE_GEOMETRY_BIT;
+            case HINA_SHADER_STAGE_GEOMETRY: stage_flags = HINA_STAGE_GEOMETRY;
               break;
-            case HINA_SHADER_STAGE_FRAGMENT: stage_flags = HINA_VK_STAGE_FRAGMENT_BIT;
+            case HINA_SHADER_STAGE_FRAGMENT: stage_flags = HINA_STAGE_FRAGMENT;
               break;
-            case HINA_SHADER_STAGE_COMPUTE: stage_flags = HINA_VK_STAGE_COMPUTE_BIT;
+            case HINA_SHADER_STAGE_COMPUTE: stage_flags = HINA_STAGE_COMPUTE;
               break;
             default: stage_flags = 0;
               break;
@@ -27795,6 +27796,33 @@ static bool hslc_reflect_vertex_inputs(const hina_shader_stage_data* vs, hina_re
   return true;
 }
 
+static uint32_t hslc_merge_push_constant_blocks(hina_reflected_push_constant* pcs, uint32_t idx,
+                                                const SpvReflectShaderModule* module, uint32_t stage_flag)
+{
+  for (uint32_t i = 0; i < module->push_constant_block_count; i++)
+  {
+    const SpvReflectBlockVariable* block = &module->push_constant_blocks[i];
+    bool merged = false;
+    for (uint32_t j = 0; j < idx; j++)
+    {
+      if (pcs[j].offset == block->offset && pcs[j].size == block->size)
+      {
+        pcs[j].stage_flags |= stage_flag;
+        merged = true;
+        break;
+      }
+    }
+    if (!merged)
+    {
+      pcs[idx].offset = block->offset;
+      pcs[idx].size = block->size;
+      pcs[idx].stage_flags = stage_flag;
+      idx++;
+    }
+  }
+  return idx;
+}
+
 // Helper: Reflect push constants from all stages
 static bool hslc_reflect_push_constants(const hina_shader_stage_data* vs, const hina_shader_stage_data* tcs,
                                         const hina_shader_stage_data* tes, const hina_shader_stage_data* gs,
@@ -27847,138 +27875,32 @@ static bool hslc_reflect_push_constants(const hina_shader_stage_data* vs, const 
   uint32_t idx = 0;
   if (vs_ok)
   {
-    for (uint32_t i = 0; i < vs_module.push_constant_block_count; i++)
-    {
-      pcs[idx].offset = vs_module.push_constant_blocks[i].offset;
-      pcs[idx].size = vs_module.push_constant_blocks[i].size;
-      pcs[idx].stage_flags = HINA_VK_STAGE_VERTEX_BIT;
-      idx++;
-    }
+    idx = hslc_merge_push_constant_blocks(pcs, idx, &vs_module, HINA_STAGE_VERTEX);
     spvReflectDestroyShaderModule(&vs_module);
   }
   if (tcs_ok)
   {
-    for (uint32_t i = 0; i < tcs_module.push_constant_block_count; i++)
-    {
-      bool merged = false;
-      for (uint32_t j = 0; j < idx; j++)
-      {
-        if (pcs[j].offset == tcs_module.push_constant_blocks[i].offset && pcs[j].size == tcs_module.push_constant_blocks
-          [i].size)
-        {
-          pcs[j].stage_flags |= HINA_VK_STAGE_TESS_CONTROL_BIT;
-          merged = true;
-          break;
-        }
-      }
-      if (!merged)
-      {
-        pcs[idx].offset = tcs_module.push_constant_blocks[i].offset;
-        pcs[idx].size = tcs_module.push_constant_blocks[i].size;
-        pcs[idx].stage_flags = HINA_VK_STAGE_TESS_CONTROL_BIT;
-        idx++;
-      }
-    }
+    idx = hslc_merge_push_constant_blocks(pcs, idx, &tcs_module, HINA_STAGE_TESS_CONTROL);
     spvReflectDestroyShaderModule(&tcs_module);
   }
   if (tes_ok)
   {
-    for (uint32_t i = 0; i < tes_module.push_constant_block_count; i++)
-    {
-      bool merged = false;
-      for (uint32_t j = 0; j < idx; j++)
-      {
-        if (pcs[j].offset == tes_module.push_constant_blocks[i].offset && pcs[j].size == tes_module.push_constant_blocks
-          [i].size)
-        {
-          pcs[j].stage_flags |= HINA_VK_STAGE_TESS_EVALUATION_BIT;
-          merged = true;
-          break;
-        }
-      }
-      if (!merged)
-      {
-        pcs[idx].offset = tes_module.push_constant_blocks[i].offset;
-        pcs[idx].size = tes_module.push_constant_blocks[i].size;
-        pcs[idx].stage_flags = HINA_VK_STAGE_TESS_EVALUATION_BIT;
-        idx++;
-      }
-    }
+    idx = hslc_merge_push_constant_blocks(pcs, idx, &tes_module, HINA_STAGE_TESS_EVAL);
     spvReflectDestroyShaderModule(&tes_module);
   }
   if (gs_ok)
   {
-    for (uint32_t i = 0; i < gs_module.push_constant_block_count; i++)
-    {
-      bool merged = false;
-      for (uint32_t j = 0; j < idx; j++)
-      {
-        if (pcs[j].offset == gs_module.push_constant_blocks[i].offset && pcs[j].size == gs_module.push_constant_blocks[
-          i].size)
-        {
-          pcs[j].stage_flags |= HINA_VK_STAGE_GEOMETRY_BIT;
-          merged = true;
-          break;
-        }
-      }
-      if (!merged)
-      {
-        pcs[idx].offset = gs_module.push_constant_blocks[i].offset;
-        pcs[idx].size = gs_module.push_constant_blocks[i].size;
-        pcs[idx].stage_flags = HINA_VK_STAGE_GEOMETRY_BIT;
-        idx++;
-      }
-    }
+    idx = hslc_merge_push_constant_blocks(pcs, idx, &gs_module, HINA_STAGE_GEOMETRY);
     spvReflectDestroyShaderModule(&gs_module);
   }
   if (fs_ok)
   {
-    for (uint32_t i = 0; i < fs_module.push_constant_block_count; i++)
-    {
-      bool merged = false;
-      for (uint32_t j = 0; j < idx; j++)
-      {
-        if (pcs[j].offset == fs_module.push_constant_blocks[i].offset && pcs[j].size == fs_module.push_constant_blocks[
-          i].size)
-        {
-          pcs[j].stage_flags |= HINA_VK_STAGE_FRAGMENT_BIT;
-          merged = true;
-          break;
-        }
-      }
-      if (!merged)
-      {
-        pcs[idx].offset = fs_module.push_constant_blocks[i].offset;
-        pcs[idx].size = fs_module.push_constant_blocks[i].size;
-        pcs[idx].stage_flags = HINA_VK_STAGE_FRAGMENT_BIT;
-        idx++;
-      }
-    }
+    idx = hslc_merge_push_constant_blocks(pcs, idx, &fs_module, HINA_STAGE_FRAGMENT);
     spvReflectDestroyShaderModule(&fs_module);
   }
   if (cs_ok)
   {
-    for (uint32_t i = 0; i < cs_module.push_constant_block_count; i++)
-    {
-      bool merged = false;
-      for (uint32_t j = 0; j < idx; j++)
-      {
-        if (pcs[j].offset == cs_module.push_constant_blocks[i].offset && pcs[j].size == cs_module.push_constant_blocks[
-          i].size)
-        {
-          pcs[j].stage_flags |= HINA_VK_STAGE_COMPUTE_BIT;
-          merged = true;
-          break;
-        }
-      }
-      if (!merged)
-      {
-        pcs[idx].offset = cs_module.push_constant_blocks[i].offset;
-        pcs[idx].size = cs_module.push_constant_blocks[i].size;
-        pcs[idx].stage_flags = HINA_VK_STAGE_COMPUTE_BIT;
-        idx++;
-      }
-    }
+    idx = hslc_merge_push_constant_blocks(pcs, idx, &cs_module, HINA_STAGE_COMPUTE);
     spvReflectDestroyShaderModule(&cs_module);
   }
   *out_push_constants = pcs;
