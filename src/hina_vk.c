@@ -3023,7 +3023,7 @@ struct hina_cmd
     bool active;
     uint8_t current_subpass;
     uint8_t subpass_count;
-    uint8_t pad_;
+    bool uses_dynamic; // True = dynamic local read, false = legacy subpass
   } tile;
 
   // Bound groups (16B) - accessed during flush_bindings
@@ -3035,6 +3035,11 @@ struct hina_cmd
   // Cache line 2+: cold / large data
   hina_texture_view color_views[HINA_MAX_COLOR_ATTACHMENTS];
   hina_texture_view resolve_views[HINA_MAX_COLOR_ATTACHMENTS]; // MSAA resolve targets
+  // Tile pass: track ALL color attachments across all subpasses for end-of-pass tracking updates
+  // Inline array - cmd is already frame-temporary, so no point in separate allocation
+  // Without this, only the final subpass's attachments get their tracking updated (visibility buffer bug)
+  hina_texture_view tile_all_color_views[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
+  uint32_t tile_all_color_count;
   hina_cmd_legacy_bindings* legacy; // Optional legacy slot bindings (demo path only)
   // Cross-queue GPU dependencies (cold, rarely used)
   uint64_t cross_queue_wait_tickets[HINA_MAX_QUEUE_LANES];
@@ -6376,6 +6381,9 @@ static uint64_t hina_tile_rp_cache_key(const hina_tile_pass_desc* desc, uint32_t
       FNV_MIX(s->depth.load_op);
       FNV_MIX(s->depth.store_op);
     }
+    // depth_read_only and depth_input affect subpass dependencies and attachment layouts
+    FNV_MIX(s->depth_read_only);
+    FNV_MIX(s->depth_input);
   }
   FNV_MIX(depth_fmt);
   FNV_MIX(depth_samples);
@@ -6880,7 +6888,7 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
       HINA_ASSERTF(src_att < src_color_count, "tile_layout_input[%u][%u] attachment out of range", sp, ti);
 #endif
       input_refs[sp][input_count++] = (VkAttachmentReference){
-        .attachment = src_att, .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        .attachment = subpass_color_indices[src_sp][src_att], .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
       };
     }
     // Depth input attachment reference
@@ -6891,11 +6899,14 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
       };
     }
     input_counts[sp] = input_count;
-    // Depth attachment reference
+    // Depth attachment reference - must match hina_legacy_make_tile_render_pass for compatibility
     if (sp_depth_fmt != VK_FORMAT_UNDEFINED && depth_att_idx >= 0)
     {
       depth_refs[sp] = (VkAttachmentReference){
-        .attachment = (uint32_t)depth_att_idx, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        .attachment = (uint32_t)depth_att_idx,
+        .layout = sub->depth_read_only
+                    ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                    : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
       };
     }
     subpasses[sp] = (VkSubpassDescription){
@@ -7009,6 +7020,7 @@ static VkRenderPass hina_legacy_get_cached_tile_template_render_pass(hina_contex
     FNV_MIX(sp_color_count);
     FNV_MIX(sp_depth);
     FNV_MIX(sub->depth_read_only);
+    FNV_MIX(sub->depth_input);
     for (uint32_t c = 0; c < sp_color_count; c++)
     {
       VkFormat color_fmt = use_override ? override->color_formats[c] : hina_format_to_vk(sub->color_formats[c]);
@@ -7093,6 +7105,39 @@ static uint32_t hina_tile_count_total_attachments(const hina_tile_pass_layout* l
   uint32_t total = 0;
   for (uint32_t sp = 0; sp < subpass_count; sp++) total += layout->subpasses[sp].color_count;
   return total;
+}
+
+// Check if a tile pass descriptor can use dynamic rendering local read
+// Returns false if depth_input is used but hardware doesn't support it
+static bool hina_tile_can_use_dynamic_local_read_desc(const hina_tile_pass_desc* desc)
+{
+  if (!g_device_caps.has_dynamic_rendering_local_read) return false;
+  // Check if any subpass uses depth_input
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
+  {
+    if (desc->subpasses[sp].depth_input)
+    {
+      // Depth input requires VK 1.4 property support
+      return g_device_caps.has_dynamic_rendering_local_read_depth_stencil;
+    }
+  }
+  return true; // Color-only inputs work on all dynamic local read implementations
+}
+
+// Check if a tile pass layout can use dynamic rendering local read
+static bool hina_tile_can_use_dynamic_local_read_layout(const hina_tile_pass_layout* layout)
+{
+  if (!g_device_caps.has_dynamic_rendering_local_read) return false;
+  const uint32_t subpass_count = hina_count_tile_subpasses_layout(layout);
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
+  {
+    if (layout->subpasses[sp].depth_input)
+    {
+      return g_device_caps.has_dynamic_rendering_local_read_depth_stencil;
+    }
+  }
+  return true;
 }
 
 static bool hina_has_instance_extension(const VkExtensionProperties* props, uint32_t count, const char* ext_name)
@@ -8284,13 +8329,28 @@ static void hina_fill_caps(hina_context* ctx)
         if (api_version >= HINA_VK_VERSION_1_4)
         {
           g_device_caps.has_dynamic_rendering_local_read = true;
+          // Query VK 1.4 properties for depth/stencil input attachment support
+          VkPhysicalDeviceVulkan14Properties vk14_props = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_PROPERTIES
+          };
+          VkPhysicalDeviceProperties2 props2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &vk14_props
+          };
+          vkGetPhysicalDeviceProperties2(ctx->core.device->core.phys, &props2);
+          g_device_caps.has_dynamic_rendering_local_read_depth_stencil =
+            vk14_props.dynamicRenderingLocalReadDepthStencilAttachments == VK_TRUE;
           HINA_LOGI(ctx, "Tile pass backend: dynamic_local_read (VK 1.4 core)");
+          HINA_LOGI(ctx, "  depth/stencil input: %s",
+            g_device_caps.has_dynamic_rendering_local_read_depth_stencil ? "YES" : "NO (fallback to legacy)");
         }
         else if (hina_has_device_extension(ctx->core.device->core.phys,
                                            VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
         {
           g_device_caps.has_dynamic_rendering_local_read = true;
+          // Extension only supports color attachments, not depth/stencil
+          g_device_caps.has_dynamic_rendering_local_read_depth_stencil = false;
           HINA_LOGI(ctx, "Tile pass backend: dynamic_local_read (extension)");
+          HINA_LOGI(ctx, "  depth/stencil input: NO (extension doesn't support, fallback to legacy)");
         }
       }
     }
@@ -9079,18 +9139,22 @@ static hina_staging_page* hina_page_pool_acquire(hina_context* ctx)
     HINA_LOGW(ctx, "staging page pool at max capacity (%u)", HINA_STAGING_PAGE_POOL_MAX);
     return NULL;
   }
+  pool->state.total_count++;
   uint32_t page_size = pool->page_size ? pool->page_size : HINA_STAGING_PAGE_SIZE;
   mtx_unlock(&pool->lock); // Release lock during allocation
   page = hina_page_pool_create_page(ctx, page_size);
-  if (page)
+  if (!page)
   {
     mtx_lock(&pool->lock);
-    // Link into all_pages for cleanup tracking
-    page->all_next = pool->pages.all_pages;
-    pool->pages.all_pages = page;
-    pool->state.total_count++;
+    pool->state.total_count--;
     mtx_unlock(&pool->lock);
+    return NULL;
   }
+  mtx_lock(&pool->lock);
+  // Link into all_pages for cleanup tracking
+  page->all_next = pool->pages.all_pages;
+  pool->pages.all_pages = page;
+  mtx_unlock(&pool->lock);
   return page;
 }
 
@@ -12483,6 +12547,20 @@ static void* hina_staging_ensure_download_buffer(hina_context* ctx, size_t requi
     .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
     .sharingMode = VK_SHARING_MODE_EXCLUSIVE
   };
+  uint32_t family_indices[3];
+  uint32_t family_count = 0;
+  uint32_t gfx_family = ctx->core.device->queue.graphics_family;
+  uint32_t comp_family = ctx->core.device->queue.compute_family;
+  uint32_t xfer_family = ctx->core.device->queue.transfer_family;
+  family_indices[family_count++] = gfx_family;
+  if (comp_family != gfx_family) family_indices[family_count++] = comp_family;
+  if (xfer_family != gfx_family && xfer_family != comp_family) family_indices[family_count++] = xfer_family;
+  if (family_count > 1)
+  {
+    buf_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    buf_info.queueFamilyIndexCount = family_count;
+    buf_info.pQueueFamilyIndices = family_indices;
+  }
   VmaAllocationCreateInfo alloc_info = {
     .usage = VMA_MEMORY_USAGE_AUTO,
     .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
@@ -12538,70 +12616,24 @@ void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip
   void* staging_mapped = hina_staging_ensure_download_buffer(ctx, required_size);
   HINA_ASSERTF(staging_mapped, "hina_ctx_download_texture: failed to allocate staging buffer");
   VkBuffer staging_buf = ctx->staging.download_staging_buf;
-  // Determine if we need split-path handling (dedicated transfer queue)
-  bool split = hina_staging_use_split(ctx, &ctx->staging);
-  uint32_t xfer_family = ctx->staging.queue_family;
-  uint32_t gfx_family = ctx->staging.gfx_queue_family;
-  bool needs_qfot = split && xfer_family != gfx_family;
-  // Acquire command buffers
-  VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
-  HINA_ASSERTF(xfer_cmd, "hina_ctx_download_texture: failed to acquire staging command buffer");
-  VkCommandBuffer gfx_cmd = xfer_cmd; // Same buffer if not split
-  if (split)
-  {
-    gfx_cmd = hina_staging_ctx_acquire_gfx_cmd(ctx);
-    HINA_ASSERTF(gfx_cmd, "hina_ctx_download_texture: failed to acquire graphics command buffer");
-  }
+  uint32_t owner_family = (uint32_t)hot->owning_family;
+  VkCommandBuffer cmd = hina_staging_ctx_acquire_owner_cmd(ctx, owner_family);
+  HINA_ASSERTF(cmd, "hina_ctx_download_texture: failed to acquire staging command buffer");
   const VkImageAspectFlags aspect = hina_aspect_from_format(vk_format);
   VkImageSubresourceRange range = {aspect, mip, 1, layer, 1};
-  if (needs_qfot)
-  {
-    // Graphics queue: release ownership, transition to TRANSFER_SRC
-    HINA_IMAGE_BARRIER_QFOT(gfx_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, current_access, 0, current_layout,
-                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gfx_family, xfer_family, vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-    // Transfer queue: acquire ownership
-    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gfx_family, xfer_family, vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  }
-  else
-  {
-    // Non-split: simple transition on single queue
-    HINA_IMAGE_BARRIER(xfer_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
-                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  }
-  // Copy image to buffer (always on transfer queue)
-  hina_copy_image_to_buffer(xfer_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
+  HINA_IMAGE_BARRIER(cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
+  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  // Copy image to buffer
+  hina_copy_image_to_buffer(cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
                             (VkImageSubresourceLayers){aspect, mip, layer, 1}, (VkOffset3D){0, 0, 0},
                             (VkExtent3D){mip_width, mip_height, 1});
-  if (needs_qfot)
-  {
-    // Transfer queue: release ownership back to graphics
-    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                            VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
-                            xfer_family, gfx_family, vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-    // Graphics queue: acquire ownership, restore original layout
-    HINA_IMAGE_BARRIER_QFOT(gfx_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, current_access,
-                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout, xfer_family, gfx_family, vk_image,
-                            range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  }
-  else
-  {
-    // Non-split: simple transition back
-    HINA_IMAGE_BARRIER(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                       VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
-                       vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  }
+  HINA_IMAGE_BARRIER(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                     VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
+                     vk_image, range);
+  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   // Flush staging and wait synchronously
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
   HINA_ASSERTF(ticket, "hina_ctx_download_texture: staging flush failed");
@@ -12653,70 +12685,24 @@ void hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t 
   void* staging_mapped = hina_staging_ensure_download_buffer(ctx, required_size);
   HINA_ASSERTF(staging_mapped, "hina_ctx_download_texture_3d: failed to allocate staging buffer");
   VkBuffer staging_buf = ctx->staging.download_staging_buf;
-  // Determine if we need split-path handling (dedicated transfer queue)
-  bool split = hina_staging_use_split(ctx, &ctx->staging);
-  uint32_t xfer_family = ctx->staging.queue_family;
-  uint32_t gfx_family = ctx->staging.gfx_queue_family;
-  bool needs_qfot = split && xfer_family != gfx_family;
-  // Acquire command buffers
-  VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
-  HINA_ASSERTF(xfer_cmd, "hina_ctx_download_texture_3d: failed to acquire staging command buffer");
-  VkCommandBuffer gfx_cmd = xfer_cmd; // Same buffer if not split
-  if (split)
-  {
-    gfx_cmd = hina_staging_ctx_acquire_gfx_cmd(ctx);
-    HINA_ASSERTF(gfx_cmd, "hina_ctx_download_texture_3d: failed to acquire graphics command buffer");
-  }
+  uint32_t owner_family = (uint32_t)hot->owning_family;
+  VkCommandBuffer cmd = hina_staging_ctx_acquire_owner_cmd(ctx, owner_family);
+  HINA_ASSERTF(cmd, "hina_ctx_download_texture_3d: failed to acquire staging command buffer");
   const VkImageAspectFlags aspect = hina_aspect_from_format(vk_format);
   VkImageSubresourceRange range = {aspect, mip, 1, 0, 1};
-  if (needs_qfot)
-  {
-    // Graphics queue: release ownership, transition to TRANSFER_SRC
-    HINA_IMAGE_BARRIER_QFOT(gfx_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, current_access, 0, current_layout,
-                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gfx_family, xfer_family, vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-    // Transfer queue: acquire ownership
-    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gfx_family, xfer_family, vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  }
-  else
-  {
-    // Non-split: simple transition on single queue
-    HINA_IMAGE_BARRIER(xfer_cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
-                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  }
-  // Copy image to buffer (always on transfer queue)
-  hina_copy_image_to_buffer(xfer_cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
+  HINA_IMAGE_BARRIER(cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
+  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  // Copy image to buffer
+  hina_copy_image_to_buffer(cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
                             (VkImageSubresourceLayers){aspect, mip, 0, 1}, (VkOffset3D){0, 0, (int32_t)z_offset},
                             (VkExtent3D){mip_width, mip_height, depth});
-  if (needs_qfot)
-  {
-    // Transfer queue: release ownership back to graphics
-    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                            VK_ACCESS_TRANSFER_READ_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
-                            xfer_family, gfx_family, vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-    // Graphics queue: acquire ownership, restore original layout
-    HINA_IMAGE_BARRIER_QFOT(gfx_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                            current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, current_access,
-                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout, xfer_family, gfx_family, vk_image,
-                            range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  }
-  else
-  {
-    // Non-split: simple transition back
-    HINA_IMAGE_BARRIER(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                       VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
-                       vk_image, range);
-    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  }
+  HINA_IMAGE_BARRIER(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                     VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
+                     vk_image, range);
+  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
   HINA_ASSERTF(ticket, "hina_ctx_download_texture_3d: staging flush failed");
   hina_ctx_wait_ticket(ctx, ticket);
@@ -13489,10 +13475,27 @@ static hina_bind_group hina_ctx_create_bind_group_internal(hina_context* ctx, co
             hina_texture_upload_ready(ctx, view_slot->parent_idx);
           }
           image_infos[img_idx].imageView = view_slot->view;
-          // Use RENDERING_LOCAL_READ for dynamic rendering local read path
-          image_infos[img_idx].imageLayout = g_device_caps.has_dynamic_rendering_local_read
-                                               ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR
-                                               : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          // Determine correct layout based on format and device capabilities
+          // Depth/stencil input attachments need special handling:
+          // - Dynamic local read path with depth/stencil support: RENDERING_LOCAL_READ_KHR
+          // - Legacy path or fallback: DEPTH_STENCIL_READ_ONLY_OPTIMAL
+          VkImageAspectFlags aspect = hina_aspect_from_format(thot->dims.format);
+          bool is_depth_stencil = (aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+          // Use RENDERING_LOCAL_READ_KHR only when dynamic local read is available AND
+          // either this is not depth/stencil OR depth/stencil local read is supported
+          bool use_local_read_layout = g_device_caps.has_dynamic_rendering_local_read &&
+            (!is_depth_stencil || g_device_caps.has_dynamic_rendering_local_read_depth_stencil);
+          if (use_local_read_layout)
+          {
+            image_infos[img_idx].imageLayout = VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR;
+          }
+          else
+          {
+            // Legacy path or depth/stencil fallback
+            image_infos[img_idx].imageLayout = is_depth_stencil
+              ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+              : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          }
           image_infos[img_idx].sampler = VK_NULL_HANDLE;
           w->pImageInfo = &image_infos[img_idx];
           img_idx++;
@@ -14538,7 +14541,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   VkRenderingInputAttachmentIndexInfo dyn_input_att_info = {
     .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO
   };
-  const bool use_dyn_local_read = tile_subpass_count > 0 && g_device_caps.has_dynamic_rendering_local_read;
+  const bool use_dyn_local_read = tile_subpass_count > 0 && hina_tile_can_use_dynamic_local_read_layout(desc->tile_layout);
   // For dynamic local read: colorAttachmentCount must equal total attachments in rendering
   // Unused attachments get VK_FORMAT_UNDEFINED
   VkFormat dyn_local_read_formats[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
@@ -14623,9 +14626,9 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   };
   // Use legacy VkRenderPass when:
   // 1. Dynamic rendering is not available (!vkCmdBeginRendering), OR
-  // 2. This is a tile pass pipeline and dynamic_rendering_local_read is disabled
+  // 2. This is a tile pass pipeline and dynamic local read can't be used (unsupported or depth_input without depth/stencil support)
   const bool need_legacy_rp = !vkCmdBeginRendering || (tile_subpass_count > 0 && !
-    g_device_caps.has_dynamic_rendering_local_read);
+    hina_tile_can_use_dynamic_local_read_layout(desc->tile_layout));
   if (need_legacy_rp)
   {
     VkRenderPass rp = VK_NULL_HANDLE;
@@ -16107,7 +16110,7 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   VkRenderingInputAttachmentIndexInfo hsl_input_att_info = {
     .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO
   };
-  const bool hsl_use_dyn_local_read = tile_subpass_count > 0 && g_device_caps.has_dynamic_rendering_local_read;
+  const bool hsl_use_dyn_local_read = tile_subpass_count > 0 && hina_tile_can_use_dynamic_local_read_layout(desc->tile_layout);
   // For dynamic local read: colorAttachmentCount must equal total attachments in rendering
   VkFormat hsl_dyn_formats[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
   uint32_t hsl_color_att_count = color_count;
@@ -16189,9 +16192,9 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   };
   // Legacy render pass when:
   // 1. Dynamic rendering is not available (!vkCmdBeginRendering), OR
-  // 2. This is a tile pass pipeline and dynamic_rendering_local_read is disabled
+  // 2. This is a tile pass pipeline and dynamic local read can't be used
   const bool need_legacy_rp = !vkCmdBeginRendering || (tile_subpass_count > 0 && !
-    g_device_caps.has_dynamic_rendering_local_read);
+    hina_tile_can_use_dynamic_local_read_layout(desc->tile_layout));
   if (need_legacy_rp)
   {
     VkRenderPass rp = VK_NULL_HANDLE;
@@ -17493,10 +17496,42 @@ void hina_cmd_end_pass(hina_cmd* cmd)
 // Tile Pass System
 // Two backends: dynamic_local_read (VK 1.4+) or legacy_subpass (VK 1.0-1.3)
 
+// Collect all unique color attachment views from all subpasses for end-of-pass tracking
+// This fixes the bug where only the final subpass's attachments get tracking updates
+static void hina_tile_pass_collect_all_views(hina_cmd* cmd, const hina_tile_pass_desc* desc)
+{
+  const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
+  cmd->tile_all_color_count = 0;
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
+  {
+    const hina_tile_subpass* subpass = &desc->subpasses[sp];
+    for (uint32_t c = 0; c < subpass->color_count; c++)
+    {
+      hina_texture_view view = subpass->color[c].image;
+      if (!hina_texture_view_slot_valid(view)) continue;
+      // Check for duplicates (same texture might be used across multiple subpasses)
+      bool is_duplicate = false;
+      for (uint32_t i = 0; i < cmd->tile_all_color_count; i++)
+      {
+        if (cmd->tile_all_color_views[i].id == view.id)
+        {
+          is_duplicate = true;
+          break;
+        }
+      }
+      if (!is_duplicate)
+      {
+        cmd->tile_all_color_views[cmd->tile_all_color_count++] = view;
+      }
+    }
+  }
+}
+
 // Dynamic Rendering Local Read Backend (VK_KHR_dynamic_rendering_local_read)
 static bool hina_begin_tile_pass_dynamic(hina_cmd* cmd, const hina_tile_pass_desc* desc)
 {
   HINA_ZONE_N("tile_pass_begin");
+  hina_tile_pass_collect_all_views(cmd, desc);
   const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   bool uses_swapchain = false;
   const uint32_t last_sp = subpass_count - 1;
@@ -17820,13 +17855,16 @@ static void hina_end_tile_pass_dynamic(hina_cmd* cmd)
 {
   HINA_ZONE_N("tile_pass_end");
   vkCmdEndRendering(cmd->vk_cmd);
-  // Batch swapchain transitions
-  VkImageMemoryBarrier2 barriers[HINA_MAX_COLOR_ATTACHMENTS * 2];
+  // Batch swapchain transitions - size for all tile views + resolve views + depth
+  VkImageMemoryBarrier2 barriers[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES + HINA_MAX_COLOR_ATTACHMENTS + 1];
   uint32_t barrier_count = 0;
-  for (uint32_t i = 0; i < cmd->color_count; i++)
+  // Update tracking for ALL color attachments from ALL subpasses (not just the final subpass)
+  // This fixes the visibility buffer tracking bug where G-buffer attachments from subpass 0
+  // were not getting their tracking updated because cmd->color_views was overwritten by subpass 1
+  for (uint32_t i = 0; i < cmd->tile_all_color_count; i++)
   {
-    if (!hina_texture_view_slot_valid(cmd->color_views[i])) continue;
-    uint16_t view_idx = hina_id_index(cmd->color_views[i].id);
+    hina_texture_view view = cmd->tile_all_color_views[i];
+    uint16_t view_idx = hina_id_index(view.id);
     hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
     hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx);
     // Swapchain needs PRESENT_SRC_KHR, owned images stay as-is
@@ -17853,7 +17891,22 @@ static void hina_end_tile_pass_dynamic(hina_cmd* cmd)
     }
     else
     {
-      hot->state.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      // If color was in RENDERING_LOCAL_READ_KHR for tile input, transition back
+      const VkImageLayout target_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      if (hot->state.layout != target_layout)
+      {
+        barriers[barrier_count++] = (VkImageMemoryBarrier2){
+          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+          .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+          .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT,
+          .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+          .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+          .oldLayout = hot->state.layout, .newLayout = target_layout,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = hot->vk.image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
+        };
+      }
+      hot->state.layout = target_layout;
       hot->state.access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
       hot->state.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     }
@@ -17885,10 +17938,51 @@ static void hina_end_tile_pass_dynamic(hina_cmd* cmd)
     }
     else
     {
-      hot->state.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      // Resolve targets shouldn't be in LOCAL_READ (they're write-only), but handle consistently
+      const VkImageLayout target_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      if (hot->state.layout != target_layout)
+      {
+        barriers[barrier_count++] = (VkImageMemoryBarrier2){
+          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+          .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+          .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+          .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+          .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+          .oldLayout = hot->state.layout, .newLayout = target_layout,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = hot->vk.image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}
+        };
+      }
+      hot->state.layout = target_layout;
       hot->state.access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
       hot->state.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     }
+  }
+  // Update depth attachment state - critical for subsequent passes (e.g., WBOIT)
+  // If depth was used as input attachment (RENDERING_LOCAL_READ_KHR), transition back
+  if (hina_texture_view_slot_valid(cmd->depth_view))
+  {
+    uint16_t view_idx = hina_id_index(cmd->depth_view.id);
+    hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
+    hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx);
+    const VkImageLayout target_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    if (hot->state.layout != target_layout)
+    {
+      // Depth was in RENDERING_LOCAL_READ_KHR for input attachment - transition back
+      barriers[barrier_count++] = (VkImageMemoryBarrier2){
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .srcAccessMask = VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+        .dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .oldLayout = hot->state.layout, .newLayout = target_layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = hot->vk.image, .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}
+      };
+    }
+    hot->state.layout = target_layout;
+    hot->state.access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    hot->state.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
   }
   if (barrier_count > 0)
   {
@@ -17898,16 +17992,20 @@ static void hina_end_tile_pass_dynamic(hina_cmd* cmd)
     };
     vkCmdPipelineBarrier2(cmd->vk_cmd, &dep);
   }
+  cmd->tile_all_color_count = 0;
   cmd->tile.active = false;
   cmd->tile.current_subpass = 0;
   cmd->tile.subpass_count = 0;
   cmd->color_count = 0;
+  cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE};
   cmd->is_rendering = false;
+  HINA_ZONE_END();
 }
 
 // Legacy Subpass Backend (VkRenderPass with multiple subpasses)
 HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_tile_pass_desc* desc)
 {
+  hina_tile_pass_collect_all_views(cmd, desc);
   hina_context* ctx = cmd->ctx;
   const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   bool uses_swapchain = false;
@@ -18067,11 +18165,13 @@ HINA_NOINLINE static void hina_tile_pass_next_legacy(hina_cmd* cmd, const hina_t
 HINA_NOINLINE static void hina_end_tile_pass_legacy(hina_cmd* cmd)
 {
   vkCmdEndRenderPass(cmd->vk_cmd);
-  // Update tracked layout state for color attachments
-  for (uint32_t i = 0; i < cmd->color_count; i++)
+  // Update tracked layout state for ALL color attachments from ALL subpasses
+  // This fixes the visibility buffer tracking bug where G-buffer attachments from subpass 0
+  // were not getting their tracking updated because cmd->color_views was overwritten by subpass 1
+  for (uint32_t i = 0; i < cmd->tile_all_color_count; i++)
   {
-    if (!hina_texture_view_slot_valid(cmd->color_views[i])) continue;
-    uint16_t view_idx = hina_id_index(cmd->color_views[i].id);
+    hina_texture_view view = cmd->tile_all_color_views[i];
+    uint16_t view_idx = hina_id_index(view.id);
     hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
     hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx);
     if (hot->owns_image)
@@ -18106,10 +18206,22 @@ HINA_NOINLINE static void hina_end_tile_pass_legacy(hina_cmd* cmd)
       hot->state.stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     }
   }
+  // Update depth attachment state - legacy render pass finalLayout is DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+  if (hina_texture_view_slot_valid(cmd->depth_view))
+  {
+    uint16_t view_idx = hina_id_index(cmd->depth_view.id);
+    hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
+    hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx);
+    hot->state.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    hot->state.access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    hot->state.stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+  }
+  cmd->tile_all_color_count = 0;
   cmd->tile.active = false;
   cmd->tile.current_subpass = 0;
   cmd->tile.subpass_count = 0;
   cmd->color_count = 0;
+  cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE};
   cmd->is_rendering = false;
 }
 
@@ -18126,7 +18238,10 @@ bool hina_begin_tile_pass(hina_cmd* cmd, const hina_tile_pass_desc* desc)
   hina_validate_tile_pass_desc(desc);
 #endif
   (void)subpass_count; // Used in assert above
-  if (g_device_caps.has_dynamic_rendering_local_read) return hina_begin_tile_pass_dynamic(cmd, desc);
+  // Choose backend: dynamic local read if supported, fall back to legacy if depth_input unsupported
+  const bool use_dynamic = hina_tile_can_use_dynamic_local_read_desc(desc);
+  cmd->tile.uses_dynamic = use_dynamic;
+  if (use_dynamic) return hina_begin_tile_pass_dynamic(cmd, desc);
   else return hina_begin_tile_pass_legacy(cmd, desc);
 }
 
@@ -18143,14 +18258,14 @@ void hina_tile_pass_next(hina_cmd* cmd, const hina_tile_pass_desc* desc)
                "hina_tile_pass_next: desc subpass_count mismatch (desc=%u, active=%u)", subpass_count,
                cmd->tile.subpass_count);
 #endif
-  if (g_device_caps.has_dynamic_rendering_local_read) hina_tile_pass_next_dynamic(cmd, desc);
+  if (cmd->tile.uses_dynamic) hina_tile_pass_next_dynamic(cmd, desc);
   else hina_tile_pass_next_legacy(cmd, desc);
 }
 
 void hina_end_tile_pass(hina_cmd* cmd)
 {
   HINA_ASSERT(cmd && cmd->recording && cmd->tile.active);
-  if (g_device_caps.has_dynamic_rendering_local_read) hina_end_tile_pass_dynamic(cmd);
+  if (cmd->tile.uses_dynamic) hina_end_tile_pass_dynamic(cmd);
   else hina_end_tile_pass_legacy(cmd);
 }
 
@@ -23043,6 +23158,7 @@ typedef struct hsl_string_builder
   char* data;
   size_t length;
   size_t capacity;
+  bool oom;
 } hsl_string_builder;
 
 // Include stack entry for cycle detection
@@ -23085,7 +23201,8 @@ static void hslc_sb_init(hsl_string_builder* sb)
 {
   sb->data = (char*)shader_alloc(HINA_SB_INITIAL_CAPACITY);
   sb->length = 0;
-  sb->capacity = HINA_SB_INITIAL_CAPACITY;
+  sb->capacity = sb->data ? HINA_SB_INITIAL_CAPACITY : 0;
+  sb->oom = sb->data == NULL;
   if (sb->data) sb->data[0] = '\0';
 }
 
@@ -23098,37 +23215,62 @@ static void hslc_sb_free(hsl_string_builder* sb)
   }
   sb->length = 0;
   sb->capacity = 0;
+  sb->oom = false;
 }
 
-static void hslc_sb_ensure_capacity(hsl_string_builder* sb, size_t additional)
+static bool hslc_sb_ensure_capacity(hsl_string_builder* sb, size_t additional)
 {
+  if (!sb || sb->oom) return false;
+  if (additional > SIZE_MAX - sb->length - 1)
+  {
+    sb->oom = true;
+    return false;
+  }
   size_t required = sb->length + additional + 1;
-  if (required <= sb->capacity) return;
-  size_t new_capacity = sb->capacity * 2;
-  while (new_capacity < required) new_capacity *= 2;
-  char* new_data = shader_alloc(new_capacity);
-  if (new_data && sb->data)
+  if (required <= sb->capacity && sb->data) return true;
+  size_t new_capacity = sb->capacity ? sb->capacity * 2 : HINA_SB_INITIAL_CAPACITY;
+  while (new_capacity < required)
+  {
+    if (new_capacity > SIZE_MAX / 2)
+    {
+      sb->oom = true;
+      return false;
+    }
+    new_capacity *= 2;
+  }
+  char* new_data = (char*)shader_alloc(new_capacity);
+  if (!new_data)
+  {
+    sb->oom = true;
+    return false;
+  }
+  if (sb->data)
   {
     memcpy(new_data, sb->data, sb->length + 1);
     shader_free(sb->data);
   }
+  else
+  {
+    new_data[0] = '\0';
+  }
   sb->data = new_data;
   sb->capacity = new_capacity;
+  return true;
 }
 
 static void hslc_sb_append(hsl_string_builder* sb, const char* str)
 {
-  if (!str || !sb->data) return;
+  if (!str || !sb || sb->oom) return;
   size_t len = strlen(str);
-  hslc_sb_ensure_capacity(sb, len);
+  if (!hslc_sb_ensure_capacity(sb, len)) return;
   memcpy(sb->data + sb->length, str, len + 1);
   sb->length += len;
 }
 
 static void hslc_sb_append_len(hsl_string_builder* sb, const char* str, size_t len)
 {
-  if (!str || !sb->data || len == 0) return;
-  hslc_sb_ensure_capacity(sb, len);
+  if (!str || !sb || sb->oom || len == 0) return;
+  if (!hslc_sb_ensure_capacity(sb, len)) return;
   memcpy(sb->data + sb->length, str, len);
   sb->length += len;
   sb->data[sb->length] = '\0';
@@ -23136,13 +23278,13 @@ static void hslc_sb_append_len(hsl_string_builder* sb, const char* str, size_t l
 
 static void hslc_sb_appendf(hsl_string_builder* sb, const char* fmt, ...)
 {
-  if (!fmt || !sb->data) return;
+  if (!fmt || !sb || sb->oom) return;
   va_list args;
   va_start(args, fmt);
   int needed = vsnprintf(NULL, 0, fmt, args);
   va_end(args);
   if (needed < 0) return;
-  hslc_sb_ensure_capacity(sb, (size_t)needed);
+  if (!hslc_sb_ensure_capacity(sb, (size_t)needed)) return;
   va_start(args, fmt);
   vsnprintf(sb->data + sb->length, (size_t)needed + 1, fmt, args);
   va_end(args);
@@ -23151,6 +23293,17 @@ static void hslc_sb_appendf(hsl_string_builder* sb, const char* fmt, ...)
 
 static char* hslc_sb_to_string(hsl_string_builder* sb)
 {
+  if (!sb || sb->oom)
+  {
+    if (sb && sb->data) shader_free(sb->data);
+    if (sb)
+    {
+      sb->data = NULL;
+      sb->length = 0;
+      sb->capacity = 0;
+    }
+    return NULL;
+  }
   char* result = sb->data;
   sb->data = NULL;
   sb->length = 0;
@@ -23202,7 +23355,7 @@ static void hslc_include_ctx_init(hsl_include_context* ctx, hslc_load_include_fn
 {
   ctx->stack = (hsl_include_entry*)shader_alloc(sizeof(hsl_include_entry) * HINA_MAX_INCLUDE_DEPTH);
   ctx->stack_depth = 0;
-  ctx->stack_capacity = HINA_MAX_INCLUDE_DEPTH;
+  ctx->stack_capacity = ctx->stack ? HINA_MAX_INCLUDE_DEPTH : 0;
   ctx->load_fn = load_fn;
   ctx->user_data = user_data;
   ctx->error_msg = NULL;
@@ -26034,10 +26187,15 @@ static char* hslc_generate_glsl(hsl_module_ir* ir, hsl_stage* stage, const char*
   if (stage_body)
   {
     char* transformed = hslc_transform_reserved_keywords(stage_body);
+    if (!transformed)
+    {
+      hslc_sb_free(&sb);
+      return NULL;
+    }
     hslc_sb_append(&sb, "// --- User code ---\n");
-    hslc_sb_append(&sb, transformed ? transformed : stage_body);
+    hslc_sb_append(&sb, transformed);
     hslc_sb_append(&sb, "\n\n");
-    free(transformed);
+    shader_free(transformed);
   }
   // Generate main() that calls entry function
   hslc_sb_append(&sb, "void main() {\n");
@@ -26409,6 +26567,11 @@ static char* hslc_parse_include_directive(const char* line)
 static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_builder* sb, const char* filename,
                                       const char* source)
 {
+  if (!ctx->stack)
+  {
+    hslc_set_error(ctx, "Out of memory (include stack)");
+    return false;
+  }
   // Check for circular includes
   if (hslc_is_in_include_stack(ctx, filename))
   {
@@ -26433,6 +26596,12 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
   bool at_start = true;
   while (*line_start)
   {
+    if (sb->oom)
+    {
+      hslc_set_error(ctx, "Out of memory");
+      ctx->stack_depth--;
+      return false;
+    }
     // Find end of line
     const char* line_end = line_start;
     while (*line_end && *line_end != '\n' && *line_end != '\r') line_end++;
@@ -26514,12 +26683,20 @@ static char* hslc_expand_includes(hsl_include_context* ctx, const char* filename
 {
   hsl_string_builder sb;
   hslc_sb_init(&sb);
+  if (sb.oom)
+  {
+    hslc_set_error(ctx, "Out of memory");
+    hslc_sb_free(&sb);
+    return NULL;
+  }
   if (!hslc_expand_includes_impl(ctx, &sb, filename, source))
   {
     hslc_sb_free(&sb);
     return NULL;
   }
-  return hslc_sb_to_string(&sb);
+  char* result = hslc_sb_to_string(&sb);
+  if (!result && !ctx->error_msg) hslc_set_error(ctx, "Out of memory");
+  return result;
 }
 
 // GLSL Preamble

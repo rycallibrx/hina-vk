@@ -837,6 +837,7 @@ typedef struct hina_device_caps
   // Feature flags - capabilities detected at init
   bool has_dynamic_rendering; // VK_KHR_dynamic_rendering or 1.3 core
   bool has_dynamic_rendering_local_read; // VK_KHR_dynamic_rendering_local_read for tile pass
+  bool has_dynamic_rendering_local_read_depth_stencil; // VK 1.4 property: depth/stencil input attachments
   bool has_dynamic_rendering_unused_attachments; // VK_EXT_dynamic_rendering_unused_attachments
   bool has_timeline_semaphore; // VK_KHR_timeline_semaphore or 1.2+ core
   bool has_dynamic_state2; // VK_EXT_extended_dynamic_state2
