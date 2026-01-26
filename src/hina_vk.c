@@ -1502,7 +1502,7 @@ typedef struct hina_alloc_header
 
 HINA_STATIC_ASSERT(sizeof(hina_alloc_header) == 16, hina_alloc_header_must_be_16_bytes);
 // Uncomment to trace all host allocations (debug only; compiles out in release)
-#define HINA_TRACE_ALLOCS 0
+// #define HINA_TRACE_ALLOCS 1
 
 static void hina_storage_init(void);
 
