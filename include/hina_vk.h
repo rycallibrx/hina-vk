@@ -941,6 +941,19 @@ HINA_API hina_frame_stats hina_ctx_get_frame_stats(hina_context* ctx);
  */
 HINA_API bool hina_set_native_window(void* window, void* display);
 
+/**
+ * @brief Notify the library that the surface has been lost.
+ *
+ * Call this when the platform indicates the surface is no longer valid
+ * (e.g., Android Activity paused, window minimized). This puts the library
+ * into a "surface lost" state where frame operations become no-ops until
+ * the surface is recreated.
+ *
+ * @note On Android, call this in response to APP_CMD_TERM_WINDOW or when
+ *       SDL_WINDOWEVENT_MINIMIZED is received.
+ *
+ * @see hina_is_surface_lost(), hina_recreate_surface()
+ */
 HINA_API void hina_surface_lost(void);
 
 // ===========================================================================
@@ -1148,6 +1161,26 @@ typedef struct hina_swapchain_desc
 // Defaults: present_mode=FIFO, format/color_space=auto
 HINA_API hina_swapchain_desc hina_swapchain_desc_default(void);
 
+/**
+ * @brief Configure swapchain presentation settings.
+ *
+ * Call before the first hina_frame_begin(), or between frames to reconfigure.
+ * Changes take effect on the next swapchain recreation (resize, surface lost, etc.).
+ *
+ * @param desc Swapchain configuration. Use hina_swapchain_desc_default() as base.
+ *
+ * Example:
+ * @code
+ *   hina_swapchain_desc sc = hina_swapchain_desc_default();
+ *   sc.present_mode = HINA_PRESENT_MODE_MAILBOX;  // Uncapped FPS, no tearing
+ *   sc.flags = HINA_SWAPCHAIN_PREROTATE_BIT;      // Android power optimization
+ *   hina_configure_swapchain(&sc);
+ * @endcode
+ *
+ * @note For HDR output, set preferred_format to a 10-bit or 16-bit format
+ *       (e.g., HINA_FORMAT_A2B10G10R10_UNORM) and preferred_color_space to
+ *       HINA_COLOR_SPACE_HDR10_ST2084 or similar. Falls back gracefully if unsupported.
+ */
 HINA_API void hina_configure_swapchain(const hina_swapchain_desc* desc);
 
 // Get swapchain prerotation angle in degrees (0, 90, 180, or 270).
@@ -1187,13 +1220,47 @@ HINA_API hina_format hina_get_surface_format(void);
  */
 HINA_API hina_format hina_get_texture_format(hina_texture tex);
 
-// Surface lost state (for Android lifecycle handling)
-// Returns true if surface was lost and needs recreation via hina_recreate_surface()
+/**
+ * @brief Check if the surface is in a lost state.
+ *
+ * Returns true if the surface was lost and needs recreation via hina_recreate_surface().
+ * When true, hina_frame_begin() will return an invalid swapchain image and frame
+ * operations become no-ops until the surface is recreated.
+ *
+ * @return true if surface is lost, false if surface is valid.
+ *
+ * @see hina_surface_lost(), hina_recreate_surface()
+ */
 HINA_API bool hina_is_surface_lost(void);
 
-// Recreate Vulkan surface after it was lost (Android lifecycle, BufferQueue abandoned)
-// Call this when SDL provides a new native window (e.g., SDL_APP_DIDENTERFOREGROUND)
-// Returns true on success, false on failure
+/**
+ * @brief Recreate Vulkan surface after it was lost.
+ *
+ * Call this when the platform provides a new native window after a surface loss
+ * (e.g., Android app resumed, window restored). This recreates the Vulkan surface
+ * and swapchain, allowing rendering to continue.
+ *
+ * @param native_window Platform-specific window handle (HWND, ANativeWindow*, etc.)
+ * @param native_display Platform-specific display handle (NULL on Windows/Android)
+ * @return true on success, false on failure.
+ *
+ * Android lifecycle example (SDL):
+ * @code
+ *   void handle_event(SDL_Event* e) {
+ *       if (e->type == SDL_APP_DIDENTERFOREGROUND) {
+ *           SDL_Window* window = SDL_GetWindowFromID(e->window.windowID);
+ *           SDL_SysWMinfo info;
+ *           SDL_VERSION(&info.version);
+ *           SDL_GetWindowWMInfo(window, &info);
+ *           hina_recreate_surface(info.info.android.window, NULL);
+ *       } else if (e->type == SDL_APP_WILLENTERBACKGROUND) {
+ *           hina_surface_lost();
+ *       }
+ *   }
+ * @endcode
+ *
+ * @see hina_surface_lost(), hina_is_surface_lost()
+ */
 HINA_API bool hina_recreate_surface(void* native_window, void* native_display);
 
 // ===========================================================================
