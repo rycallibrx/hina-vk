@@ -7257,6 +7257,16 @@ static bool hina_has_device_extension(VkPhysicalDevice phys, const char* ext_nam
   return found;
 }
 
+static bool hina_is_extension_enabled(const char* const* exts, uint32_t count, const char* ext_name)
+{
+  if (!exts || count == 0 || !ext_name) return false;
+  for (uint32_t i = 0; i < count; ++i)
+  {
+    if (strcmp(exts[i], ext_name) == 0) return true;
+  }
+  return false;
+}
+
 // Rank 0 = unsuitable, 1-4 = usable (higher is better)
 static uint32_t hina_rank_device_type(VkPhysicalDeviceType type, bool prefer_integrated)
 {
@@ -7616,6 +7626,7 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   // - Vulkan 1.2:  dynamic_rendering needs VK_KHR_dynamic_rendering + VK_KHR_depth_stencil_resolve (as extension)
   // - Vulkan 1.1:  dynamic_rendering needs full extension chain
   const bool is_vk13_plus = g_device_caps.vk_version >= HINA_VK_VERSION_1_3;
+  const bool is_vk14 = g_device_caps.vk_version >= HINA_VK_VERSION_1_4;
   const bool is_vk12 = g_device_caps.vk_version == HINA_VK_VERSION_1_2;
   const bool is_vk11 = g_device_caps.vk_version == HINA_VK_VERSION_1_1;
   const bool is_vk10 = g_device_caps.vk_version == HINA_VK_VERSION_1_0;
@@ -7804,6 +7815,21 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
     dev_exts = default_exts;
     dev_ext_count = default_ext_count;
   }
+  const bool enable_dyn_feat = !is_vk13_plus && g_device_caps.has_dynamic_rendering &&
+    hina_is_extension_enabled(dev_exts, dev_ext_count, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+  const bool enable_dyn2_feat = g_device_caps.has_dynamic_state2 &&
+    hina_is_extension_enabled(dev_exts, dev_ext_count, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+  const bool enable_device_fault_feat = g_debug_caps.has_device_fault &&
+    hina_is_extension_enabled(dev_exts, dev_ext_count, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+  const bool enable_sync2_feat = !is_vk13_plus && g_debug_caps.has_synchronization2 &&
+    hina_is_extension_enabled(dev_exts, dev_ext_count, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+  const bool enable_timeline_feat = is_vk11 && g_device_caps.has_timeline_semaphore &&
+    hina_is_extension_enabled(dev_exts, dev_ext_count, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+  const bool enable_dyn_local_read_feat = g_device_caps.has_dynamic_rendering_local_read &&
+    (is_vk14 || hina_is_extension_enabled(dev_exts, dev_ext_count,
+                                          VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME));
+  const bool enable_dyn_unused_attach_feat = g_device_caps.has_dynamic_rendering_unused_attachments &&
+    hina_is_extension_enabled(dev_exts, dev_ext_count, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
   // Log enabled device extensions
   HINA_LOGI(ctx, "Enabling %u device extensions:", dev_ext_count);
   for (uint32_t i = 0; i < dev_ext_count; ++i)
@@ -7824,11 +7850,11 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   };
   VkPhysicalDeviceDynamicRenderingFeaturesKHR dyn = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
-    .dynamicRendering = g_device_caps.has_dynamic_rendering ? VK_TRUE : VK_FALSE
+    .dynamicRendering = enable_dyn_feat ? VK_TRUE : VK_FALSE
   };
   VkPhysicalDeviceExtendedDynamicState2FeaturesEXT dyn2 = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT,
-    .extendedDynamicState2 = g_device_caps.has_dynamic_state2 ? VK_TRUE : VK_FALSE
+    .extendedDynamicState2 = enable_dyn2_feat ? VK_TRUE : VK_FALSE
   };
   VkPhysicalDeviceVulkan12Features vk12 = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
@@ -7842,105 +7868,68 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   };
   VkPhysicalDeviceFaultFeaturesEXT fault_feat = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,
-    .deviceFault = g_debug_caps.has_device_fault ? VK_TRUE : VK_FALSE, .deviceFaultVendorBinary = VK_FALSE
+    .deviceFault = enable_device_fault_feat ? VK_TRUE : VK_FALSE, .deviceFaultVendorBinary = VK_FALSE
   };
   // Internal extension features
   VkPhysicalDeviceSynchronization2Features sync2_feat = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES,
-    .synchronization2 = g_debug_caps.has_synchronization2 ? VK_TRUE : VK_FALSE
+    .synchronization2 = enable_sync2_feat ? VK_TRUE : VK_FALSE
   };
   // For Vulkan 1.1, we need VkPhysicalDeviceTimelineSemaphoreFeaturesKHR (VkPhysicalDeviceVulkan12Features is ignored on 1.1)
   VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline_feat = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR,
-    .timelineSemaphore = g_device_caps.has_timeline_semaphore ? VK_TRUE : VK_FALSE
+    .timelineSemaphore = enable_timeline_feat ? VK_TRUE : VK_FALSE
   };
   // Dynamic rendering local read: enables input attachments with dynamic rendering (tile pass)
   VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR dyn_local_read_feat = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,
-    .dynamicRenderingLocalRead = g_device_caps.has_dynamic_rendering_local_read ? VK_TRUE : VK_FALSE
+    .dynamicRenderingLocalRead = enable_dyn_local_read_feat ? VK_TRUE : VK_FALSE
   };
   // Dynamic rendering unused attachments: allows pipeline colorAttachmentCount to differ from rendering
   VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT dyn_unused_attach_feat = {
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT,
-    .dynamicRenderingUnusedAttachments = g_device_caps.has_dynamic_rendering_unused_attachments ? VK_TRUE : VK_FALSE
+    .dynamicRenderingUnusedAttachments = enable_dyn_unused_attach_feat ? VK_TRUE : VK_FALSE
   };
   // Build pNext chain conditionally based on Vulkan version
   // - Vulkan 1.0: No pNext chaining, use pEnabledFeatures instead
   // - VkPhysicalDeviceVulkan12Features is only valid for 1.2+
   // - VkPhysicalDeviceVulkan13Features is only valid for 1.3+
   void** last_pNext = NULL;
-  if (is_vk13_plus)
+  if (!is_vk10)
   {
-    feats2.pNext = &dyn2; // Skip dyn (dynamicRendering is in vk13)
-    dyn2.pNext = &vk12;
-    vk12.pNext = &vk13;
-    if (g_debug_caps.has_device_fault)
+    feats2.pNext = NULL;
+    last_pNext = &feats2.pNext;
+#define HINA_APPEND_PNEXT(last, node)                  \
+  do                                                   \
+  {                                                    \
+    *(last) = (node);                                  \
+    (last) = &((VkBaseOutStructure*)(node))->pNext;    \
+  } while (0)
+    if (is_vk13_plus)
     {
-      vk13.pNext = &fault_feat;
-      last_pNext = &fault_feat.pNext;
+      if (enable_dyn2_feat) HINA_APPEND_PNEXT(last_pNext, &dyn2);
+      HINA_APPEND_PNEXT(last_pNext, &vk12);
+      HINA_APPEND_PNEXT(last_pNext, &vk13);
+      if (enable_device_fault_feat) HINA_APPEND_PNEXT(last_pNext, &fault_feat);
     }
-    else
+    else if (is_vk12)
     {
-      vk13.pNext = NULL;
-      last_pNext = &vk13.pNext;
+      if (enable_dyn_feat) HINA_APPEND_PNEXT(last_pNext, &dyn);
+      if (enable_dyn2_feat) HINA_APPEND_PNEXT(last_pNext, &dyn2);
+      HINA_APPEND_PNEXT(last_pNext, &vk12);
+      if (enable_device_fault_feat) HINA_APPEND_PNEXT(last_pNext, &fault_feat);
     }
-  }
-  else if (is_vk12)
-  {
-    // 1.2: chain vk12 (provides timelineSemaphore, hostQueryReset)
-    feats2.pNext = &dyn;
-    dyn.pNext = &dyn2;
-    dyn2.pNext = &vk12;
-    if (g_debug_caps.has_device_fault)
+    else if (is_vk11)
     {
-      vk12.pNext = &fault_feat;
-      last_pNext = &fault_feat.pNext;
+      if (enable_dyn_feat) HINA_APPEND_PNEXT(last_pNext, &dyn);
+      if (enable_dyn2_feat) HINA_APPEND_PNEXT(last_pNext, &dyn2);
+      if (enable_device_fault_feat) HINA_APPEND_PNEXT(last_pNext, &fault_feat);
     }
-    else
-    {
-      vk12.pNext = NULL;
-      last_pNext = &vk12.pNext;
-    }
-  }
-  else if (is_vk11)
-  {
-    // 1.1: don't chain vk12 (not valid for this API version)
-    feats2.pNext = &dyn;
-    dyn.pNext = &dyn2;
-    if (g_debug_caps.has_device_fault)
-    {
-      dyn2.pNext = &fault_feat;
-      last_pNext = &fault_feat.pNext;
-    }
-    else
-    {
-      dyn2.pNext = NULL;
-      last_pNext = &dyn2.pNext;
-    }
-  }
-  // 1.0: No pNext chain - VkPhysicalDeviceFeatures2 requires 1.1+
-  // Chain internal extension feature structs conditionally (1.1+ only):
-  // - sync2_feat: Only on Vulkan 1.1/1.2 (1.3+ has it in VkPhysicalDeviceVulkan13Features via core)
-  // - timeline_feat: Only on Vulkan 1.1 (1.2+ has it in VkPhysicalDeviceVulkan12Features)
-  // - dyn_local_read_feat: If dynamic_rendering_local_read is enabled
-  if (last_pNext && !is_vk13_plus && g_debug_caps.has_synchronization2)
-  {
-    *last_pNext = &sync2_feat;
-    last_pNext = &sync2_feat.pNext;
-  }
-  if (last_pNext && is_vk11 && g_device_caps.has_timeline_semaphore)
-  {
-    *last_pNext = &timeline_feat;
-    last_pNext = &timeline_feat.pNext;
-  }
-  if (last_pNext && g_device_caps.has_dynamic_rendering_local_read)
-  {
-    *last_pNext = &dyn_local_read_feat;
-    last_pNext = &dyn_local_read_feat.pNext;
-  }
-  if (last_pNext && g_device_caps.has_dynamic_rendering_unused_attachments)
-  {
-    *last_pNext = &dyn_unused_attach_feat;
+    if (enable_sync2_feat) HINA_APPEND_PNEXT(last_pNext, &sync2_feat);
+    if (enable_timeline_feat) HINA_APPEND_PNEXT(last_pNext, &timeline_feat);
+    if (enable_dyn_local_read_feat) HINA_APPEND_PNEXT(last_pNext, &dyn_local_read_feat);
+    if (enable_dyn_unused_attach_feat) HINA_APPEND_PNEXT(last_pNext, &dyn_unused_attach_feat);
+#undef HINA_APPEND_PNEXT
   }
   VkDeviceCreateInfo dci = {0};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
