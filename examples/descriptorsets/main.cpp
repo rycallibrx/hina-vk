@@ -454,7 +454,7 @@ static bool example_init(hina_example_app* app) {
     EXAMPLE_LOGI("Texture bind groups created successfully");
 
     // Initialize Camera
-    app->camera.rotation = glm::vec3(-15.0f, 0.0f, 0.0f);
+    app->camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
     app->camera.zoom = -4.0f;
 
     EXAMPLE_LOGI("Descriptor Sets example initialized");
@@ -539,7 +539,7 @@ static void example_render(hina_example_app* app) {
     glm::mat4 projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
     projection[1][1] *= -1.0f; // Vulkan Y-flip (match deferred example)
     glm::mat4 view = app->camera.view_matrix();
-    glm::vec4 light_pos = glm::vec4(5.0f, 5.0f, 5.0f, 1.0f);
+    glm::vec4 light_pos = glm::vec4(0.0f, 0.0f, 5.0f, 1.0f);
 
     for (int i = 0; i < 2; i++) {
         if (g_app.cubes[i].ubo_mapped) {

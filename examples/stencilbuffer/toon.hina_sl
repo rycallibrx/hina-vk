@@ -11,6 +11,7 @@ group Scene = 0;
 bindings(Scene, start=0) {
   uniform(std140) UBO {
     mat4 projection;
+    mat4 view;
     mat4 model;
     vec4 light_pos;
     float outline_width;
@@ -41,15 +42,16 @@ Varyings VSMain(VertexIn in) {
     // Output a red base color for toon shading
     out.color = vec3(1.0, 0.0, 0.0);
 
-    gl_Position = ubo.projection * ubo.model * vec4(in.a_position, 1.0);
+    mat4 model_view = ubo.view * ubo.model;
+    vec4 view_pos = model_view * vec4(in.a_position, 1.0);
+    gl_Position = ubo.projection * view_pos;
 
-    // Transform normal to world space
-    out.normal = mat3(ubo.model) * in.a_normal;
+    // Transform normal to view space
+    out.normal = mat3(model_view) * in.a_normal;
 
-    // Calculate light vector in world space
-    vec4 world_pos = ubo.model * vec4(in.a_position, 1.0);
-    vec3 light_pos_world = mat3(ubo.model) * ubo.light_pos.xyz;
-    out.light_vec = light_pos_world - world_pos.xyz;
+    // Calculate light vector in view space
+    vec3 light_pos_view = (ubo.view * ubo.light_pos).xyz;
+    out.light_vec = light_pos_view - view_pos.xyz;
     return out;
 }
 #hina_end

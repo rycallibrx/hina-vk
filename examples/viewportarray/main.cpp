@@ -275,8 +275,8 @@ static bool example_init(hina_example_app* app) {
     }
 
     // Initialize Camera
-    app->camera.rotation = glm::vec3(-15.0f, 0.0f, 0.0f);
-    app->camera.zoom = -3.0f;
+    app->camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
+    app->camera.zoom = -4.0f;
     g_app.rotation = 0.0f;
 
     EXAMPLE_LOGI("Viewport Array example initialized");
@@ -323,7 +323,7 @@ static void example_render(hina_example_app* app) {
     model = glm::rotate(model, glm::radians(g_app.rotation * 0.5f), glm::vec3(1.0f, 0.0f, 0.0f));
 
     // Light position
-    g_app.ubo_mapped->lightPos = glm::vec4(5.0f, 5.0f, 5.0f, 1.0f);
+    g_app.ubo_mapped->lightPos = glm::vec4(0.0f, 0.0f, 5.0f, 1.0f);
 
     // Screen offsets: -0.5 for left half, +0.5 for right half (in NDC)
     g_app.ubo_mapped->screenOffsets[0] = glm::vec4(-0.5f, 0.0f, 0.0f, 0.0f);  // Left

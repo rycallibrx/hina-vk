@@ -7874,8 +7874,16 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
     feats2.pNext = &dyn2; // Skip dyn (dynamicRendering is in vk13)
     dyn2.pNext = &vk12;
     vk12.pNext = &vk13;
-    vk13.pNext = &fault_feat;
-    last_pNext = &fault_feat.pNext;
+    if (g_debug_caps.has_device_fault)
+    {
+      vk13.pNext = &fault_feat;
+      last_pNext = &fault_feat.pNext;
+    }
+    else
+    {
+      vk13.pNext = NULL;
+      last_pNext = &vk13.pNext;
+    }
   }
   else if (is_vk12)
   {
@@ -7883,16 +7891,32 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
     feats2.pNext = &dyn;
     dyn.pNext = &dyn2;
     dyn2.pNext = &vk12;
-    vk12.pNext = &fault_feat;
-    last_pNext = &fault_feat.pNext;
+    if (g_debug_caps.has_device_fault)
+    {
+      vk12.pNext = &fault_feat;
+      last_pNext = &fault_feat.pNext;
+    }
+    else
+    {
+      vk12.pNext = NULL;
+      last_pNext = &vk12.pNext;
+    }
   }
   else if (is_vk11)
   {
     // 1.1: don't chain vk12 (not valid for this API version)
     feats2.pNext = &dyn;
     dyn.pNext = &dyn2;
-    dyn2.pNext = &fault_feat;
-    last_pNext = &fault_feat.pNext;
+    if (g_debug_caps.has_device_fault)
+    {
+      dyn2.pNext = &fault_feat;
+      last_pNext = &fault_feat.pNext;
+    }
+    else
+    {
+      dyn2.pNext = NULL;
+      last_pNext = &dyn2.pNext;
+    }
   }
   // 1.0: No pNext chain - VkPhysicalDeviceFeatures2 requires 1.1+
   // Chain internal extension feature structs conditionally (1.1+ only):

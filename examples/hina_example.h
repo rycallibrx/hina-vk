@@ -154,8 +154,7 @@ struct hina_camera {
         rotM = glm::rotate(rotM, glm::radians(rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
         rotM = glm::rotate(rotM, glm::radians(rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
 
-        glm::vec3 translation = position;
-        translation.z = zoom;
+        glm::vec3 translation = position + glm::vec3(0.0f, 0.0f, zoom);
         glm::mat4 transM = glm::translate(glm::mat4(1.0f), translation);
 
         return transM * rotM;

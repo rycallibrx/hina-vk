@@ -63,7 +63,7 @@ Varyings VSMain(VertexIn in) {
     out.view_pos = (ubo.view * world_pos).xyz;
 
     // Light position (fixed in world space, above and in front)
-    vec4 light_world = vec4(0.0, 5.0, 5.0, 1.0);
+    vec4 light_world = vec4(0.0, 0.0, 5.0, 1.0);
     out.light_pos = (ubo.view * light_world).xyz;
     return out;
 }

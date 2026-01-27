@@ -34,6 +34,7 @@ struct Vertex {
 // Uniform buffer structure (must match shader)
 struct UniformData {
     glm::mat4 projection;
+    glm::mat4 view;
     glm::mat4 model;
     glm::vec4 light_pos;
     float outline_width;
@@ -384,16 +385,12 @@ static void example_render(hina_example_app* app) {
     // Update uniform buffer
     g_app.ubo_mapped->projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
 
-    // Combine camera view with model rotation
     glm::mat4 model = glm::mat4(1.0f);
     model = glm::rotate(model, glm::radians(g_app.rotation_angle), glm::vec3(0.0f, 1.0f, 0.0f));
-    model = glm::rotate(model, glm::radians(app->camera.rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
-    model = glm::rotate(model, glm::radians(app->camera.rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
 
-    glm::mat4 view = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, app->camera.zoom));
-    g_app.ubo_mapped->model = view * model;
-
-    g_app.ubo_mapped->light_pos = glm::vec4(0.0f, -2.0f, 1.0f, 1.0f);
+    g_app.ubo_mapped->view = app->camera.view_matrix();
+    g_app.ubo_mapped->model = model;
+    g_app.ubo_mapped->light_pos = glm::vec4(0.0f, 0.0f, 5.0f, 1.0f);
     g_app.ubo_mapped->outline_width = 0.025f;
 
     // Begin command buffer

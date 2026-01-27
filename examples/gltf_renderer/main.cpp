@@ -18,6 +18,7 @@
 #include <tiny_gltf.h>
 
 #define GLM_ENABLE_EXPERIMENTAL
+#include <iostream>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -1053,7 +1054,9 @@ int main(int argc, char** argv) {
 
     if (gltf_path.empty()) {
         // Default for running from VS without command line args
-        gltf_path = "ABeautifulGame.glb";
+        // gltf_path = "ABeautifulGame.glb";
+        fprintf(stderr, "No file detected\n");
+        return 1;
     }
 
     hina_example_app app;

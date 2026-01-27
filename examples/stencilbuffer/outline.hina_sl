@@ -12,6 +12,7 @@ group Scene = 0;
 bindings(Scene, start=0) {
   uniform(std140) UBO {
     mat4 projection;
+    mat4 view;
     mat4 model;
     vec4 light_pos;
     float outline_width;
@@ -33,7 +34,7 @@ struct FragOut {
 void VSMain(VertexIn in) {
     // Extrude vertex position along normal direction
     vec3 extruded_pos = in.a_position + in.a_normal * ubo.outline_width;
-    gl_Position = ubo.projection * ubo.model * vec4(extruded_pos, 1.0);
+    gl_Position = ubo.projection * ubo.view * ubo.model * vec4(extruded_pos, 1.0);
 }
 #hina_end
 

@@ -299,7 +299,7 @@ static bool example_init(hina_example_app* app) {
     EXAMPLE_LOGI("Pipeline created successfully");
 
     // Initialize Camera
-    app->camera.rotation = glm::vec3(-15.0f, 0.0f, 0.0f);
+    app->camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
     app->camera.zoom = -10.0f;
 
     EXAMPLE_LOGI("Rendering %d spheres using push constants", SPHERE_COUNT);

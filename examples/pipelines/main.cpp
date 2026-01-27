@@ -298,7 +298,8 @@ static bool example_init(hina_example_app* app) {
     EXAMPLE_LOGI("All pipelines created successfully");
 
     // Initialize camera
-    app->camera.rotation = glm::vec3(-15.0f, 0.0f, 0.0f);
+    app->camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
+    app->camera.zoom = -4.0f;
     g_app.rotation_timer = 0.0f;
 
     EXAMPLE_LOGI("Pipelines example initialized");
@@ -338,9 +339,13 @@ static void example_render(hina_example_app* app) {
 
     // Update uniform buffer
     g_app.ubo->projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
+
+    glm::mat4 model = glm::mat4(1.0f);
+    model = glm::rotate(model, glm::radians(g_app.rotation_timer), glm::vec3(0.0f, 1.0f, 0.0f));
+
     g_app.ubo->view = app->camera.view_matrix();
-    g_app.ubo->model = glm::rotate(glm::mat4(1.0f), glm::radians(g_app.rotation_timer), glm::vec3(0.0f, 1.0f, 0.0f));
-    g_app.ubo->light_pos = glm::vec4(5.0f, 5.0f, 5.0f, 1.0f);
+    g_app.ubo->model = model;
+    g_app.ubo->light_pos = glm::vec4(0.0f, 0.0f, 5.0f, 1.0f);
 
     // Begin command buffer
     hina_cmd* cmd = hina_cmd_begin_ex(HINA_QUEUE_GRAPHICS);
