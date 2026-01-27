@@ -147,7 +147,6 @@ struct ViewportArrayApp {
     hina_depth_buffer depth;
 
     // Camera
-    hina_camera camera;
 
     // Animation
     float rotation;
@@ -276,8 +275,8 @@ static bool example_init(hina_example_app* app) {
     }
 
     // Initialize Camera
-    g_app.camera.rotation = glm::vec3(-15.0f, 0.0f, 0.0f);
-    g_app.camera.zoom = -3.0f;
+    app->camera.rotation = glm::vec3(-15.0f, 0.0f, 0.0f);
+    app->camera.zoom = -3.0f;
     g_app.rotation = 0.0f;
 
     EXAMPLE_LOGI("Viewport Array example initialized");
@@ -295,7 +294,7 @@ static void example_render(hina_example_app* app) {
     g_app.rotation += 45.0f * app->delta_time;
 
     // Update camera from input
-    g_app.camera.update(*app);
+    app->camera.update(*app);
 
     // Begin frame
     hina_swapchain_image swapchain = hina_frame_begin();
@@ -332,7 +331,7 @@ static void example_render(hina_example_app* app) {
 
     // Left invocation (index 0) - slightly rotated left
     {
-        glm::mat4 view = g_app.camera.view_matrix();
+        glm::mat4 view = app->camera.view_matrix();
         view = glm::rotate(view, glm::radians(-5.0f), glm::vec3(0.0f, 1.0f, 0.0f));  // Stereo offset
         g_app.ubo_mapped->projection[0] = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
         g_app.ubo_mapped->modelview[0] = view * model;
@@ -340,7 +339,7 @@ static void example_render(hina_example_app* app) {
 
     // Right invocation (index 1) - slightly rotated right
     {
-        glm::mat4 view = g_app.camera.view_matrix();
+        glm::mat4 view = app->camera.view_matrix();
         view = glm::rotate(view, glm::radians(5.0f), glm::vec3(0.0f, 1.0f, 0.0f));  // Stereo offset
         g_app.ubo_mapped->projection[1] = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
         g_app.ubo_mapped->modelview[1] = view * model;

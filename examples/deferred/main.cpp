@@ -404,7 +404,6 @@ struct DeferredApp {
     hina_bind_group_layout transparent_scene_layout;
 
     // Camera
-    hina_camera camera;
 };
 
 static DeferredApp g_app = {};
@@ -774,8 +773,8 @@ static bool example_init(hina_example_app* app) {
     // Setup Camera
     // ========================================================================
 
-    g_app.camera.rotation = glm::vec3(35.0f, 45.0f, 0.0f);
-    g_app.camera.zoom = -12.0f;
+    app->camera.rotation = glm::vec3(35.0f, 45.0f, 0.0f);
+    app->camera.zoom = -12.0f;
 
     EXAMPLE_LOGI("Deferred shading with %d dynamic point lights + transparent pass", NUM_LIGHTS);
     return true;
@@ -786,7 +785,7 @@ static bool example_init(hina_example_app* app) {
 // ============================================================================
 
 static void example_render(hina_example_app* app) {
-    g_app.camera.update(*app);
+    app->camera.update(*app);
 
     hina_swapchain_image swapchain = hina_frame_begin();
     if (swapchain.texture.id == HINA_INVALID_HANDLE) {
@@ -810,10 +809,10 @@ static void example_render(hina_example_app* app) {
 
     g_app.gbuffer_ubo_mapped[frame_idx]->projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
     g_app.gbuffer_ubo_mapped[frame_idx]->projection[1][1] *= -1.0f;
-    g_app.gbuffer_ubo_mapped[frame_idx]->view = g_app.camera.view_matrix();
+    g_app.gbuffer_ubo_mapped[frame_idx]->view = app->camera.view_matrix();
 
-    glm::vec3 cam_pos = glm::vec3(0.0f, 0.0f, -g_app.camera.zoom);
-    cam_pos = glm::mat3(glm::inverse(g_app.camera.view_matrix())) * cam_pos;
+    glm::vec3 cam_pos = glm::vec3(0.0f, 0.0f, -app->camera.zoom);
+    cam_pos = glm::mat3(glm::inverse(app->camera.view_matrix())) * cam_pos;
     g_app.composition_ubo_mapped[frame_idx]->view_pos = glm::vec4(cam_pos, 1.0f);
     g_app.composition_ubo_mapped[frame_idx]->light_count = NUM_LIGHTS;
 

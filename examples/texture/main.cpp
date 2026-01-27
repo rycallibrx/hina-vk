@@ -230,7 +230,6 @@ struct TextureApp {
     hina_bind_group_layout texture_layout;
 
     // Camera
-    hina_camera camera;
 };
 
 static TextureApp g_app = {};
@@ -386,8 +385,8 @@ static bool example_init(hina_example_app* app) {
     EXAMPLE_LOGI("Pipeline created successfully");
 
     // Initialize Camera
-    g_app.camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
-    g_app.camera.zoom = -2.5f;
+    app->camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
+    app->camera.zoom = -2.5f;
 
     return true;
 }
@@ -398,7 +397,7 @@ static bool example_init(hina_example_app* app) {
 
 static void example_render(hina_example_app* app) {
     // Update camera from input
-    g_app.camera.update(*app);
+    app->camera.update(*app);
 
     // Begin frame (acquires swapchain image)
     hina_swapchain_image swapchain = hina_frame_begin();
@@ -423,9 +422,9 @@ static void example_render(hina_example_app* app) {
 
     // Update uniform buffer
     g_app.ubo->projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
-    g_app.ubo->view = g_app.camera.view_matrix();
+    g_app.ubo->view = app->camera.view_matrix();
     g_app.ubo->model = glm::mat4(1.0f);
-    g_app.ubo->view_pos = glm::vec4(0.0f, 0.0f, g_app.camera.zoom, 1.0f);
+    g_app.ubo->view_pos = glm::vec4(0.0f, 0.0f, app->camera.zoom, 1.0f);
     g_app.ubo->texture_id = 0;
     g_app.ubo->sampler_id = 0;
 

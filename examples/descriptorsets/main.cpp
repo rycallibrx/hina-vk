@@ -202,7 +202,6 @@ struct DescriptorSetsApp {
     hina_msaa_buffers msaa;
 
     // Camera
-    hina_camera camera;
 
     // MSAA state
     bool msaa_enabled;
@@ -364,7 +363,7 @@ static bool example_init(hina_example_app* app) {
 
     // 1x pipeline (no MSAA)
     hina_hsl_pipeline_desc pip_desc_1x = hina_hsl_pipeline_desc_default();
-    pip_desc_1x.front_face = HINA_FRONT_FACE_CLOCKWISE;
+    pip_desc_1x.front_face = HINA_FRONT_FACE_COUNTER_CLOCKWISE;
     pip_desc_1x.layout = vertex_layout;
     pip_desc_1x.color_formats[0] = hina_get_surface_format();
     pip_desc_1x.depth_format = HINA_FORMAT_D32_SFLOAT;
@@ -381,7 +380,7 @@ static bool example_init(hina_example_app* app) {
 
     // 4x MSAA pipeline
     hina_hsl_pipeline_desc pip_desc_4x = hina_hsl_pipeline_desc_default();
-    pip_desc_4x.front_face = HINA_FRONT_FACE_CLOCKWISE;
+    pip_desc_4x.front_face = HINA_FRONT_FACE_COUNTER_CLOCKWISE;
     pip_desc_4x.layout = vertex_layout;
     pip_desc_4x.color_formats[0] = hina_get_surface_format();
     pip_desc_4x.depth_format = HINA_FORMAT_D32_SFLOAT;
@@ -455,8 +454,8 @@ static bool example_init(hina_example_app* app) {
     EXAMPLE_LOGI("Texture bind groups created successfully");
 
     // Initialize Camera
-    g_app.camera.rotation = glm::vec3(-15.0f, 0.0f, 0.0f);
-    g_app.camera.zoom = -4.0f;
+    app->camera.rotation = glm::vec3(-15.0f, 0.0f, 0.0f);
+    app->camera.zoom = -4.0f;
 
     EXAMPLE_LOGI("Descriptor Sets example initialized");
     EXAMPLE_LOGI("Two cubes with different textures, rotating at different speeds");
@@ -499,7 +498,7 @@ static void example_render(hina_example_app* app) {
 
     // Only update camera if UI doesn't want the mouse
     if (!hina_example_ui_want_mouse(app)) {
-        g_app.camera.update(*app);
+        app->camera.update(*app);
     }
 
     // Update cube rotations
@@ -538,7 +537,8 @@ static void example_render(hina_example_app* app) {
 
     // Update uniform buffers for each cube
     glm::mat4 projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
-    glm::mat4 view = g_app.camera.view_matrix();
+    projection[1][1] *= -1.0f; // Vulkan Y-flip (match deferred example)
+    glm::mat4 view = app->camera.view_matrix();
     glm::vec4 light_pos = glm::vec4(5.0f, 5.0f, 5.0f, 1.0f);
 
     for (int i = 0; i < 2; i++) {

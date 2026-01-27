@@ -45,12 +45,21 @@ Varyings VSMain(VertexIn in) {
     Varyings out;
     out.uv = in.a_uv;
 
-    vec4 world_pos = ubo.model * vec4(in.a_position, 1.0);
-    gl_Position = ubo.projection * ubo.view * world_pos;
+    // Transform to view space (matches pipelines/phong.hina_sl approach)
+    mat4 model_view = ubo.view * ubo.model;
+    vec4 view_pos = model_view * vec4(in.a_position, 1.0);
+    gl_Position = ubo.projection * view_pos;
 
-    out.normal = mat3(ubo.model) * in.a_normal;
-    out.light_vec = ubo.light_pos.xyz - world_pos.xyz;
-    out.view_vec = -world_pos.xyz;
+    // Normal in view space
+    mat3 normal_matrix = mat3(model_view);
+    out.normal = normalize(normal_matrix * in.a_normal);
+
+    // Light position in view space
+    vec3 light_pos_view = (ubo.view * ubo.light_pos).xyz;
+    out.light_vec = light_pos_view - view_pos.xyz;
+
+    // View vector: camera is at origin in view space
+    out.view_vec = -view_pos.xyz;
     return out;
 }
 #hina_end

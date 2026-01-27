@@ -1211,17 +1211,7 @@ typedef struct HINA_ALIGN(16) hina_sampler_slot
 
 HINA_STATIC_ASSERT(sizeof(hina_sampler_slot) % 16 == 0, hina_sampler_slot_must_be_16B_aligned);
 
-// Hot metadata for handle validation (4B per slot, 16 entries per cache line)
-// Separated from cold slot data to improve cache efficiency during validation.
-// Validation checks only need generation + in_use, not the full slot data.
-typedef struct hina_slot_hot
-{
-  uint16_t generation; // 2: Handle generation for ABA prevention
-  uint8_t in_use; // 1: Slot is currently allocated
-  uint8_t pad_; // 1: Pad to 4 bytes for alignment
-} hina_slot_hot;
 
-HINA_STATIC_ASSERT(sizeof(hina_slot_hot) == 4, hina_slot_hot_must_be_4_bytes);
 
 // Texture view slot (32B) - compressed from 48B
 typedef struct HINA_ALIGN(32) hina_texture_view_slot
@@ -1425,31 +1415,32 @@ static void hina_vm_release(hina_vm_region* region)
 // Global storage: static header + VM-backed pools
 //
 // Pool struct macro: generates an anonymous struct containing all pool data.
-// Each pool is self-contained with metadata, VM regions, typed pointers, and sizes.
-// This enables compile-time macro dispatch without enum lookup tables.
-#define HINA_POOL(slot_type, hot_type) \
+// Each pool is self-contained with metadata, VM region, typed slot pointer, and size.
+// Generation counters are embedded in each slot struct - no separate hot array needed.
+#define HINA_POOL(slot_type) \
   struct { \
     hina_pool_meta meta; \
     hina_vm_region vm; \
-    hina_vm_region hot_vm; \
     slot_type* slots; \
-    hot_type* hot; \
     uint32_t slot_size; \
-    uint32_t hot_size; \
   }
+
+#define HINA_POOL_LIST(X) \
+  X(buffer_pool, hina_buffer_slot, HINA_POOL_MAX_BUFFERS, HINA_POOL_INIT_BUFFERS) \
+  X(texture_pool, hina_texture_slot, HINA_POOL_MAX_TEXTURES, HINA_POOL_INIT_TEXTURES) \
+  X(texture_view_pool, hina_texture_view_slot, HINA_POOL_MAX_TEXTURE_VIEWS, HINA_POOL_INIT_TEXTURE_VIEWS) \
+  X(sampler_pool, hina_sampler_slot, HINA_POOL_MAX_SAMPLERS, HINA_POOL_INIT_SAMPLERS) \
+  X(desc_layout_pool, hina_desc_layout_slot, HINA_POOL_MAX_DESC_SET_LAYOUTS, HINA_POOL_INIT_DESC_SET_LAYOUTS) \
+  X(desc_set_pool, hina_desc_set_slot, HINA_POOL_MAX_DESC_SETS, HINA_POOL_INIT_DESC_SETS) \
+  X(pipeline_pool, hina_pipeline_slot, HINA_POOL_MAX_PIPELINES, HINA_POOL_INIT_PIPELINES) \
+  X(query_pool, hina_query_slot, HINA_POOL_MAX_QUERIES, HINA_POOL_INIT_QUERIES)
 
 typedef struct HINA_ALIGN(128) hina_global_storage
 {
-  // Hot pools (frequently validated, have hot data for fast validation)
-  HINA_POOL(hina_buffer_slot, hina_slot_hot) buffer_pool;
-  HINA_POOL(hina_texture_view_slot, hina_slot_hot) texture_view_pool;
-  HINA_POOL(hina_pipeline_slot, hina_slot_hot) pipeline_pool;
-  // Cold pools (no hot data - use void* for hot pointer)
-  HINA_POOL(hina_texture_slot, void) texture_pool;
-  HINA_POOL(hina_sampler_slot, void) sampler_pool;
-  HINA_POOL(hina_desc_layout_slot, void) desc_layout_pool;
-  HINA_POOL(hina_desc_set_slot, void) desc_set_pool;
-  HINA_POOL(hina_query_slot, void) query_pool;
+  // Pools (generation embedded in each slot)
+#define HINA_POOL_FIELD(name, slot_type, cap, init) HINA_POOL(slot_type) name;
+  HINA_POOL_LIST(HINA_POOL_FIELD)
+#undef HINA_POOL_FIELD
 
   /* Persistent arena (TLSF-style allocator for long-lived data) */
   hina_spinlock persistent_lock;
@@ -1647,12 +1638,10 @@ static void hina_alloc_dump_stats(void)
 // Pool slot allocation helpers
 // Pool macros operate on pool structs directly - no enum lookup needed.
 #define HINA_POOL_ENSURE_COMMITTED(pool, idx) \
-  hina_pool_ensure_committed(&(pool)->meta, &(pool)->vm, (pool)->slot_size, \
-                             (pool)->hot_size ? &(pool)->hot_vm : NULL, \
-                             (pool)->hot_size, (idx))
+  hina_pool_ensure_committed(&(pool)->meta, &(pool)->vm, (pool)->slot_size, (idx))
 
 // LIFO slot alloc: pop from head, fallback to high_water
-#define HINA_SLOT_ALLOC(pool, freelist_sentinel, out_idx) \
+#define HINA_SLOT_ALLOC_MSG(pool, freelist_sentinel, out_idx, overflow_msg) \
   do { \
     hina_pool_meta* _meta = &(pool)->meta; \
     hina_spin_lock(&_meta->lock); \
@@ -1670,10 +1659,13 @@ static void hina_alloc_dump_stats(void)
       _meta->count++; \
     } else { \
       *(out_idx) = UINT16_MAX; /* Pool full */ \
-      HINA_POOL_OVERFLOW_ASSERTF("Pool overflow"); \
+      HINA_POOL_OVERFLOW_ASSERTF((overflow_msg)); \
     } \
     hina_spin_unlock(&_meta->lock); \
   } while(0)
+
+#define HINA_SLOT_ALLOC(pool, freelist_sentinel, out_idx) \
+  HINA_SLOT_ALLOC_MSG((pool), (freelist_sentinel), (out_idx), "Pool overflow")
 
 // LIFO slot free: push to head. Generation bumped on alloc, not here.
 #define HINA_SLOT_FREE(pool, idx) \
@@ -1688,7 +1680,7 @@ static void hina_alloc_dump_stats(void)
   } while(0)
 
 static uint16_t hina_pool_commit_to(hina_pool_meta* meta, hina_vm_region* slots_vm, size_t slot_size,
-                                    hina_vm_region* hot_vm, size_t hot_size, uint16_t desired_slots)
+                                    uint16_t desired_slots)
 {
   if (desired_slots <= meta->committed) return meta->committed;
   if (desired_slots > meta->capacity) desired_slots = meta->capacity;
@@ -1705,27 +1697,17 @@ static uint16_t hina_pool_commit_to(hina_pool_meta* meta, hina_vm_region* slots_
     hina_vm_commit(slots_vm, slots_vm->committed_size, delta);
     slots_vm->committed_size = commit_bytes;
   }
-  if (hot_vm && hot_vm->base && hot_size)
-  {
-    size_t hot_commit_bytes = hina_vm_align_up_size((size_t)committed_slots * hot_size, g_vm_state.page_size);
-    if (hot_commit_bytes > hot_vm->committed_size)
-    {
-      size_t delta = hot_commit_bytes - hot_vm->committed_size;
-      hina_vm_commit(hot_vm, hot_vm->committed_size, delta);
-      hot_vm->committed_size = hot_commit_bytes;
-    }
-  }
   meta->committed = committed_slots;
   return committed_slots;
 }
 
 static void hina_pool_ensure_committed(hina_pool_meta* meta, hina_vm_region* slots_vm, size_t slot_size,
-                                      hina_vm_region* hot_vm, size_t hot_size, uint16_t idx_needed)
+                                      uint16_t idx_needed)
 {
   if (idx_needed < meta->committed) return;
   uint32_t desired = (uint32_t)idx_needed + 1u;
   if (desired > meta->capacity) desired = meta->capacity;
-  hina_pool_commit_to(meta, slots_vm, slot_size, hot_vm, hot_size, (uint16_t)desired);
+  hina_pool_commit_to(meta, slots_vm, slot_size, (uint16_t)desired);
 }
 
 static uint16_t hina_pool_initial_commit(size_t slot_size, uint16_t capacity, uint16_t initial_commit)
@@ -1748,8 +1730,7 @@ static bool hina_texture_upload_ready(hina_context* ctx, uint16_t idx);
 
 
 static void hina_pool_vm_init(hina_pool_meta* meta, hina_vm_region* slots_vm, size_t slot_size,
-                              hina_vm_region* hot_vm, size_t hot_size, uint16_t capacity,
-                              uint16_t initial_commit, uint16_t freelist_sentinel)
+                              uint16_t capacity, uint16_t initial_commit, uint16_t freelist_sentinel)
 {
   meta->count = 0;
   meta->capacity = capacity;
@@ -1757,14 +1738,10 @@ static void hina_pool_vm_init(hina_pool_meta* meta, hina_vm_region* slots_vm, si
   meta->high_water = 0;
   meta->committed = 0;
   hina_vm_reserve(slots_vm, (size_t)capacity * slot_size);
-  if (hot_vm && hot_size)
-  {
-    hina_vm_reserve(hot_vm, (size_t)capacity * hot_size);
-  }
   initial_commit = hina_pool_initial_commit(slot_size, capacity, initial_commit);
   if (initial_commit)
   {
-    hina_pool_commit_to(meta, slots_vm, slot_size, hot_vm, hot_size, initial_commit);
+    hina_pool_commit_to(meta, slots_vm, slot_size, initial_commit);
   }
 }
 
@@ -1773,16 +1750,13 @@ static HINA_INLINE hina_buffer hina_buffer_slot_alloc(void)
   uint16_t idx;
   HINA_SLOT_ALLOC(&g_storage.buffer_pool, HINA_SLOT_FREE_SENTINEL, &idx);
   if (idx == UINT16_MAX) return (hina_buffer){HINA_INVALID_HANDLE};
-  uint16_t gen = ++g_storage.buffer_pool.hot[idx].generation;
-  if (gen == 0) gen = g_storage.buffer_pool.hot[idx].generation = 1;
-  g_storage.buffer_pool.hot[idx].in_use = 1;
-  g_storage.buffer_pool.slots[idx].generation = gen;
+  uint16_t gen = ++g_storage.buffer_pool.slots[idx].generation;
+  if (gen == 0) gen = g_storage.buffer_pool.slots[idx].generation = 1;
   return (hina_buffer){((uint32_t)gen << 16) | idx};
 }
 
 static HINA_INLINE void hina_buffer_slot_free(uint16_t idx)
 {
-  g_storage.buffer_pool.hot[idx].in_use = 0;
   HINA_SLOT_FREE(&g_storage.buffer_pool, idx);
 }
 
@@ -1792,7 +1766,7 @@ static HINA_INLINE bool hina_buffer_slot_valid(hina_buffer h)
   uint16_t idx = h.id & 0xFFFF;
   uint16_t gen = h.id >> 16;
   if (HINA_UNLIKELY(idx >= g_storage.buffer_pool.meta.committed)) return false;
-  return HINA_LIKELY(g_storage.buffer_pool.hot[idx].generation == gen);
+  return HINA_LIKELY(g_storage.buffer_pool.slots[idx].generation == gen);
 }
 
 static HINA_INLINE hina_buffer_slot* hina_buffer_slot_get_valid(hina_buffer h)
@@ -1801,7 +1775,7 @@ static HINA_INLINE hina_buffer_slot* hina_buffer_slot_get_valid(hina_buffer h)
   uint16_t idx = h.id & 0xFFFF;
   uint16_t gen = h.id >> 16;
   if (HINA_UNLIKELY(idx >= g_storage.buffer_pool.meta.committed)) return NULL;
-  if (HINA_UNLIKELY(g_storage.buffer_pool.hot[idx].generation != gen)) return NULL;
+  if (HINA_UNLIKELY(g_storage.buffer_pool.slots[idx].generation != gen)) return NULL;
   return &g_storage.buffer_pool.slots[idx];
 }
 
@@ -1860,17 +1834,14 @@ static HINA_INLINE hina_texture_view hina_texture_view_slot_alloc(void)
   uint16_t idx;
   HINA_SLOT_ALLOC(&g_storage.texture_view_pool, HINA_SLOT_FREE_SENTINEL, &idx);
   if (idx == UINT16_MAX) return (hina_texture_view){HINA_INVALID_HANDLE};
-  uint16_t gen = ++g_storage.texture_view_pool.hot[idx].generation;
-  if (gen == 0) gen = g_storage.texture_view_pool.hot[idx].generation = 1;
-  g_storage.texture_view_pool.hot[idx].in_use = 1;
-  g_storage.texture_view_pool.slots[idx].generation = gen;
+  uint16_t gen = ++g_storage.texture_view_pool.slots[idx].generation;
+  if (gen == 0) gen = g_storage.texture_view_pool.slots[idx].generation = 1;
   g_storage.texture_view_pool.slots[idx].in_use = 1;
   return (hina_texture_view){((uint32_t)gen << 16) | idx};
 }
 
 static HINA_INLINE void hina_texture_view_slot_free(uint16_t idx)
 {
-  g_storage.texture_view_pool.hot[idx].in_use = 0;
   g_storage.texture_view_pool.slots[idx].in_use = 0;
   HINA_SLOT_FREE(&g_storage.texture_view_pool, idx);
 }
@@ -1886,8 +1857,8 @@ static HINA_INLINE bool hina_texture_view_slot_valid(hina_texture_view h)
   uint16_t idx = hina_id_index(h.id);
   uint16_t gen = hina_id_gen(h.id);
   if (HINA_UNLIKELY(idx >= g_storage.texture_view_pool.meta.committed)) return false;
-  const hina_slot_hot* hot = &g_storage.texture_view_pool.hot[idx];
-  return HINA_LIKELY(hot->generation == gen && hot->in_use);
+  hina_texture_view_slot* slot = &g_storage.texture_view_pool.slots[idx];
+  return HINA_LIKELY(slot->generation == gen && slot->in_use);
 }
 
 static HINA_INLINE hina_pipeline hina_pipeline_slot_alloc(void)
@@ -1895,18 +1866,14 @@ static HINA_INLINE hina_pipeline hina_pipeline_slot_alloc(void)
   uint16_t idx;
   HINA_SLOT_ALLOC(&g_storage.pipeline_pool, HINA_SLOT_FREE_SENTINEL, &idx);
   if (idx == UINT16_MAX) return (hina_pipeline){HINA_INVALID_HANDLE};
-  hina_slot_hot* hot = &g_storage.pipeline_pool.hot[idx];
-  uint16_t gen = ++hot->generation;
-  if (gen == 0) gen = hot->generation = 1;
-  hot->in_use = 1;
-  g_storage.pipeline_pool.slots[idx].generation = gen;
+  uint16_t gen = ++g_storage.pipeline_pool.slots[idx].generation;
+  if (gen == 0) gen = g_storage.pipeline_pool.slots[idx].generation = 1;
   g_storage.pipeline_pool.slots[idx].in_use = 1;
   return (hina_pipeline){((uint32_t)gen << 16) | idx};
 }
 
 static HINA_INLINE void hina_pipeline_slot_free(uint16_t idx)
 {
-  g_storage.pipeline_pool.hot[idx].in_use = 0;
   g_storage.pipeline_pool.slots[idx].in_use = 0;
   HINA_SLOT_FREE(&g_storage.pipeline_pool, idx);
 }
@@ -1917,8 +1884,8 @@ static HINA_INLINE bool hina_pipeline_slot_valid(hina_pipeline h)
   uint16_t idx = hina_id_index(h.id);
   uint16_t gen = hina_id_gen(h.id);
   if (HINA_UNLIKELY(idx >= g_storage.pipeline_pool.meta.committed)) return false;
-  const hina_slot_hot* hot = &g_storage.pipeline_pool.hot[idx];
-  return HINA_LIKELY(hot->generation == gen && hot->in_use);
+  hina_pipeline_slot* slot = &g_storage.pipeline_pool.slots[idx];
+  return HINA_LIKELY(slot->generation == gen && slot->in_use);
 }
 
 static HINA_INLINE hina_pipeline_slot* hina_pipeline_slot_get_valid(hina_pipeline h)
@@ -1927,9 +1894,9 @@ static HINA_INLINE hina_pipeline_slot* hina_pipeline_slot_get_valid(hina_pipelin
   uint16_t idx = hina_id_index(h.id);
   uint16_t gen = hina_id_gen(h.id);
   if (HINA_UNLIKELY(idx >= g_storage.pipeline_pool.meta.committed)) return NULL;
-  const hina_slot_hot* hot = &g_storage.pipeline_pool.hot[idx];
-  if (HINA_UNLIKELY(hot->generation != gen || !hot->in_use)) return NULL;
-  return &g_storage.pipeline_pool.slots[idx];
+  hina_pipeline_slot* slot = &g_storage.pipeline_pool.slots[idx];
+  if (HINA_UNLIKELY(slot->generation != gen || !slot->in_use)) return NULL;
+  return slot;
 }
 
 static HINA_INLINE hina_desc_set_layout hina_desc_layout_slot_alloc(void)
@@ -1960,30 +1927,8 @@ static HINA_INLINE bool hina_desc_layout_slot_valid(hina_desc_set_layout h)
 
 static HINA_INLINE hina_desc_set hina_desc_set_slot_alloc(void)
 {
-  hina_pool_meta* meta = &g_storage.desc_set_pool.meta;
   uint16_t idx;
-  hina_spin_lock(&meta->lock);
-  if (meta->freelist_head != HINA_SLOT_FREE_SENTINEL)
-  {
-    idx = meta->freelist_head;
-    meta->freelist_head = g_storage.desc_set_pool.slots[idx].next_free;
-    g_storage.desc_set_pool.slots[idx].next_free = HINA_SLOT_FREE_SENTINEL;
-    meta->count++;
-  }
-  else if (meta->high_water < meta->capacity)
-  {
-    idx = meta->high_water;
-    HINA_POOL_ENSURE_COMMITTED(&g_storage.desc_set_pool, idx);
-    meta->high_water++;
-    g_storage.desc_set_pool.slots[idx].next_free = HINA_SLOT_FREE_SENTINEL;
-    meta->count++;
-  }
-  else
-  {
-    idx = UINT16_MAX;
-    HINA_POOL_OVERFLOW_ASSERTF("Descriptor set pool overflow");
-  }
-  hina_spin_unlock(&meta->lock);
+  HINA_SLOT_ALLOC_MSG(&g_storage.desc_set_pool, HINA_SLOT_FREE_SENTINEL, &idx, "Descriptor set pool overflow");
   if (idx == UINT16_MAX) return (hina_desc_set){HINA_INVALID_HANDLE};
   uint16_t gen = ++g_storage.desc_set_pool.slots[idx].generation;
   if (gen == 0) gen = g_storage.desc_set_pool.slots[idx].generation = 1;
@@ -1992,14 +1937,8 @@ static HINA_INLINE hina_desc_set hina_desc_set_slot_alloc(void)
 
 static HINA_INLINE void hina_desc_set_slot_free(uint16_t idx)
 {
-  hina_pool_meta* meta = &g_storage.desc_set_pool.meta;
-  hina_spin_lock(&meta->lock);
-  g_storage.desc_set_pool.slots[idx].generation++;
   g_storage.desc_set_pool.slots[idx].set = VK_NULL_HANDLE;
-  g_storage.desc_set_pool.slots[idx].next_free = meta->freelist_head;
-  meta->freelist_head = idx;
-  meta->count--;
-  hina_spin_unlock(&meta->lock);
+  HINA_SLOT_FREE(&g_storage.desc_set_pool, idx);
 }
 
 static HINA_INLINE bool hina_desc_set_slot_valid(hina_desc_set h)
@@ -2014,30 +1953,8 @@ static HINA_INLINE bool hina_desc_set_slot_valid(hina_desc_set h)
 
 static HINA_INLINE hina_query_pool hina_query_slot_alloc(void)
 {
-  hina_pool_meta* meta = &g_storage.query_pool.meta;
   uint16_t idx;
-  hina_spin_lock(&meta->lock);
-  if (meta->freelist_head != HINA_SLOT_FREE_SENTINEL)
-  {
-    idx = meta->freelist_head;
-    meta->freelist_head = g_storage.query_pool.slots[idx].next_free;
-    g_storage.query_pool.slots[idx].next_free = HINA_SLOT_FREE_SENTINEL;
-    meta->count++;
-  }
-  else if (meta->high_water < meta->capacity)
-  {
-    idx = meta->high_water;
-    HINA_POOL_ENSURE_COMMITTED(&g_storage.query_pool, idx);
-    meta->high_water++;
-    g_storage.query_pool.slots[idx].next_free = HINA_SLOT_FREE_SENTINEL;
-    meta->count++;
-  }
-  else
-  {
-    idx = UINT16_MAX;
-    HINA_POOL_OVERFLOW_ASSERTF("Query pool overflow");
-  }
-  hina_spin_unlock(&meta->lock);
+  HINA_SLOT_ALLOC_MSG(&g_storage.query_pool, HINA_SLOT_FREE_SENTINEL, &idx, "Query pool overflow");
   if (idx == UINT16_MAX) return (hina_query_pool){HINA_INVALID_HANDLE};
   uint16_t gen = ++g_storage.query_pool.slots[idx].generation;
   if (gen == 0) gen = g_storage.query_pool.slots[idx].generation = 1;
@@ -2046,14 +1963,8 @@ static HINA_INLINE hina_query_pool hina_query_slot_alloc(void)
 
 static HINA_INLINE void hina_query_slot_free(uint16_t idx)
 {
-  hina_pool_meta* meta = &g_storage.query_pool.meta;
-  hina_spin_lock(&meta->lock);
-  g_storage.query_pool.slots[idx].generation++;
   g_storage.query_pool.slots[idx].pool = VK_NULL_HANDLE;
-  g_storage.query_pool.slots[idx].next_free = meta->freelist_head;
-  meta->freelist_head = idx;
-  meta->count--;
-  hina_spin_unlock(&meta->lock);
+  HINA_SLOT_FREE(&g_storage.query_pool, idx);
 }
 
 static HINA_INLINE bool hina_query_slot_valid(hina_query_pool h)
@@ -3995,50 +3906,22 @@ static uint32_t hina_vk_version_to_api(hina_vk_version v)
   }
 }
 
-// Pool initialization macros - initialize a pool struct with all its metadata
-#define HINA_INIT_POOL(pool, slot_type, hot_type, cap, init, freelist) \
+#define HINA_POOL_INIT_ONE(name, slot_type, cap, init) \
   do { \
-    (pool)->slot_size = sizeof(slot_type); \
-    (pool)->hot_size = sizeof(hot_type); \
-    hina_pool_vm_init(&(pool)->meta, &(pool)->vm, sizeof(slot_type), \
-                      sizeof(hot_type) ? &(pool)->hot_vm : NULL, sizeof(hot_type), \
-                      (cap), (init), (freelist)); \
-    (pool)->slots = (slot_type*)(pool)->vm.base; \
-    (pool)->hot = sizeof(hot_type) ? (hot_type*)(pool)->hot_vm.base : NULL; \
+    g_storage.name.slot_size = sizeof(slot_type); \
+    hina_pool_vm_init(&g_storage.name.meta, &g_storage.name.vm, sizeof(slot_type), \
+                      (cap), (init), HINA_SLOT_FREE_SENTINEL); \
+    g_storage.name.slots = (slot_type*)g_storage.name.vm.base; \
   } while (0)
 
-// For cold pools (no hot data)
-#define HINA_INIT_POOL_COLD(pool, slot_type, cap, init, freelist) \
-  do { \
-    (pool)->slot_size = sizeof(slot_type); \
-    (pool)->hot_size = 0; \
-    hina_pool_vm_init(&(pool)->meta, &(pool)->vm, sizeof(slot_type), NULL, 0, (cap), (init), (freelist)); \
-    (pool)->slots = (slot_type*)(pool)->vm.base; \
-    (pool)->hot = NULL; \
-  } while (0)
+#define HINA_POOL_INIT_APPLY(name, slot_type, cap, init) \
+  HINA_POOL_INIT_ONE(name, slot_type, cap, init);
 
 static void hina_storage_init(void)
 {
   if (g_storage.initialized == HINA_STORAGE_INITIALIZED) return; // Already initialized
   hina_vm_init();
-  // Hot pools (validation-heavy)
-  HINA_INIT_POOL(&g_storage.buffer_pool, hina_buffer_slot, hina_slot_hot,
-                 HINA_POOL_MAX_BUFFERS, HINA_POOL_INIT_BUFFERS, HINA_SLOT_FREE_SENTINEL);
-  HINA_INIT_POOL(&g_storage.texture_view_pool, hina_texture_view_slot, hina_slot_hot,
-                 HINA_POOL_MAX_TEXTURE_VIEWS, HINA_POOL_INIT_TEXTURE_VIEWS, HINA_SLOT_FREE_SENTINEL);
-  HINA_INIT_POOL(&g_storage.pipeline_pool, hina_pipeline_slot, hina_slot_hot,
-                 HINA_POOL_MAX_PIPELINES, HINA_POOL_INIT_PIPELINES, HINA_SLOT_FREE_SENTINEL);
-  // Cold pools
-  HINA_INIT_POOL_COLD(&g_storage.texture_pool, hina_texture_slot,
-                      HINA_POOL_MAX_TEXTURES, HINA_POOL_INIT_TEXTURES, HINA_SLOT_FREE_SENTINEL);
-  HINA_INIT_POOL_COLD(&g_storage.sampler_pool, hina_sampler_slot,
-                      HINA_POOL_MAX_SAMPLERS, HINA_POOL_INIT_SAMPLERS, HINA_SLOT_FREE_SENTINEL);
-  HINA_INIT_POOL_COLD(&g_storage.desc_layout_pool, hina_desc_layout_slot,
-                      HINA_POOL_MAX_DESC_SET_LAYOUTS, HINA_POOL_INIT_DESC_SET_LAYOUTS, HINA_SLOT_FREE_SENTINEL);
-  HINA_INIT_POOL_COLD(&g_storage.desc_set_pool, hina_desc_set_slot,
-                      HINA_POOL_MAX_DESC_SETS, HINA_POOL_INIT_DESC_SETS, HINA_SLOT_FREE_SENTINEL);
-  HINA_INIT_POOL_COLD(&g_storage.query_pool, hina_query_slot,
-                      HINA_POOL_MAX_QUERIES, HINA_POOL_INIT_QUERIES, HINA_SLOT_FREE_SENTINEL);
+  HINA_POOL_LIST(HINA_POOL_INIT_APPLY);
   hina_vm_reserve(&g_storage.persistent_vm, HINA_PERSISTENT_ARENA_SIZE);
   g_storage.persistent_data = g_storage.persistent_vm.base;
   if (HINA_PERSISTENT_ARENA_INIT_COMMIT)
@@ -4064,18 +3947,16 @@ static void hina_storage_init(void)
   g_storage.validation_level = HINA_DEFAULT_VALIDATION_LEVEL;
 }
 
-#undef HINA_INIT_POOL
-#undef HINA_INIT_POOL_COLD
+#undef HINA_POOL_INIT_APPLY
+#undef HINA_POOL_INIT_ONE
 
-// Release a pool's VM regions and reset its state
-#define HINA_POOL_RELEASE(pool) \
+// Release a pool's VM region and reset its state
+#define HINA_POOL_RELEASE_ONE(name, slot_type, cap, init) \
   do { \
-    hina_vm_release(&(pool)->hot_vm); \
-    hina_vm_release(&(pool)->vm); \
-    (pool)->slots = NULL; \
-    (pool)->hot = NULL; \
-    (pool)->meta.committed = 0; \
-  } while(0)
+    hina_vm_release(&g_storage.name.vm); \
+    g_storage.name.slots = NULL; \
+    g_storage.name.meta.committed = 0; \
+  } while(0);
 
 // Cleanup any remaining user resources before VMA is destroyed.
 // This prevents VMA from complaining about leaked allocations.
@@ -4086,17 +3967,14 @@ static void hina_cleanup_leaked_resources(hina_device* dev)
   VmaAllocator vma = dev->allocator.vma;
   uint32_t leaked_buffers = 0, leaked_textures = 0, leaked_views = 0;
   uint32_t leaked_samplers = 0, leaked_pipelines = 0, leaked_layouts = 0;
-  // Buffers: use hot array for in_use check
+  // Buffers: check vk.buffer (no in_use field in slot)
   for (uint32_t i = 0; i < g_storage.buffer_pool.meta.committed; ++i)
   {
-    if (g_storage.buffer_pool.hot[i].in_use)
+    hina_buffer_slot* slot = &g_storage.buffer_pool.slots[i];
+    if (slot->vk.buffer)
     {
-      hina_buffer_slot* slot = &g_storage.buffer_pool.slots[i];
-      if (slot->vk.buffer)
-      {
-        vmaDestroyBuffer(vma, slot->vk.buffer, slot->vk.allocation);
-        leaked_buffers++;
-      }
+      vmaDestroyBuffer(vma, slot->vk.buffer, slot->vk.allocation);
+      leaked_buffers++;
     }
   }
   // Textures: check vk.image and owns_image (no hot array)
@@ -4131,12 +4009,12 @@ static void hina_cleanup_leaked_resources(hina_device* dev)
       leaked_samplers++;
     }
   }
-  // Pipelines: use hot array for in_use check
+  // Pipelines: use slot.in_use
   for (uint32_t i = 0; i < g_storage.pipeline_pool.meta.committed; ++i)
   {
-    if (g_storage.pipeline_pool.hot[i].in_use)
+    hina_pipeline_slot* slot = &g_storage.pipeline_pool.slots[i];
+    if (slot->in_use)
     {
-      hina_pipeline_slot* slot = &g_storage.pipeline_pool.slots[i];
       if (slot->pipeline)
         vkDestroyPipeline(vk_dev, slot->pipeline, NULL);
       if (slot->layout)
@@ -4172,20 +4050,13 @@ static void hina_storage_shutdown(void)
 #ifdef HINA_DEBUG
   hina_debug_name_shutdown();  // Must be before persistent_vm release (uses hina_free_host)
 #endif
-  HINA_POOL_RELEASE(&g_storage.buffer_pool);
-  HINA_POOL_RELEASE(&g_storage.texture_pool);
-  HINA_POOL_RELEASE(&g_storage.texture_view_pool);
-  HINA_POOL_RELEASE(&g_storage.sampler_pool);
-  HINA_POOL_RELEASE(&g_storage.desc_layout_pool);
-  HINA_POOL_RELEASE(&g_storage.desc_set_pool);
-  HINA_POOL_RELEASE(&g_storage.pipeline_pool);
-  HINA_POOL_RELEASE(&g_storage.query_pool);
+  HINA_POOL_LIST(HINA_POOL_RELEASE_ONE);
   hina_vm_release(&g_storage.persistent_vm);
   g_storage.persistent_data = NULL;
   g_storage.initialized = 0;
 }
 
-#undef HINA_POOL_RELEASE
+#undef HINA_POOL_RELEASE_ONE
 
 static uint64_t hina_latest_pending_ticket(hina_context* ctx);
 

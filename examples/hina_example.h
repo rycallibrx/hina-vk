@@ -135,6 +135,37 @@ struct hina_scope_exit_t {
 typedef bool (*hina_example_event_callback)(const SDL_Event* event, void* user_data);
 #endif
 
+// ============================================================================
+// Camera Helper (requires GLM)
+// ============================================================================
+
+#ifdef GLM_VERSION
+
+struct hina_camera {
+    glm::vec3 rotation;
+    glm::vec3 position;
+    float zoom;
+
+    hina_camera() : rotation(0.0f), position(0.0f), zoom(-2.5f) {}
+
+    glm::mat4 view_matrix() const {
+        glm::mat4 rotM = glm::mat4(1.0f);
+        rotM = glm::rotate(rotM, glm::radians(rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+        rotM = glm::rotate(rotM, glm::radians(rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+        rotM = glm::rotate(rotM, glm::radians(rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
+
+        glm::vec3 translation = position;
+        translation.z = zoom;
+        glm::mat4 transM = glm::translate(glm::mat4(1.0f), translation);
+
+        return transM * rotM;
+    }
+
+    void update(const hina_example_app& app, float rotation_speed = 0.5f, float pan_speed = 0.01f, float zoom_speed = 0.25f);
+};
+
+#endif // GLM_VERSION
+
 struct hina_example_app {
     // Common state
     int width;
@@ -163,6 +194,10 @@ struct hina_example_app {
     // Timing
     float delta_time;
     float elapsed_time;
+
+#ifdef GLM_VERSION
+    hina_camera camera;
+#endif
 
     // Frame limits (for automated testing)
     int frame_count;
@@ -227,6 +262,22 @@ struct hina_example_app {
     } imgui_frames[HINA_IMGUI_FRAMES_IN_FLIGHT];
 #endif
 };
+
+#ifdef GLM_VERSION
+
+inline void hina_camera::update(const hina_example_app& app, float rotation_speed, float pan_speed, float zoom_speed) {
+    if (app.input_down) {
+        rotation.x += app.input_delta_y * rotation_speed;
+        rotation.y += app.input_delta_x * rotation_speed;
+    }
+    if (app.input_down_alt) {
+        position.x += app.input_delta_x * pan_speed;
+        position.y += app.input_delta_y * pan_speed;
+    }
+    zoom += app.scroll_delta * zoom_speed;
+}
+
+#endif // GLM_VERSION
 
 // ============================================================================
 // Example Configuration (Desktop only)
@@ -1391,47 +1442,6 @@ static inline bool hina_uniform_ring_write(hina_uniform_ring* ring, const void* 
     hina_flush_buffer(*out_buffer, *out_offset, size);
     return true;
 }
-
-// ============================================================================
-// Camera Helper (requires GLM)
-// ============================================================================
-
-#ifdef GLM_VERSION
-
-struct hina_camera {
-    glm::vec3 rotation;
-    glm::vec3 position;
-    float zoom;
-
-    hina_camera() : rotation(0.0f), position(0.0f), zoom(-2.5f) {}
-
-    glm::mat4 view_matrix() const {
-        glm::mat4 rotM = glm::mat4(1.0f);
-        rotM = glm::rotate(rotM, glm::radians(rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
-        rotM = glm::rotate(rotM, glm::radians(rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
-        rotM = glm::rotate(rotM, glm::radians(rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
-
-        glm::vec3 translation = position;
-        translation.z = zoom;
-        glm::mat4 transM = glm::translate(glm::mat4(1.0f), translation);
-
-        return transM * rotM;
-    }
-
-    void update(const hina_example_app& app, float rotation_speed = 0.5f, float pan_speed = 0.01f, float zoom_speed = 0.25f) {
-        if (app.input_down) {
-            rotation.x += app.input_delta_y * rotation_speed;
-            rotation.y += app.input_delta_x * rotation_speed;
-        }
-        if (app.input_down_alt) {
-            position.x += app.input_delta_x * pan_speed;
-            position.y += app.input_delta_y * pan_speed;
-        }
-        zoom += app.scroll_delta * zoom_speed;
-    }
-};
-
-#endif // GLM_VERSION
 
 // ============================================================================
 // Pipeline Creation Helper

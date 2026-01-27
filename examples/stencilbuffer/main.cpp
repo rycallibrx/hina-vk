@@ -113,7 +113,6 @@ struct StencilBufferApp {
     hina_bind_group_layout scene_layout;
 
     // Camera
-    hina_camera camera;
     float rotation_angle;
 };
 
@@ -321,8 +320,8 @@ static bool example_init(hina_example_app* app) {
     }
 
     // Initialize Camera
-    g_app.camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
-    g_app.camera.zoom = -4.0f;
+    app->camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
+    app->camera.zoom = -4.0f;
 
     g_app.rotation_angle = 0.0f;
 
@@ -341,7 +340,7 @@ static void example_render(hina_example_app* app) {
     g_app.rotation_angle += 30.0f * app->delta_time;
 
     // Update camera from input
-    g_app.camera.update(*app);
+    app->camera.update(*app);
 
     // Begin frame (acquires swapchain image)
     hina_swapchain_image swapchain = hina_frame_begin();
@@ -388,10 +387,10 @@ static void example_render(hina_example_app* app) {
     // Combine camera view with model rotation
     glm::mat4 model = glm::mat4(1.0f);
     model = glm::rotate(model, glm::radians(g_app.rotation_angle), glm::vec3(0.0f, 1.0f, 0.0f));
-    model = glm::rotate(model, glm::radians(g_app.camera.rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
-    model = glm::rotate(model, glm::radians(g_app.camera.rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+    model = glm::rotate(model, glm::radians(app->camera.rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+    model = glm::rotate(model, glm::radians(app->camera.rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
 
-    glm::mat4 view = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, g_app.camera.zoom));
+    glm::mat4 view = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 0.0f, app->camera.zoom));
     g_app.ubo_mapped->model = view * model;
 
     g_app.ubo_mapped->light_pos = glm::vec4(0.0f, -2.0f, 1.0f, 1.0f);

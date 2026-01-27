@@ -157,7 +157,6 @@ struct DynamicUniformBufferApp {
     std::vector<ObjectData> objects;
 
     // Camera
-    hina_camera camera;
 
     // Alignment
     size_t dynamicAlignment;
@@ -370,8 +369,8 @@ static bool example_init(hina_example_app* app) {
     }
 
     // Initialize Camera
-    g_app.camera.rotation = glm::vec3(-15.0f, -45.0f, 0.0f);
-    g_app.camera.zoom = -30.0f;  // Zoomed out to see all 125 cubes
+    app->camera.rotation = glm::vec3(-15.0f, -45.0f, 0.0f);
+    app->camera.zoom = -30.0f;  // Zoomed out to see all 125 cubes
 
     EXAMPLE_LOGI("Dynamic Uniform Buffer example initialized");
     EXAMPLE_LOGI("Rendering %d cubes in a %dx%dx%d grid",
@@ -388,7 +387,7 @@ static void example_render(hina_example_app* app) {
     const float cube_spacing = 4.0f;  // Distance between cube centers
 
     // Update camera from input
-    g_app.camera.update(*app);
+    app->camera.update(*app);
 
     // Begin frame (acquires swapchain image)
     hina_swapchain_image swapchain = hina_frame_begin();
@@ -413,7 +412,7 @@ static void example_render(hina_example_app* app) {
 
     // Update View/Projection UBO
     g_app.vp_ubo->projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 512.0f);
-    g_app.vp_ubo->view = g_app.camera.view_matrix();
+    g_app.vp_ubo->view = app->camera.view_matrix();
 
     // Update Dynamic UBO (all object model matrices)
     // Center offset for the grid

@@ -314,7 +314,6 @@ struct OffscreenApp
     hina_bind_group debug_tex_bind_group;
 
     // Camera and state
-    hina_camera camera;
     float model_rotation;
     glm::vec3 model_position;
 };
@@ -629,8 +628,8 @@ static bool example_init(hina_example_app *app)
     g_app.debug_tex_bind_group = hina_create_bind_group(&debug_tex_group_desc);
 
     // Setup Camera and State
-    g_app.camera.rotation = glm::vec3(25.0f, 0.0f, 0.0f);
-    g_app.camera.zoom = -4.5f;
+    app->camera.rotation = glm::vec3(25.0f, 0.0f, 0.0f);
+    app->camera.zoom = -4.5f;
 
     g_app.model_rotation = 0.0f;
     g_app.model_position = glm::vec3(0.0f, 1.5f, 0.0f);
@@ -647,7 +646,7 @@ static bool example_init(hina_example_app *app)
 static void example_render(hina_example_app *app)
 {
     g_app.model_rotation += 45.0f * app->delta_time;
-    g_app.camera.update(*app);
+    app->camera.update(*app);
 
     hina_swapchain_image swapchain = hina_frame_begin();
     if (swapchain.texture.id == HINA_INVALID_HANDLE)
@@ -673,7 +672,7 @@ static void example_render(hina_example_app *app)
     glm::vec4 light_pos(0.0f, 5.0f, 5.0f, 1.0f);
 
     // View and projection for main pass
-    glm::mat4 view = g_app.camera.view_matrix();
+    glm::mat4 view = app->camera.view_matrix();
     glm::mat4 projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
     projection[1][1] *= -1.0f; // Vulkan Y-flip
 

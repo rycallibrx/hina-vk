@@ -185,7 +185,6 @@ struct SpecializationConstantsApp {
     hina_bind_group_layout scene_layout;
 
     // Camera
-    hina_camera camera;
     float rotation_timer;
 };
 
@@ -367,8 +366,8 @@ static bool example_init(hina_example_app* app) {
     }
 
     // Initialize Camera
-    g_app.camera.rotation = glm::vec3(-20.0f, 0.0f, 0.0f);
-    g_app.camera.zoom = -6.0f;
+    app->camera.rotation = glm::vec3(-20.0f, 0.0f, 0.0f);
+    app->camera.zoom = -6.0f;
 
     g_app.rotation_timer = 0.0f;
 
@@ -388,7 +387,7 @@ static void example_render(hina_example_app* app) {
     g_app.rotation_timer += app->delta_time * 45.0f;  // 45 degrees per second
 
     // Update camera from input
-    g_app.camera.update(*app);
+    app->camera.update(*app);
 
     // Begin frame (acquires swapchain image)
     hina_swapchain_image swapchain = hina_frame_begin();
@@ -414,7 +413,7 @@ static void example_render(hina_example_app* app) {
 
     // Update UBO (shared between all pipelines)
     g_app.ubo->projection = glm::perspective(glm::radians(60.0f), aspect / 3.0f, 0.1f, 256.0f);
-    g_app.ubo->view = g_app.camera.view_matrix();
+    g_app.ubo->view = app->camera.view_matrix();
     g_app.ubo->model = glm::rotate(glm::mat4(1.0f), glm::radians(g_app.rotation_timer), glm::vec3(0.0f, 1.0f, 0.0f));
     g_app.ubo->light_pos = glm::vec4(5.0f, 5.0f, 5.0f, 1.0f);
 

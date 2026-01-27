@@ -1707,8 +1707,7 @@ int main(int argc, char** argv) {
     // Main loop
     // ========================================================================
 
-    hina_camera camera;
-    camera.zoom = -scene.scene_radius * 2.0f;
+    app.camera.zoom = -scene.scene_radius * 2.0f;
 
     glm::vec3 light_dir = glm::normalize(glm::vec3(-0.6f, -1.0f, -0.4f));
     glm::vec3 light_color = glm::vec3(1.0f, 0.95f, 0.9f);
@@ -1739,7 +1738,7 @@ int main(int argc, char** argv) {
 
         // Only update camera if ImGui doesn't want the mouse
         if (!hina_example_ui_want_mouse(&app)) {
-            camera.update(app);
+            app.camera.update(app);
         }
 
         // hina_frame_begin() auto-manages registered child contexts (shadow_ctx, main_ctx)
@@ -1758,7 +1757,7 @@ int main(int argc, char** argv) {
             break;
         }
 
-        glm::mat4 view = camera.view_matrix();
+        glm::mat4 view = app.camera.view_matrix();
         glm::mat4 proj = glm::perspective(glm::radians(60.0f),
                                           h > 0 ? (float)w / (float)h : 1.0f,
                                           0.1f, scene.scene_radius * 10.0f);
@@ -2012,5 +2011,4 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
 

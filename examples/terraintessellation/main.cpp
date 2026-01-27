@@ -230,7 +230,6 @@ struct TerrainTessellationApp {
     hina_depth_buffer depth;
 
     // Camera
-    hina_camera camera;
 
     // Tessellation parameters
     float tessellation_factor;
@@ -424,8 +423,8 @@ static bool example_init(hina_example_app* app) {
     }
 
     // Initialize Camera - position above terrain looking down
-    g_app.camera.rotation = glm::vec3(-45.0f, 0.0f, 0.0f);
-    g_app.camera.zoom = -20.0f;
+    app->camera.rotation = glm::vec3(-45.0f, 0.0f, 0.0f);
+    app->camera.zoom = -20.0f;
 
     EXAMPLE_LOGI("Terrain Tessellation example initialized");
     EXAMPLE_LOGI("Controls: Mouse to rotate, scroll to zoom");
@@ -441,7 +440,7 @@ static bool example_init(hina_example_app* app) {
 
 static void example_render(hina_example_app* app) {
     // Update camera from input
-    g_app.camera.update(*app);
+    app->camera.update(*app);
 
     // Begin frame
     hina_swapchain_image swapchain = hina_frame_begin();
@@ -466,7 +465,7 @@ static void example_render(hina_example_app* app) {
 
     // Update UBO
     glm::mat4 projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 512.0f);
-    glm::mat4 view = g_app.camera.view_matrix();
+    glm::mat4 view = app->camera.view_matrix();
     glm::mat4 model = glm::mat4(1.0f);
     glm::mat4 mvp = projection * view * model;
 
