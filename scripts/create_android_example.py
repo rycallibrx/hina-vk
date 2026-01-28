@@ -325,8 +325,11 @@ def create_android_example(example_name: str, force: bool = False) -> bool:
     template_cmake = ANDROID_EXAMPLES_DIR / "_template/CMakeLists.txt"
     if template_cmake.exists():
         cmake_content = template_cmake.read_text()
-        # Replace template project name and source path
+        # Replace template project name and example selector.
         cmake_content = cmake_content.replace("project(example ", f"project({example_name} ")
+        cmake_content = cmake_content.replace('set(HINA_ANDROID_EXAMPLE_NAME "triangle")', f'set(HINA_ANDROID_EXAMPLE_NAME "{example_name}")')
+
+        # Back-compat if the template still uses the old hardcoded main.cpp path.
         cmake_content = cmake_content.replace("${HINA_EXAMPLES}/triangle/main.cpp", f"${{HINA_EXAMPLES}}/{example_name}/main.cpp")
         (android_example_path / "CMakeLists.txt").write_text(cmake_content)
     else:

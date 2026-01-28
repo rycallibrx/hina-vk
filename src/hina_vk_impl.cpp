@@ -61,8 +61,12 @@ void hina_tracy_vk_context_name(void* ctx, const char* name)
 #endif
 
 #ifndef HINA_NO_SHADER_COMPILER
+
+#if !defined(HINA_NO_SPIRV_LINT)
+
 #include <spirv-tools/linter.hpp>
 #include <string>
+
 extern "C" {
 
 // Catches divergent derivatives (valid SPIR-V but undefined behavior)
@@ -105,4 +109,27 @@ void hina_spirv_lint_cleanup(void)
 }
 
 }
-#endif
+
+#else
+
+extern "C" {
+
+bool hina_spirv_lint(const uint32_t*, size_t)
+{
+    return true;
+}
+
+const char* hina_spirv_lint_get_warnings(void)
+{
+    return nullptr;
+}
+
+void hina_spirv_lint_cleanup(void)
+{
+}
+
+}
+
+#endif // !HINA_NO_SPIRV_LINT
+
+#endif // !HINA_NO_SHADER_COMPILER
