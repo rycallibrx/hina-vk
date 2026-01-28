@@ -7894,16 +7894,16 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   // - Vulkan 1.0: No pNext chaining, use pEnabledFeatures instead
   // - VkPhysicalDeviceVulkan12Features is only valid for 1.2+
   // - VkPhysicalDeviceVulkan13Features is only valid for 1.3+
-  void** last_pNext = NULL;
+  VkBaseOutStructure** last_pNext = NULL;
   if (!is_vk10)
   {
     feats2.pNext = NULL;
-    last_pNext = &feats2.pNext;
+    last_pNext = (VkBaseOutStructure**)&feats2.pNext;
 #define HINA_APPEND_PNEXT(last, node)                  \
   do                                                   \
   {                                                    \
-    *(last) = (node);                                  \
-    (last) = &((VkBaseOutStructure*)(node))->pNext;    \
+    *(last) = (VkBaseOutStructure*)(node);             \
+    (last) = &(*(last))->pNext;                        \
   } while (0)
     if (is_vk13_plus)
     {

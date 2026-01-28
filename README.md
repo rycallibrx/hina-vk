@@ -506,6 +506,11 @@ abiFilters = ["arm64-v8a"]  // Add "armeabi-v7a" for older 32-bit devices
 
 **Requirements:** Android Studio, NDK r25+, API 24+ (Vulkan minimum)
 
+**Recommended workflow:** build/run from Android Studio.
+
+- Open the `android/` Gradle project.
+- Select an example module (e.g. `triangle`, `pipelines`) and run it on a device.
+
 ### Using in Your Project
 
 The library is just a few files:
@@ -640,8 +645,11 @@ desc.max_api_version = HINA_VK_VERSION_1_0;  // Force Vulkan 1.0 path
 | Toolchain | Version | Notes |
 |-----------|---------|-------|
 | MSVC | 2022 (v143) | Primary development |
-| GCC | 13+ (MinGW-w64) | Windows cross-compile |
+| GCC | MSYS2 MinGW-w64 | Windows cross-compile |
 | Clang | NDK r26+ | Android builds |
+
+Note: The Android examples are built with the NDK's Clang toolchain. For GCC on Windows, MSYS2 provides a MinGW-w64 toolchain.
+Note: Tracy's Windows ETW backend does not compile under MinGW in this setup, so `HINA_VK_ENABLE_TRACY=OFF` is used for the GCC build check.
 
 **Requirements:** C11, C++17 (for volk/VMA implementation files)
 

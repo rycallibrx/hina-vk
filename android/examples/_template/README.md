@@ -16,18 +16,20 @@ This is a template for creating new Android examples. Follow these steps to port
    - Edit `AndroidManifest.xml`: Change activity class to `com.hinavk.YOUR_EXAMPLE.VulkanActivity`
 
 3. **Update CMakeLists.txt:**
-   - Change `project(example ...)` to `project(YOUR_EXAMPLE ...)`
-   - Update the source file path to point to your example's `main.cpp`
+    - Change `project(example ...)` to `project(YOUR_EXAMPLE ...)`
+    - Update `set(HINA_ANDROID_EXAMPLE_NAME "...")` to match your example folder under `examples/`
+
+   The Android examples share the native build logic via `android/cmake/hina_android_example_common.cmake`.
 
 4. **Copy shaders:**
    - Copy your `.hina_sl` shader files to `src/main/assets/shaders/`
    - Or update `build.gradle` to copy from your example directory
 
 5. **Build:**
-   ```bash
-   cd android
-   ./gradlew :YOUR_EXAMPLE:assembleDebug
-   ```
+    ```bash
+    cd android
+    ./gradlew :YOUR_EXAMPLE:assembleDebug
+    ```
 
 6. **Install:**
    ```bash
