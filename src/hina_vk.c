@@ -2067,6 +2067,9 @@ typedef struct hina_rp_cache_table
 
 #define HINA_FB_CACHE_SIZE 32
 #define HINA_FB_MAX_ATTACHMENTS (HINA_MAX_COLOR_ATTACHMENTS + 1)
+#define HINA_FB_COUNT_OVERFLOW 7u
+HINA_STATIC_ASSERT(HINA_FB_MAX_ATTACHMENTS < HINA_FB_COUNT_OVERFLOW, hina_fb_overflow_tag_requires_free_count_bits);
+#define HINA_FB_MAX_ATTACHMENTS_LARGE (HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES + HINA_MAX_COLOR_ATTACHMENTS + 1)
 // Pack frame counter (29 bits) and attachment count (3 bits) into 32 bits
 #define HINA_FB_PACK_LAST_USED(frame, count) (((uint32_t)(count) << 29) | ((frame) & 0x1FFFFFFF))
 #define HINA_FB_UNPACK_FRAME(val) ((val) & 0x1FFFFFFF)
@@ -2084,9 +2087,17 @@ typedef struct hina_fb_cache_entry
 
 HINA_STATIC_ASSERT(sizeof(hina_fb_cache_entry) == 64, hina_fb_cache_entry_is_one_cache_line);
 
+typedef struct hina_fb_overflow_entry
+{
+  VkImageView* attachments;
+  uint32_t count;
+  uint32_t hash;
+} hina_fb_overflow_entry;
+
 typedef struct hina_fb_cache_table
 {
   hina_fb_cache_entry entries[HINA_FB_CACHE_SIZE];
+  hina_fb_overflow_entry overflow[HINA_FB_CACHE_SIZE];
   uint32_t count;
 } hina_fb_cache_table;
 
@@ -2894,6 +2905,23 @@ typedef struct hina_cmd_legacy_bindings
   uint8_t pad_[3];
 } hina_cmd_legacy_bindings;
 
+#define HINA_CMD_DEFERRED_DESTROY_BLOCK_CAP 32u
+
+typedef struct hina_cmd_deferred_destroy
+{
+  uint64_t handle;
+  uint32_t kind;
+  uint32_t pad_;
+} hina_cmd_deferred_destroy;
+
+typedef struct hina_cmd_deferred_destroy_block
+{
+  struct hina_cmd_deferred_destroy_block* next;
+  uint32_t count;
+  uint32_t pad_;
+  hina_cmd_deferred_destroy entries[HINA_CMD_DEFERRED_DESTROY_BLOCK_CAP];
+} hina_cmd_deferred_destroy_block;
+
 // Layout optimized by cache line sorting (not hot/cold separation)
 // Hot path: explicit bind groups only
 // Legacy slot bindings are kept in an optional cold allocation.
@@ -2946,6 +2974,8 @@ struct hina_cmd
   // Cache line 2+: cold / large data
   hina_texture_view color_views[HINA_MAX_COLOR_ATTACHMENTS];
   hina_texture_view resolve_views[HINA_MAX_COLOR_ATTACHMENTS]; // MSAA resolve targets
+  hina_cmd_deferred_destroy_block* deferred_destroy_head;
+  hina_cmd_deferred_destroy_block* deferred_destroy_tail;
   // Tile pass: track ALL color attachments across all subpasses for end-of-pass tracking updates
   // Inline array - cmd is already frame-temporary, so no point in separate allocation
   // Without this, only the final subpass's attachments get their tracking updated (visibility buffer bug)
@@ -3632,6 +3662,69 @@ static void hina_flush_pending_staging_for_destroy(hina_context* ctx)
   }
 }
 
+static void hina_cmd_defer_destroy_push(hina_cmd* cmd, hina_zombie_kind kind, uint64_t handle)
+{
+  HINA_ASSERT(cmd && handle);
+  hina_cmd_deferred_destroy_block* block = cmd->deferred_destroy_tail;
+  if (!block || block->count >= HINA_CMD_DEFERRED_DESTROY_BLOCK_CAP)
+  {
+    block = hina_frame_temp_alloc(cmd->ctx, sizeof(hina_cmd_deferred_destroy_block), 16);
+    if (!block)
+    {
+      hina_zombie_entry sync_entry = {
+        .handle = handle, .allocation = 0, .ticket = 0, .kind = (uint32_t)kind, .pad_ = 0
+      };
+      hina_destroy_zombie_fast(cmd->ctx, &sync_entry);
+      return;
+    }
+    block->next = NULL;
+    block->count = 0;
+    if (cmd->deferred_destroy_tail) cmd->deferred_destroy_tail->next = block;
+    else cmd->deferred_destroy_head = block;
+    cmd->deferred_destroy_tail = block;
+  }
+  block->entries[block->count++] = (hina_cmd_deferred_destroy){
+    .handle = handle, .kind = (uint32_t)kind, .pad_ = 0
+  };
+}
+
+static void hina_cmd_flush_deferred_destroys(hina_context* ctx, hina_cmd* cmd, uint64_t ticket)
+{
+  HINA_ASSERT(cmd);
+  hina_cmd_deferred_destroy_block* block = cmd->deferred_destroy_head;
+  if (!block) return;
+  if (!ticket)
+  {
+    for (; block; block = block->next)
+    {
+      for (uint32_t i = 0; i < block->count; ++i)
+      {
+        hina_zombie_entry sync_entry = {
+          .handle = block->entries[i].handle, .allocation = 0, .ticket = 0, .kind = block->entries[i].kind, .pad_ = 0
+        };
+        hina_destroy_zombie_fast(ctx, &sync_entry);
+      }
+    }
+    cmd->deferred_destroy_head = NULL;
+    cmd->deferred_destroy_tail = NULL;
+    return;
+  }
+  uint8_t lane_idx = hina_ticket_lane(ticket);
+  HINA_ASSERT(lane_idx < HINA_MAX_QUEUE_LANES);
+  hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
+  HINA_ASSERT(lane->valid && lane->zombies);
+  for (; block; block = block->next)
+  {
+    for (uint32_t i = 0; i < block->count; ++i)
+    {
+      hina_push_zombie_lane_fast(ctx, lane, ticket, (hina_zombie_kind)block->entries[i].kind,
+                                 block->entries[i].handle, 0);
+    }
+  }
+  cmd->deferred_destroy_head = NULL;
+  cmd->deferred_destroy_tail = NULL;
+}
+
 static void hina_defer_destroy_fast(hina_context* ctx, hina_zombie_kind kind, uint64_t handle, uint64_t allocation)
 {
   hina_flush_pending_staging_for_destroy(ctx);
@@ -3690,6 +3783,28 @@ static void hina_defer_destroy_fast(hina_context* ctx, hina_zombie_kind kind, ui
   mtx_unlock(&dev->lock.zombie_lock);
 }
 
+static void hina_defer_destroy_framebuffer(hina_context* ctx, hina_cmd* cmd, VkFramebuffer fb)
+{
+  if (!fb) return;
+  if (cmd && cmd->recording)
+  {
+    hina_cmd_defer_destroy_push(cmd, HINA_ZOMBIE_FRAMEBUFFER, (uint64_t)(uintptr_t)fb);
+    return;
+  }
+  hina_defer_destroy_fast(ctx, HINA_ZOMBIE_FRAMEBUFFER, (uint64_t)(uintptr_t)fb, 0);
+}
+
+static void hina_defer_destroy_render_pass(hina_context* ctx, hina_cmd* cmd, VkRenderPass rp)
+{
+  if (!rp) return;
+  if (cmd && cmd->recording)
+  {
+    hina_cmd_defer_destroy_push(cmd, HINA_ZOMBIE_RENDER_PASS, (uint64_t)(uintptr_t)rp);
+    return;
+  }
+  hina_defer_destroy_fast(ctx, HINA_ZOMBIE_RENDER_PASS, (uint64_t)(uintptr_t)rp, 0);
+}
+
 // Convenience macros for common resource types
 #define HINA_DEFER_DESTROY_BUFFER(ctx, vk_buf, vma_alloc) \
   hina_defer_destroy_fast((ctx), HINA_ZOMBIE_BUFFER, (uint64_t)(uintptr_t)(vk_buf), (uint64_t)(uintptr_t)(vma_alloc))
@@ -3704,9 +3819,13 @@ static void hina_defer_destroy_fast(hina_context* ctx, hina_zombie_kind kind, ui
 #define HINA_DEFER_DESTROY_BIND_GROUP_LAYOUT(ctx, vk_layout) \
   hina_defer_destroy_fast((ctx), HINA_ZOMBIE_BIND_GROUP_LAYOUT, (uint64_t)(uintptr_t)(vk_layout), 0)
 #define HINA_DEFER_DESTROY_RENDER_PASS(ctx, vk_rp) \
-  hina_defer_destroy_fast((ctx), HINA_ZOMBIE_RENDER_PASS, (uint64_t)(uintptr_t)(vk_rp), 0)
+  hina_defer_destroy_render_pass((ctx), NULL, (vk_rp))
 #define HINA_DEFER_DESTROY_FRAMEBUFFER(ctx, vk_fb) \
-  hina_defer_destroy_fast((ctx), HINA_ZOMBIE_FRAMEBUFFER, (uint64_t)(uintptr_t)(vk_fb), 0)
+  hina_defer_destroy_framebuffer((ctx), NULL, (vk_fb))
+#define HINA_CMD_DEFER_DESTROY_RENDER_PASS(cmd, vk_rp) \
+  hina_defer_destroy_render_pass((cmd)->ctx, (cmd), (vk_rp))
+#define HINA_CMD_DEFER_DESTROY_FRAMEBUFFER(cmd, vk_fb) \
+  hina_defer_destroy_framebuffer((cmd)->ctx, (cmd), (vk_fb))
 
 // Legacy callback-based deferred destruction (for complex resources)
 static void hina_defer_destroy_ex(hina_context* ctx, uint64_t ticket, void (*destroy_fn)(hina_context*, void*),
@@ -6269,7 +6388,8 @@ static uint64_t hina_tile_rp_cache_key(const hina_tile_pass_desc* desc, uint32_t
 // Forward declaration - defined below
 static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const hina_tile_pass_desc* desc);
 
-static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, const hina_tile_pass_desc* desc)
+static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, hina_cmd* cmd,
+                                                            const hina_tile_pass_desc* desc)
 {
   hina_device* dev = ctx->core.device;
   const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
@@ -6375,7 +6495,7 @@ static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, c
   table->entries[slot].subpass_count = (uint8_t)subpass_count;
   if (table->count < HINA_RP_CACHE_SIZE) table->count++;
   if (old_rp)
-    HINA_DEFER_DESTROY_RENDER_PASS(ctx, old_rp);
+    hina_defer_destroy_render_pass(ctx, cmd, old_rp);
   mtx_unlock(&dev->lock.legacy_cache_lock);
   return rp;
 }
@@ -10859,6 +10979,13 @@ void hina_shutdown(void)
           vkDestroyFramebuffer(dev->core.device, fb_table->entries[i].fb, NULL);
         }
       }
+      for (uint32_t i = 0; i < HINA_FB_CACHE_SIZE; ++i)
+      {
+        if (fb_table->overflow[i].attachments)
+        {
+          hina_free_host(fb_table->overflow[i].attachments);
+        }
+      }
       hina_free_host(fb_table);
       hina_atomic_store_ptr(&dev->core.backend.legacy.fb.table, NULL);
     }
@@ -11679,7 +11806,7 @@ static uint64_t hina_rp_cache_key(VkFormat color_fmt, VkSampleCountFlagBits colo
 // Lookup or create a cached render pass (with optional depth and MSAA resolve)
 // Pass depth_fmt = VK_FORMAT_UNDEFINED for color-only
 // Pass color_resolve_fmt = VK_FORMAT_UNDEFINED for no MSAA resolve
-static VkRenderPass hina_legacy_get_cached_render_pass(hina_context* ctx, VkFormat color_fmt,
+static VkRenderPass hina_legacy_get_cached_render_pass(hina_context* ctx, hina_cmd* cmd, VkFormat color_fmt,
                                                        VkSampleCountFlagBits color_samples,
                                                        VkAttachmentLoadOp color_load, VkAttachmentStoreOp color_store,
                                                        VkImageLayout color_initial, VkImageLayout color_final,
@@ -11764,7 +11891,7 @@ static VkRenderPass hina_legacy_get_cached_render_pass(hina_context* ctx, VkForm
   table->clock = new_clock;
   if (old_rp)
   {
-    HINA_DEFER_DESTROY_RENDER_PASS(ctx, old_rp);
+    hina_defer_destroy_render_pass(ctx, cmd, old_rp);
   }
   mtx_unlock(&dev->lock.legacy_cache_lock);
   return rp;
@@ -11786,27 +11913,33 @@ static HINA_INLINE uint32_t hina_fb_hash(VkRenderPass rp, uint32_t w, uint32_t h
   return hash;
 }
 
-static VkFramebuffer hina_legacy_get_cached_framebuffer(hina_context* ctx, VkRenderPass rp, uint32_t width,
-                                                        uint32_t height, const VkImageView* attachments,
-                                                        uint32_t attachment_count)
+static HINA_INLINE uint32_t hina_fb_attachments_hash(const VkImageView* attachments, uint32_t count)
+{
+  uint32_t hash = 0x811c9dc5;
+  for (uint32_t i = 0; i < count; ++i)
+  {
+    uint64_t k = (uint64_t)(uintptr_t)attachments[i];
+    hash ^= (uint32_t)(k & 0xFFFFFFFF);
+    hash *= 0x01000193;
+    hash ^= (uint32_t)(k >> 32);
+    hash *= 0x01000193;
+  }
+  hash ^= count;
+  hash *= 0x01000193;
+  return hash;
+}
+
+static VkFramebuffer hina_legacy_get_cached_framebuffer(hina_context* ctx, hina_cmd* cmd, VkRenderPass rp,
+                                                        uint32_t width, uint32_t height,
+                                                        const VkImageView* attachments, uint32_t attachment_count)
 {
   hina_device* dev = ctx->core.device;
   HINA_ASSERT(attachment_count > 0);
-  if (attachment_count > HINA_FB_MAX_ATTACHMENTS)
-  {
-    const VkFramebufferCreateInfo fb_info = {
-      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = attachment_count,
-      .pAttachments = attachments, .width = width, .height = height, .layers = 1
-    };
-    VkFramebuffer fb = VK_NULL_HANDLE;
-    if (vkCreateFramebuffer(dev->core.device, &fb_info, NULL, &fb) != VK_SUCCESS)
-    {
-      return VK_NULL_HANDLE;
-    }
-    hina_set_object_namef(ctx, (uint64_t)fb, VK_OBJECT_TYPE_FRAMEBUFFER, "hina_framebuffer_tmp_%ux%u", width, height);
-    HINA_DEFER_DESTROY_FRAMEBUFFER(ctx, fb);
-    return fb;
-  }
+  HINA_ASSERTF(attachment_count <= HINA_FB_MAX_ATTACHMENTS_LARGE,
+               "attachment_count exceeds FB cache bounds: %u > %u", attachment_count, HINA_FB_MAX_ATTACHMENTS_LARGE);
+  const bool overflow = attachment_count > HINA_FB_MAX_ATTACHMENTS;
+  const uint32_t count_tag = overflow ? HINA_FB_COUNT_OVERFLOW : attachment_count;
+  const uint32_t attach_hash = overflow ? hina_fb_attachments_hash(attachments, attachment_count) : 0;
   uint32_t key = hina_fb_hash(rp, width, height);
   uint32_t mask = HINA_FB_CACHE_SIZE - 1;
   uint32_t start = key & mask;
@@ -11822,21 +11955,36 @@ static VkFramebuffer hina_legacy_get_cached_framebuffer(hina_context* ctx, VkRen
       VkFramebuffer cached_fb = (VkFramebuffer)hina_atomic_load64((hina_atomic64_t*)&e->fb);
       if (!cached_fb) break;
       if (e->rp == rp && e->width == width && e->height == height && HINA_FB_UNPACK_COUNT(e->last_used_count) ==
-        attachment_count)
+        count_tag)
       {
         bool match = true;
-        for (uint32_t j = 0; j < attachment_count; ++j)
+        if (overflow)
         {
-          if (e->attachments[j] != attachments[j])
+          hina_fb_overflow_entry* ov = &table->overflow[idx];
+          if (ov->count == attachment_count && ov->hash == attach_hash && ov->attachments)
+          {
+            if (memcmp(ov->attachments, attachments, attachment_count * sizeof(VkImageView)) != 0) match = false;
+          }
+          else
           {
             match = false;
-            break;
+          }
+        }
+        else
+        {
+          for (uint32_t j = 0; j < attachment_count; ++j)
+          {
+            if (e->attachments[j] != attachments[j])
+            {
+              match = false;
+              break;
+            }
           }
         }
         if (match)
         {
           uint32_t old_frame = HINA_FB_UNPACK_FRAME(e->last_used_count);
-          if (frame - old_frame >= 8) e->last_used_count = HINA_FB_PACK_LAST_USED(frame, attachment_count);
+          if (frame - old_frame >= 8) e->last_used_count = HINA_FB_PACK_LAST_USED(frame, count_tag);
           return cached_fb;
         }
       }
@@ -11852,15 +12000,30 @@ static VkFramebuffer hina_legacy_get_cached_framebuffer(hina_context* ctx, VkRen
       hina_fb_cache_entry* e = &table->entries[idx];
       if (!e->fb) break;
       if (e->rp == rp && e->width == width && e->height == height && HINA_FB_UNPACK_COUNT(e->last_used_count) ==
-        attachment_count)
+        count_tag)
       {
         bool match = true;
-        for (uint32_t j = 0; j < attachment_count; ++j)
+        if (overflow)
         {
-          if (e->attachments[j] != attachments[j])
+          hina_fb_overflow_entry* ov = &table->overflow[idx];
+          if (ov->count == attachment_count && ov->hash == attach_hash && ov->attachments)
+          {
+            if (memcmp(ov->attachments, attachments, attachment_count * sizeof(VkImageView)) != 0) match = false;
+          }
+          else
           {
             match = false;
-            break;
+          }
+        }
+        else
+        {
+          for (uint32_t j = 0; j < attachment_count; ++j)
+          {
+            if (e->attachments[j] != attachments[j])
+            {
+              match = false;
+              break;
+            }
           }
         }
         if (match)
@@ -11920,14 +12083,32 @@ static VkFramebuffer hina_legacy_get_cached_framebuffer(hina_context* ctx, VkRen
   target->rp = rp;
   target->width = (uint16_t)width;
   target->height = (uint16_t)height;
-  memcpy(target->attachments, attachments, attachment_count * sizeof(VkImageView));
-  target->last_used_count = HINA_FB_PACK_LAST_USED((uint32_t)ctx->frame.frame_index, attachment_count);
+  if (overflow)
+  {
+    hina_fb_overflow_entry* ov = &table->overflow[slot];
+    if (!ov->attachments)
+    {
+      ov->attachments = hina_alloc_host(sizeof(VkImageView) * HINA_FB_MAX_ATTACHMENTS_LARGE);
+    }
+    memcpy(ov->attachments, attachments, attachment_count * sizeof(VkImageView));
+    ov->count = attachment_count;
+    ov->hash = attach_hash;
+  }
+  else
+  {
+    memcpy(target->attachments, attachments, attachment_count * sizeof(VkImageView));
+    // Invalidate any stale overflow data at this slot (non-overflow evicting overflow)
+    hina_fb_overflow_entry* ov = &table->overflow[slot];
+    ov->count = 0;
+    ov->hash = 0;
+  }
+  target->last_used_count = HINA_FB_PACK_LAST_USED((uint32_t)ctx->frame.frame_index, count_tag);
   // Store fb last with release semantics so readers see consistent entry
   hina_atomic_store64((hina_atomic64_t*)&target->fb, (int64_t)(uintptr_t)fb);
   if (table->count < HINA_FB_CACHE_SIZE) table->count++;
   if (old_fb)
   {
-    HINA_DEFER_DESTROY_FRAMEBUFFER(ctx, old_fb);
+    hina_defer_destroy_framebuffer(ctx, cmd, old_fb);
   }
   mtx_unlock(&dev->lock.legacy_cache_lock);
   return fb;
@@ -14542,7 +14723,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
       VkSampleCountFlagBits vk_samples = hina_samples_to_vk(desc->samples);
       HINA_LOGI(ctx, "Creating pipeline render pass: color_fmt=%d, depth_fmt=%d, samples=%d", (int)legacy_color_fmt,
                 (int)legacy_depth_fmt, (int)vk_samples);
-      rp = hina_legacy_get_cached_render_pass(ctx, legacy_color_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
+      rp = hina_legacy_get_cached_render_pass(ctx, NULL, legacy_color_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
                                               VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_UNDEFINED,
                                               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_UNDEFINED,
                                               legacy_depth_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
@@ -16107,7 +16288,7 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
       // Use COLOR_ATTACHMENT_OPTIMAL as final layout - explicit transitions handle the rest
       HINA_LOGI(ctx, "Creating pipeline render pass (module): color_fmt=%d, depth_fmt=%d, samples=%d",
                 (int)legacy_color_fmt, (int)legacy_depth_fmt, (int)vk_samples);
-      rp = hina_legacy_get_cached_render_pass(ctx, legacy_color_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
+      rp = hina_legacy_get_cached_render_pass(ctx, NULL, legacy_color_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
                                               VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_UNDEFINED,
                                               VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_UNDEFINED,
                                               legacy_depth_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
@@ -16495,6 +16676,10 @@ hina_cmd* hina_ctx_cmd_begin_ex(hina_context* ctx, hina_queue queue)
   // Initialize dynamic state to "unset" values (will trigger first-time set)
   cmd->dynamic_state.line_width = -1.0f; // Invalid, forces first set
   cmd->dynamic_state.depth_bias_enable = true; // Invalid (target is false), forces first set
+  cmd->dynamic_state.depth_bias_constant = 0.0f;
+  cmd->dynamic_state.depth_bias_clamp = 0.0f;
+  cmd->dynamic_state.depth_bias_slope = 0.0f;
+  cmd->dynamic_state.depth_bias_set = false;
   // Viewport/scissor: use impossible values so first set always goes through
   cmd->dynamic_state.viewport_w = -1.0f;
   cmd->dynamic_state.scissor_w = UINT32_MAX;
@@ -16657,6 +16842,10 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
       color_final = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
       cmd->uses_swapchain = true;
     }
+    else
+    {
+      color_final = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
     hina_texture_view depth_view_handle = action->depth.image;
     hina_texture_view_slot* depth_view_slot = NULL;
     VkImageView depth_view = hina_get_or_create_view(depth_view_handle, VK_IMAGE_ASPECT_DEPTH_BIT, &depth_view_slot);
@@ -16709,7 +16898,7 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
       cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE};
     }
     // Get cached render pass with MSAA support
-    VkRenderPass rp = hina_legacy_get_cached_render_pass(ctx, color_fmt, color_samples, color_load, color_store,
+    VkRenderPass rp = hina_legacy_get_cached_render_pass(ctx, cmd, color_fmt, color_samples, color_load, color_store,
                                                          color_initial, color_final, color_resolve_fmt, depth_fmt,
                                                          depth_samples, depth_load, depth_store);
     if (rp == VK_NULL_HANDLE)
@@ -16718,9 +16907,9 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
       return;
     }
     // Get cached framebuffer
-    VkFramebuffer framebuffer = hina_legacy_get_cached_framebuffer(ctx, rp, color_hot->dims.width,
-                                                                   color_hot->dims.height, attachments,
-                                                                   attachment_count);
+    VkFramebuffer framebuffer = hina_legacy_get_cached_framebuffer(ctx, cmd, rp, color_hot->dims.width,
+                                                                    color_hot->dims.height, attachments,
+                                                                    attachment_count);
     if (framebuffer == VK_NULL_HANDLE)
     {
       HINA_ZONE_END();
@@ -17164,16 +17353,29 @@ HINA_NOINLINE static void hina_cmd_end_pass_legacy(hina_cmd* cmd)
   HINA_ZONE_N("end_pass_leg");
   vkCmdEndRenderPass(cmd->vk_cmd);
   // Sync tracked state with render pass finalLayout (no barriers needed - render pass handles transitions)
-  if (cmd->color_count && hina_texture_view_slot_valid(cmd->color_views[0]))
+  for (uint32_t i = 0; i < cmd->color_count; ++i)
   {
-    uint16_t view_idx = hina_id_index(cmd->color_views[0].id);
+    hina_texture_view view = cmd->color_views[i];
+    if (!hina_texture_view_slot_valid(view)) continue;
+    uint16_t view_idx = hina_id_index(view.id);
     hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
     hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx);
     if (hot->owns_image)
     {
-      hot->state.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      hot->state.access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
-      hot->state.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+      bool has_resolve = hina_texture_view_slot_valid(cmd->resolve_views[i]);
+      if (has_resolve)
+      {
+        hot->state.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        hot->state.access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+        hot->state.stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+      }
+      else
+      {
+        hina_layout_state target = hina_layout_for_hint(HINA_TEXSTATE_SHADER_READ);
+        hot->state.layout = target.layout;
+        hot->state.access = target.access;
+        hot->state.stages = target.stages;
+      }
     }
     else
     {
@@ -17182,22 +17384,25 @@ HINA_NOINLINE static void hina_cmd_end_pass_legacy(hina_cmd* cmd)
       hot->state.stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     }
   }
-  if (cmd->color_count && hina_texture_view_slot_valid(cmd->resolve_views[0]))
+  for (uint32_t i = 0; i < cmd->color_count; ++i)
   {
-    uint16_t view_idx = hina_id_index(cmd->resolve_views[0].id);
+    hina_texture_view resolve_view = cmd->resolve_views[i];
+    if (!hina_texture_view_slot_valid(resolve_view)) continue;
+    uint16_t view_idx = hina_id_index(resolve_view.id);
     hina_texture_view_slot* view_slot = hina_texture_view_slot_get(view_idx);
-    hina_texture_hot* resolve_hot = HINA_TEX_HOT(view_slot->parent_idx);
-    if (!resolve_hot->owns_image)
+    hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx);
+    if (!hot->owns_image)
     {
-      resolve_hot->state.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-      resolve_hot->state.access = 0;
-      resolve_hot->state.stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+      hot->state.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+      hot->state.access = 0;
+      hot->state.stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     }
     else
     {
-      resolve_hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-      resolve_hot->state.access = VK_ACCESS_SHADER_READ_BIT;
-      resolve_hot->state.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+      hina_layout_state target = hina_layout_for_hint(HINA_TEXSTATE_SHADER_READ);
+      hot->state.layout = target.layout;
+      hot->state.access = target.access;
+      hot->state.stages = target.stages;
     }
   }
   if (hina_texture_view_slot_valid(cmd->depth_view))
@@ -17896,7 +18101,7 @@ HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_
   const uint32_t subpass_count = hina_count_tile_subpasses_desc(desc);
   bool uses_swapchain = false;
   const uint32_t last_sp = subpass_count - 1;
-  VkRenderPass render_pass = hina_legacy_get_cached_tile_render_pass(ctx, desc);
+  VkRenderPass render_pass = hina_legacy_get_cached_tile_render_pass(ctx, cmd, desc);
   if (render_pass == VK_NULL_HANDLE)
   {
     HINA_LOGE(ctx, "hina_begin_tile_pass: failed to create render pass");
@@ -17967,8 +18172,8 @@ HINA_NOINLINE static bool hina_begin_tile_pass_legacy(hina_cmd* cmd, const hina_
   }
   HINA_ASSERTF(render_width > 0 && render_height > 0,
                "hina_begin_tile_pass: could not determine render extent (no valid attachments?)");
-  VkFramebuffer framebuffer = hina_legacy_get_cached_framebuffer(ctx, render_pass, render_width, render_height,
-                                                                 fb_views, fb_view_count);
+  VkFramebuffer framebuffer = hina_legacy_get_cached_framebuffer(ctx, cmd, render_pass, render_width, render_height,
+                                                                  fb_views, fb_view_count);
   if (framebuffer == VK_NULL_HANDLE)
   {
     HINA_LOGE(ctx, "hina_begin_tile_pass: failed to create framebuffer");
@@ -18316,13 +18521,14 @@ void hina_cmd_bind_pipeline(hina_cmd* cmd, hina_pipeline pip)
     }
     // Depth bias: only set if different from tracked state
     const float target_bias_const = 0.0f, target_bias_clamp = 0.0f, target_bias_slope = 0.0f;
-    if (cmd->dynamic_state.depth_bias_constant != target_bias_const || cmd->dynamic_state.depth_bias_clamp !=
-      target_bias_clamp || cmd->dynamic_state.depth_bias_slope != target_bias_slope)
+    if (!cmd->dynamic_state.depth_bias_set || cmd->dynamic_state.depth_bias_constant != target_bias_const ||
+      cmd->dynamic_state.depth_bias_clamp != target_bias_clamp || cmd->dynamic_state.depth_bias_slope != target_bias_slope)
     {
       vkCmdSetDepthBias(cmd->vk_cmd, target_bias_const, target_bias_clamp, target_bias_slope);
       cmd->dynamic_state.depth_bias_constant = target_bias_const;
       cmd->dynamic_state.depth_bias_clamp = target_bias_clamp;
       cmd->dynamic_state.depth_bias_slope = target_bias_slope;
+      cmd->dynamic_state.depth_bias_set = true;
     }
     // Blend constants: only set if different from tracked state
     const float target_blend[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -19804,9 +20010,14 @@ void hina_cmd_set_depth_bias(hina_cmd* cmd, float constant, float slope, float c
   {
     VkBool32 enable = constant != 0.0f || slope != 0.0f ? VK_TRUE : VK_FALSE;
     vkCmdSetDepthBiasEnable(cmd->vk_cmd, enable);
+    cmd->dynamic_state.depth_bias_enable = enable == VK_TRUE;
   }
   // Always set values (1.0 core)
   vkCmdSetDepthBias(cmd->vk_cmd, constant, clamp, slope);
+  cmd->dynamic_state.depth_bias_constant = constant;
+  cmd->dynamic_state.depth_bias_clamp = clamp;
+  cmd->dynamic_state.depth_bias_slope = slope;
+  cmd->dynamic_state.depth_bias_set = true;
 }
 
 void hina_cmd_set_blend_color(hina_cmd* cmd, const float color[4])
@@ -20503,6 +20714,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
       hina_atomic_dec32(&owner_ctx->cmd.immediate_active[q]);
     }
     HINA_LOGE(ctx, "submission queue full");
+    hina_cmd_flush_deferred_destroys(ctx, cmd, 0);
     HINA_ZONE_END();
     return 0;
   }
@@ -20663,6 +20875,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
     if (HINA_UNLIKELY(submit_result != VK_SUCCESS) && !hina_vk_check_with_msg(
       ctx, submit_result, "vkQueueSubmit2", __FILE__, __LINE__, "queue submit failed"))
     {
+      hina_cmd_flush_deferred_destroys(ctx, cmd, 0);
       hina_release_submission_slot(slot);
       HINA_ZONE_END();
       return 0;
@@ -20808,6 +21021,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
     if (HINA_UNLIKELY(submit_result != VK_SUCCESS) && !hina_vk_check_with_msg(
       ctx, submit_result, "vkQueueSubmit", __FILE__, __LINE__, "queue submit failed"))
     {
+      hina_cmd_flush_deferred_destroys(ctx, cmd, 0);
       hina_release_submission_slot(slot);
       HINA_ZONE_END();
       return 0;
@@ -20816,6 +21030,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
     timeline_value = signal_value;
     ticket = hina_ticket_encode((uint8_t)lane_idx, signal_value);
   }
+  hina_cmd_flush_deferred_destroys(ctx, cmd, ticket);
   if (has_timeline)
   {
     hina_atomic_inc64(&ctx->core.device->sync.timeline.value);
@@ -21659,6 +21874,13 @@ static void hina_destroy_swapchain(hina_context* ctx)
         vkDestroyFramebuffer(ctx->core.device->core.device, fb_table->entries[i].fb, NULL);
       }
     }
+    for (uint32_t i = 0; i < HINA_FB_CACHE_SIZE; ++i)
+    {
+      if (fb_table->overflow[i].attachments)
+      {
+        hina_free_host(fb_table->overflow[i].attachments);
+      }
+    }
     hina_free_host(fb_table);
     hina_atomic_store_ptr(&ctx->core.device->core.backend.legacy.fb.table, NULL);
   }
@@ -21946,7 +22168,7 @@ static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* 
   ctx->core.device->surface.swapchain.vk.extent = extent;
   if (!vkCmdBeginRendering)
   {
-    hina_legacy_get_cached_render_pass(ctx, chosen.format, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD,
+    hina_legacy_get_cached_render_pass(ctx, NULL, chosen.format, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD,
                                        VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_UNDEFINED,
                                        VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT, 0, 0);
