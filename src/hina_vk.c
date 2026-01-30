@@ -2780,6 +2780,7 @@ typedef struct hina_device
     bool prefer_integrated; // 1  Prefer integrated GPU for power savings
     bool force_separate_families; // 1  Force compute to separate queue family (tests ownership)
     bool force_legacy_tile_pass; // 1  Force legacy multi-subpass tile pass (tests VK 1.0-1.3)
+    bool has_debug_utils; // 1  VK_EXT_debug_utils enabled on instance (see extension guard policy)
   } config;
 
   // Locks (pools use internal spinlocks, these are for other subsystems)
@@ -7294,6 +7295,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
     ici.ppEnabledExtensionNames = default_exts;
     HINA_LOGI(ctx, "using %u default instance extensions", ext_count);
   }
+  ctx->core.device->config.has_debug_utils = has_debug_utils;
   // Only attach debug messenger if VK_EXT_debug_utils is enabled
   if (has_debug_utils && (ctx->core.device->config.log_fn || ctx->core.device->config.enable_validation))
   {
@@ -7736,7 +7738,10 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   const char* const* dev_exts = NULL;
   uint32_t dev_ext_count = 0;
   uint32_t default_ext_count = 0;
-  const char* default_exts[16]; // Increased for internal extension support
+  uint32_t default_ext_cap = 16;
+  const char* default_exts_stack[16];
+  const char** default_exts = default_exts_stack;
+  bool default_exts_heap = false;
   enum { HINA_MAX_STACK_DEVICE_EXTS = 64 };
   const char* merged_exts_stack[HINA_MAX_STACK_DEVICE_EXTS];
   const char** merged_exts = NULL;
@@ -7762,9 +7767,24 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
       }
     }
   }
+  // Push a default device extension, growing to heap if the stack buffer is full.
+#define HINA_PUSH_DEFAULT_EXT(ext_name)                                                     \
+  do {                                                                                      \
+    if (default_ext_count >= default_ext_cap) {                                             \
+      uint32_t new_cap = default_ext_cap * 2;                                               \
+      const char** grown = (const char**)hina_alloc_host(new_cap * sizeof(const char*));    \
+      if (!grown) { HINA_LOGE(ctx, "failed to grow default_exts"); goto fail_cleanup; }       \
+      memcpy(grown, default_exts, default_ext_count * sizeof(const char*));                 \
+      if (default_exts_heap) hina_free_host((void*)default_exts);                           \
+      default_exts = grown;                                                                 \
+      default_ext_cap = new_cap;                                                            \
+      default_exts_heap = true;                                                             \
+    }                                                                                       \
+    default_exts[default_ext_count++] = (ext_name);                                         \
+  } while (0)
   if (wants_surface)
   {
-    default_exts[default_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    HINA_PUSH_DEFAULT_EXT(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
   }
   // Dynamic rendering extension setup based on Vulkan version
   if (g_device_caps.has_dynamic_rendering)
@@ -7786,27 +7806,19 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
       {
         // Vulkan 1.2: need dynamic rendering extension + depth_stencil_resolve extension
         HINA_LOGI(ctx, "Using VK_KHR_dynamic_rendering extension (Vulkan 1.2 path)");
-        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-          VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
-        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-          VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME;
-        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-          VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
+        HINA_PUSH_DEFAULT_EXT(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+        HINA_PUSH_DEFAULT_EXT(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+        HINA_PUSH_DEFAULT_EXT(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
       }
       else
       {
         // Vulkan 1.1: need full extension chain
         HINA_LOGI(ctx, "Using VK_KHR_dynamic_rendering extension (Vulkan 1.1 path)");
-        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-          VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
-        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-          VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME;
-        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-          VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
-        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-          VK_KHR_MULTIVIEW_EXTENSION_NAME;
-        if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-          VK_KHR_MAINTENANCE2_EXTENSION_NAME;
+        HINA_PUSH_DEFAULT_EXT(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+        HINA_PUSH_DEFAULT_EXT(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+        HINA_PUSH_DEFAULT_EXT(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
+        HINA_PUSH_DEFAULT_EXT(VK_KHR_MULTIVIEW_EXTENSION_NAME);
+        HINA_PUSH_DEFAULT_EXT(VK_KHR_MAINTENANCE2_EXTENSION_NAME);
       }
     }
     else
@@ -7816,24 +7828,21 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
       g_device_caps.has_dynamic_rendering = false;
     }
   }
-  if (g_device_caps.has_dynamic_state2 && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  if (g_device_caps.has_dynamic_state2)
   {
-    default_exts[default_ext_count++] = VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME;
+    HINA_PUSH_DEFAULT_EXT(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
   }
-  if (g_debug_caps.has_device_fault && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  if (g_debug_caps.has_device_fault)
   {
-    default_exts[default_ext_count++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
+    HINA_PUSH_DEFAULT_EXT(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
   }
   // Timeline semaphore extension for Vulkan 1.1 (core in 1.2+)
   if (g_device_caps.has_timeline_semaphore && !is_vk13_plus && !is_vk12)
   {
     if (hina_has_device_extension(ctx->core.device->core.phys, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME))
     {
-      if (default_ext_count < HINA_ARRAY_SIZE(default_exts))
-      {
-        default_exts[default_ext_count++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
-        HINA_LOGI(ctx, "Enabling VK_KHR_timeline_semaphore extension for Vulkan 1.1");
-      }
+      HINA_PUSH_DEFAULT_EXT(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+      HINA_LOGI(ctx, "Enabling VK_KHR_timeline_semaphore extension for Vulkan 1.1");
     }
     else
     {
@@ -7844,50 +7853,43 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   // Synchronization2 extension for Vulkan 1.1/1.2 (core in 1.3+)
   if (g_debug_caps.has_synchronization2 && !is_vk13_plus)
   {
-    if (default_ext_count < HINA_ARRAY_SIZE(default_exts))
-    {
-      default_exts[default_ext_count++] = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
-      HINA_LOGI(ctx, "Enabling VK_KHR_synchronization2 extension");
-    }
+    HINA_PUSH_DEFAULT_EXT(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+    HINA_LOGI(ctx, "Enabling VK_KHR_synchronization2 extension");
   }
   // Pipeline creation feedback for Vulkan 1.1/1.2 (core in 1.3+)
   if (g_debug_caps.has_pipeline_creation_feedback && !is_vk13_plus)
   {
-    if (default_ext_count < HINA_ARRAY_SIZE(default_exts))
-    {
-      default_exts[default_ext_count++] = VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME;
-    }
+    HINA_PUSH_DEFAULT_EXT(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
   }
   // VK_EXT_memory_budget: pure extension for accurate GPU memory tracking (VMA uses it)
-  if (g_debug_caps.has_memory_budget && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  if (g_debug_caps.has_memory_budget)
   {
-    default_exts[default_ext_count++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    HINA_PUSH_DEFAULT_EXT(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
   }
   // VK_KHR_maintenance4 for Vulkan 1.1/1.2 (core in 1.3+)
-  if (g_debug_caps.has_maintenance4 && !is_vk13_plus && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  if (g_debug_caps.has_maintenance4 && !is_vk13_plus)
   {
-    default_exts[default_ext_count++] = VK_KHR_MAINTENANCE_4_EXTENSION_NAME;
+    HINA_PUSH_DEFAULT_EXT(VK_KHR_MAINTENANCE_4_EXTENSION_NAME);
   }
   // VK_KHR_maintenance5 (not core yet, always extension)
-  if (g_debug_caps.has_maintenance5 && default_ext_count < HINA_ARRAY_SIZE(default_exts))
+  if (g_debug_caps.has_maintenance5)
   {
-    default_exts[default_ext_count++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+    HINA_PUSH_DEFAULT_EXT(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
   }
   // VK_EXT_dynamic_rendering_unused_attachments: allows mismatched colorAttachmentCount
   // between pipeline and rendering (useful for tile pass with dynamic_rendering_local_read)
   if (hina_has_device_extension(ctx->core.device->core.phys,
                                 VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME))
   {
-    if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-      VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME;
+    HINA_PUSH_DEFAULT_EXT(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
   }
   // VK_KHR_dynamic_rendering_local_read: enables input attachments with dynamic rendering
   if (hina_has_device_extension(ctx->core.device->core.phys,
                                 VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
   {
-    if (default_ext_count < HINA_ARRAY_SIZE(default_exts)) default_exts[default_ext_count++] =
-      VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
+    HINA_PUSH_DEFAULT_EXT(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
   }
+#undef HINA_PUSH_DEFAULT_EXT
   if (desc->device_exts && desc->device_ext_count)
   {
     uint32_t max_ext_count = default_ext_count + desc->device_ext_count;
@@ -7903,7 +7905,7 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
     if (!merged_exts)
     {
       HINA_LOGE(ctx, "failed to allocate device extension list");
-      return false;
+      goto fail_cleanup;
     }
     uint32_t merged_count = 0;
     for (uint32_t i = 0; i < default_ext_count; ++i)
@@ -8105,19 +8107,22 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   if (!HINA_VK_CHECK_MSG(ctx, vkCreateDevice(ctx->core.device->core.phys, &dci, NULL, &ctx->core.device->core.device),
                          "creating logical device"))
   {
-    if (merged_exts_heap) hina_free_host((void*)merged_exts);
-    return false;
+    goto fail_cleanup;
   }
-  if (merged_exts_heap)
-  {
-    hina_free_host((void*)merged_exts);
-    merged_exts = NULL;
-  }
+  if (merged_exts_heap) hina_free_host((void*)merged_exts);
+  if (default_exts_heap) hina_free_host((void*)default_exts);
   ctx->core.owns_device = true;
   volkLoadDevice(ctx->core.device->core.device);
   // Patch volk function pointers: map KHR variants to core names when core is NULL.
   // This unifies dispatch so callers always use core function names regardless of API version.
   // The structs are ABI-compatible (KHR types are aliases of core types).
+  //
+  // Extension guard policy:
+  //   Device extensions:  vkGetDeviceProcAddr returns NULL for non-enabled extensions,
+  //                       so volk pointer checks (e.g. `if (vkFooEXT)`) are reliable guards.
+  //   Instance extensions: vkGetInstanceProcAddr may return non-null loader trampolines even
+  //                        for non-enabled extensions. NEVER guard on volk pointers alone.
+  //                        Store a bool (e.g. config.has_debug_utils) at init time and check that.
   if (!vkCmdBeginRendering && vkCmdBeginRenderingKHR) vkCmdBeginRendering = vkCmdBeginRenderingKHR;
   if (!vkCmdEndRendering && vkCmdEndRenderingKHR) vkCmdEndRendering = vkCmdEndRenderingKHR;
   if (!vkQueueSubmit2 && vkQueueSubmit2KHR) vkQueueSubmit2 = vkQueueSubmit2KHR;
@@ -8194,6 +8199,10 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   }
   hina_init_queue_lanes(ctx);
   return true;
+fail_cleanup:
+  if (merged_exts_heap) hina_free_host((void*)merged_exts);
+  if (default_exts_heap) hina_free_host((void*)default_exts);
+  return false;
 }
 
 static void hina_fill_caps(hina_context* ctx)
@@ -8274,12 +8283,22 @@ static void hina_fill_caps(hina_context* ctx)
     VkPhysicalDeviceSynchronization2Features sync2_feats = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES
     };
-    // Build pNext chain
+    // Build pNext chain — only include extension feature structs when the extension is available,
+    // otherwise validation layers (especially best-practices) may warn about unknown sTypes.
+    const bool phys_has_device_fault = hina_has_device_extension(
+      ctx->core.device->core.phys, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     feats.pNext = &dyn;
     dyn.pNext = &dyn2;
     dyn2.pNext = &timeline_feats;
-    timeline_feats.pNext = &fault;
-    fault.pNext = &sync2_feats;
+    if (phys_has_device_fault)
+    {
+      timeline_feats.pNext = &fault;
+      fault.pNext = &sync2_feats;
+    }
+    else
+    {
+      timeline_feats.pNext = &sync2_feats;
+    }
     sync2_feats.pNext = &dyn_local_read;
     dyn_local_read.pNext = &dyn_unused_attach;
     vkGetPhysicalDeviceFeatures2(ctx->core.device->core.phys, &feats);
@@ -8288,8 +8307,7 @@ static void hina_fill_caps(hina_context* ctx)
     g_device_caps.has_dynamic_rendering = dyn.dynamicRendering == VK_TRUE;
     g_device_caps.has_timeline_semaphore = timeline_feats.timelineSemaphore == VK_TRUE;
     g_device_caps.has_dynamic_state2 = dyn2.extendedDynamicState2 == VK_TRUE;
-    g_debug_caps.has_device_fault = fault.deviceFault == VK_TRUE && hina_has_device_extension(
-      ctx->core.device->core.phys, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    g_debug_caps.has_device_fault = fault.deviceFault == VK_TRUE && phys_has_device_fault;
     g_debug_caps.has_pipeline_creation_feedback = hina_has_device_extension(
       ctx->core.device->core.phys, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     g_debug_caps.has_subgroup_size_control = hina_has_device_extension(ctx->core.device->core.phys,
@@ -20845,7 +20863,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
       lane->submit_count++;
     }
     hina_lane_unlock(lane);
-    if (submit_result == VK_ERROR_DEVICE_LOST && g_debug_caps.has_device_fault && vkGetDeviceFaultInfoEXT)
+    if (submit_result == VK_ERROR_DEVICE_LOST && g_debug_caps.has_device_fault)
     {
       VkDeviceFaultCountsEXT counts = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
       if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, NULL) == VK_SUCCESS)
@@ -20991,7 +21009,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
       lane->submit_count++;
     }
     hina_lane_unlock(lane);
-    if (submit_result == VK_ERROR_DEVICE_LOST && g_debug_caps.has_device_fault && vkGetDeviceFaultInfoEXT)
+    if (submit_result == VK_ERROR_DEVICE_LOST && g_debug_caps.has_device_fault)
     {
       VkDeviceFaultCountsEXT counts = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
       if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, NULL) == VK_SUCCESS)
@@ -22817,7 +22835,7 @@ void hina_cmd_acquire_buffer(hina_cmd* cmd, hina_buffer buf, hina_queue src_queu
 static bool hina_debug_names_enabled(hina_context* ctx)
 {
   return ctx->core.device && ctx->core.device->core.device && ctx->core.device->config.enable_debug_names &&
-    vkSetDebugUtilsObjectNameEXT;
+    ctx->core.device->config.has_debug_utils;
 }
 
 static void hina_set_object_name(hina_context* ctx, uint64_t handle, VkObjectType type, const char* name)
@@ -22903,7 +22921,7 @@ void* hina_get_vk_command_buffer(hina_cmd* cmd)
 void hina_cmd_begin_label(hina_cmd* cmd, const char* name, float color[4])
 {
   HINA_ASSERT(cmd && name);
-  if (vkCmdBeginDebugUtilsLabelEXT)
+  if (cmd->ctx->core.device->config.has_debug_utils)
   {
     VkDebugUtilsLabelEXT label = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = name};
     if (color) memcpy(label.color, color, sizeof(float) * 4);
@@ -22914,7 +22932,7 @@ void hina_cmd_begin_label(hina_cmd* cmd, const char* name, float color[4])
 void hina_cmd_end_label(hina_cmd* cmd)
 {
   HINA_ASSERT(cmd);
-  if (vkCmdEndDebugUtilsLabelEXT)
+  if (cmd->ctx->core.device->config.has_debug_utils)
   {
     vkCmdEndDebugUtilsLabelEXT(cmd->vk_cmd);
   }
@@ -22923,7 +22941,7 @@ void hina_cmd_end_label(hina_cmd* cmd)
 void hina_cmd_insert_label(hina_cmd* cmd, const char* name, float color[4])
 {
   HINA_ASSERT(cmd && name);
-  if (vkCmdInsertDebugUtilsLabelEXT)
+  if (cmd->ctx->core.device->config.has_debug_utils)
   {
     VkDebugUtilsLabelEXT label = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = name};
     if (color) memcpy(label.color, color, sizeof(float) * 4);
