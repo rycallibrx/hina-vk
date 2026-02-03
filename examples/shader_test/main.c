@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #ifdef _WIN32
 #include <direct.h>
 #define HINA_GETCWD _getcwd
@@ -435,6 +436,19 @@ static bool test_expected_failure(const char* test_name, const char* source,
     return true;
 }
 
+static bool test_appendf(char** cursor, size_t* remaining, const char* fmt, ...)
+{
+    if (!cursor || !*cursor || !remaining || *remaining == 0) return false;
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(*cursor, *remaining, fmt, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= *remaining) return false;
+    *cursor += (size_t)written;
+    *remaining -= (size_t)written;
+    return true;
+}
+
 // Test 6: HSL Error Handling (new syntax)
 static bool test_hsl_error_handling(void) {
     printf("Test 22: New HSL error handling (expected failures)...\n");
@@ -523,6 +537,89 @@ static bool test_hsl_error_handling(void) {
         "flat_centroid.hina_sl",
         "@flat")) passed++;
 
+    // 6f: use after qualifiers (error)
+    total++;
+    if (test_expected_failure(
+        "6f: use after qualifiers",
+        "#hina\n"
+        "struct VertexIn { vec3 pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "snippet Common { }\n"
+        "#hina_end\n"
+        "#hina_stage vertex entry VSMain\n"
+        "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.pos; gl_Position = vec4(in.pos, 1.0); return o; }\n"
+        "#hina_end\n"
+        "#hina_stage fragment entry FSMain use Common depth_less\n"
+        "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+        "#hina_end\n",
+        "use_after_qual.hina_sl",
+        "use must appear")) passed++;
+
+    // 6g: use * combined with named snippets (error)
+    total++;
+    if (test_expected_failure(
+        "6g: use * combined with named",
+        "#hina\n"
+        "struct VertexIn { vec3 pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "snippet Common { }\n"
+        "#hina_end\n"
+        "#hina_stage vertex entry VSMain use * Common\n"
+        "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.pos; gl_Position = vec4(in.pos, 1.0); return o; }\n"
+        "#hina_end\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+        "#hina_end\n",
+        "use_star_named.hina_sl",
+        "use * cannot be combined")) passed++;
+
+    // 6h: Unknown snippet (error)
+    total++;
+    if (test_expected_failure(
+        "6h: Unknown snippet name",
+        "#hina\n"
+        "struct VertexIn { vec3 pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "#hina_end\n"
+        "#hina_stage vertex entry VSMain use Missing\n"
+        "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.pos; gl_Position = vec4(in.pos, 1.0); return o; }\n"
+        "#hina_end\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+        "#hina_end\n",
+        "unknown_snippet.hina_sl",
+        "Unknown snippet")) passed++;
+
+    // 6i: Too many snippets used per stage (error)
+    total++;
+    if (test_expected_failure(
+        "6i: Too many snippets used per stage",
+        "#hina\n"
+        "struct VertexIn { vec3 pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "snippet S0 { }\n"
+        "snippet S1 { }\n"
+        "snippet S2 { }\n"
+        "snippet S3 { }\n"
+        "snippet S4 { }\n"
+        "snippet S5 { }\n"
+        "snippet S6 { }\n"
+        "snippet S7 { }\n"
+        "snippet S8 { }\n"
+        "#hina_end\n"
+        "#hina_stage vertex entry VSMain use S0, S1, S2, S3, S4, S5, S6, S7, S8\n"
+        "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.pos; gl_Position = vec4(in.pos, 1.0); return o; }\n"
+        "#hina_end\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+        "#hina_end\n",
+        "use_too_many.hina_sl",
+        "Too many snippets used")) passed++;
+
     printf("  Sub-tests: %d/%d passed\n", passed, total);
     return passed == total;
 }
@@ -576,6 +673,63 @@ static bool test_glsl_errors_in_hsl(void) {
         "#hina_end\n",
         "undefined_var.hina_sl",
         "undeclared")) passed++;
+
+    // 7c: tile_load in vertex stage (GLSL error)
+    total++;
+    if (test_expected_failure(
+        "7c: tile_load in vertex stage",
+        "#hina\n"
+        "group GBuffer = 0;\n"
+        "bindings(GBuffer, start=0) {\n"
+        "  tile_input(0) gPosition;\n"
+        "}\n"
+        "struct VertexIn { vec3 pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "#hina_end\n"
+        "#hina_stage vertex entry VSMain\n"
+        "Varyings VSMain(VertexIn in) {\n"
+        "    Varyings out;\n"
+        "    vec4 p = tile_load(gPosition);\n"
+        "    out.color = p.xyz;\n"
+        "    gl_Position = vec4(in.pos, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+        "#hina_end\n",
+        "tile_load_vs.hina_sl",
+        "error")) passed++;
+
+    // 7d: Tessellation with Varyings struct (GLSL error)
+    total++;
+    if (test_expected_failure(
+        "7d: Tessellation with Varyings struct",
+        "#hina\n"
+        "struct VertexIn { vec3 pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "#hina_end\n"
+        "#hina_stage vertex entry VSMain\n"
+        "Varyings VSMain(VertexIn in) {\n"
+        "    Varyings out; out.color = in.pos;\n"
+        "    gl_Position = vec4(in.pos, 1.0); return out;\n"
+        "}\n"
+        "#hina_end\n"
+        "#hina_stage tess_control entry TCSMain\n"
+        "layout(vertices = 3) out;\n"
+        "void TCSMain() { gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position; }\n"
+        "#hina_end\n"
+        "#hina_stage tess_eval entry TESMain\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "void TESMain() { gl_Position = gl_in[0].gl_Position; }\n"
+        "#hina_end\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+        "#hina_end\n",
+        "tess_varyings_error.hina_sl",
+        "error")) passed++;
 
     printf("  Sub-tests: %d/%d passed\n", passed, total);
     return passed == total;
@@ -927,6 +1081,65 @@ static bool test_hsl_groups(void) {
         if (error_log) hslc_free_log(error_log);
     }
 
+    // C4: Set index out of range (error)
+    printf("  C4: Set index out of range (error)...\n");
+    total++;
+    {
+        const char* source =
+            "#hina\n"
+            "group Scene = 4;\n"
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings out; gl_Position = vec4(0); return out; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut out; out.color = vec4(1); return out; }\n"
+            "#hina_end\n";
+
+        char* error_log = NULL;
+        hina_hsl_module* module = hslc_compile_hsl_source(source, "c4_set_overflow.hina_sl", &error_log);
+        if (!module && error_log && strstr(error_log, "Set index exceeds maximum")) {
+            passed++;
+            printf("    Got error: %.60s...\n", error_log);
+        }
+        else { printf("    FAIL: Expected set index overflow error\n"); }
+        if (module) hslc_hsl_module_free(module);
+        if (error_log) hslc_free_log(error_log);
+    }
+
+    // C5: Duplicate set index (error)
+    printf("  C5: Duplicate set index (error)...\n");
+    total++;
+    {
+        const char* source =
+            "#hina\n"
+            "group Scene = 0;\n"
+            "group Material = 0;\n"
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings out; gl_Position = vec4(0); return out; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut out; out.color = vec4(1); return out; }\n"
+            "#hina_end\n";
+
+        char* error_log = NULL;
+        hina_hsl_module* module = hslc_compile_hsl_source(source, "c5_set_duplicate.hina_sl", &error_log);
+        if (!module && error_log && strstr(error_log, "Set index already used")) {
+            passed++;
+            printf("    Got error: %.60s...\n", error_log);
+        }
+        else { printf("    FAIL: Expected duplicate set index error\n"); }
+        if (module) hslc_hsl_module_free(module);
+        if (error_log) hslc_free_log(error_log);
+    }
+
     printf("  Groups: %d/%d passed\n", passed, total);
     return passed == total;
 }
@@ -1182,6 +1395,36 @@ static bool test_hsl_resources(void) {
         if (error_log) hslc_free_log(error_log);
     }
 
+    // D7b: Explicit binding index overflow (error)
+    printf("  D7b: Explicit binding index overflow (error)...\n");
+    total++;
+    {
+        const char* source =
+            "#hina\n"
+            "group Scene = 0;\n"
+            "binding(Scene, 32) uniform(std140) UBO { vec4 v; } ubo;\n"
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings out; return out; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut out; return out; }\n"
+            "#hina_end\n";
+
+        char* error_log = NULL;
+        hina_hsl_module* module = hslc_compile_hsl_source(source, "d7b_binding_index_over.hina_sl", &error_log);
+        if (!module && error_log && strstr(error_log, "Binding index exceeds per-group limit")) {
+            passed++;
+            printf("    Got error: %.60s...\n", error_log);
+        }
+        else { printf("    FAIL: Expected binding index overflow error\n"); }
+        if (module) hslc_hsl_module_free(module);
+        if (error_log) hslc_free_log(error_log);
+    }
+
     // D8: SSBO buffer qualifiers
     printf("  D8: SSBO buffer qualifiers...\n");
     total++;
@@ -1287,6 +1530,38 @@ static bool test_hsl_resources(void) {
         hina_hsl_module* module = hslc_compile_hsl_source(source, "d13_tile_input.hina_sl", &error_log);
         if (module) { passed++; hslc_hsl_module_free(module); }
         else { printf("    FAIL: %s\n", error_log ? error_log : "null"); }
+        if (error_log) hslc_free_log(error_log);
+    }
+
+    // D14: tile_input index out of range (error)
+    printf("  D14: tile_input index out of range (error)...\n");
+    total++;
+    {
+        const char* source =
+            "#hina\n"
+            "group GBuffer = 0;\n"
+            "bindings(GBuffer, start=0) {\n"
+            "  tile_input(4) gBad;\n"
+            "}\n"
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings out; gl_Position = vec4(0); return out; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut out; out.color = vec4(1); return out; }\n"
+            "#hina_end\n";
+
+        char* error_log = NULL;
+        hina_hsl_module* module = hslc_compile_hsl_source(source, "d14_tile_input_over.hina_sl", &error_log);
+        if (!module && error_log && strstr(error_log, "Input attachment index must be 0-3")) {
+            passed++;
+            printf("    Got error: %.60s...\n", error_log);
+        }
+        else { printf("    FAIL: Expected tile_input index error\n"); }
+        if (module) hslc_hsl_module_free(module);
         if (error_log) hslc_free_log(error_log);
     }
 
@@ -1515,6 +1790,40 @@ static bool test_hsl_io_structs(void) {
         if (error_log) hslc_free_log(error_log);
     }
 
+    // E5b: mat2x3 in VertexIn (2 locations)
+    printf("  E5b: mat2x3 in VertexIn (2 locations)...\n");
+    total++;
+    {
+        const char* source =
+            "#hina\n"
+            "struct VertexIn {\n"
+            "  vec3 position;\n"
+            "  mat2x3 basis;\n"
+            "};\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) {\n"
+            "    Varyings out; out.color = in.position;\n"
+            "    gl_Position = vec4(in.position, 1.0); return out;\n"
+            "}\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut out; out.color = vec4(in.color, 1.0); return out; }\n"
+            "#hina_end\n";
+
+        char* error_log = NULL;
+        hina_hsl_module* module = hslc_compile_hsl_source(source, "e5b_mat2x3.hina_sl", &error_log);
+        if (module) {
+            if (module->vertex_input_count == 3) { passed++; }
+            else { printf("    FAIL: Expected 3 inputs (vec3 + mat2x3), got %u\n", module->vertex_input_count); }
+            hslc_hsl_module_free(module);
+        }
+        else { printf("    FAIL: %s\n", error_log ? error_log : "null"); }
+        if (error_log) hslc_free_log(error_log);
+    }
+
     // E6: @flat interpolation modifier
     printf("  E6: @flat interpolation modifier...\n");
     total++;
@@ -1579,6 +1888,35 @@ static bool test_hsl_io_structs(void) {
 
         char* error_log = NULL;
         hina_hsl_module* module = hslc_compile_hsl_source(source, "e7_mrt.hina_sl", &error_log);
+        if (module) { passed++; hslc_hsl_module_free(module); }
+        else { printf("    FAIL: %s\n", error_log ? error_log : "null"); }
+        if (error_log) hslc_free_log(error_log);
+    }
+
+    // E8: Additional interpolation modifiers
+    printf("  E8: @noperspective @centroid modifiers...\n");
+    total++;
+    {
+        const char* source =
+            "#hina\n"
+            "struct VertexIn { vec3 pos; vec2 uv; };\n"
+            "struct Varyings {\n"
+            "  @noperspective @centroid vec2 uv;\n"
+            "};\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) {\n"
+            "    Varyings out; out.uv = in.uv;\n"
+            "    gl_Position = vec4(in.pos, 1.0); return out;\n"
+            "}\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut out; out.color = vec4(in.uv, 0.0, 1.0); return out; }\n"
+            "#hina_end\n";
+
+        char* error_log = NULL;
+        hina_hsl_module* module = hslc_compile_hsl_source(source, "e8_interp_mods.hina_sl", &error_log);
         if (module) { passed++; hslc_hsl_module_free(module); }
         else { printf("    FAIL: %s\n", error_log ? error_log : "null"); }
         if (error_log) hslc_free_log(error_log);
@@ -1769,6 +2107,35 @@ static bool test_hsl_stage_rules(void) {
         if (error_log) hslc_free_log(error_log);
     }
 
+    // F7b: depth_any qualifier (valid)
+    printf("  F7b: depth_any qualifier (valid)...\n");
+    total++;
+    {
+        const char* source =
+            "#hina\n"
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) {\n"
+            "    Varyings out; out.color = in.pos;\n"
+            "    gl_Position = vec4(in.pos, 1.0); return out;\n"
+            "}\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain depth_any\n"
+            "FragOut FSMain(Varyings in) {\n"
+            "    FragOut out; out.color = vec4(in.color, 1.0); return out;\n"
+            "}\n"
+            "#hina_end\n";
+
+        char* error_log = NULL;
+        hina_hsl_module* module = hslc_compile_hsl_source(source, "f7b_depth_any.hina_sl", &error_log);
+        if (module) { passed++; hslc_hsl_module_free(module); }
+        else { printf("    FAIL: %s\n", error_log ? error_log : "null"); }
+        if (error_log) hslc_free_log(error_log);
+    }
+
     // F8: Depth qualifier on vertex stage (error)
     printf("  F8: Depth qualifier on vertex stage (error)...\n");
     total++;
@@ -1930,6 +2297,35 @@ static bool test_hsl_compute(void) {
             printf("    Got error: %.60s...\n", error_log);
         }
         else { printf("    FAIL: Expected shared type error\n"); }
+        if (module) hslc_hsl_module_free(module);
+        if (error_log) hslc_free_log(error_log);
+    }
+
+    // Shared declarations without compute stage (error)
+    printf("  Shared declarations without compute stage (error)...\n");
+    total++;
+    {
+        const char* source =
+            "#hina\n"
+            "shared float data[4];\n"
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings out; gl_Position = vec4(in.pos, 1.0); return out; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut out; out.color = vec4(1.0); return out; }\n"
+            "#hina_end\n";
+
+        char* error_log = NULL;
+        hina_hsl_module* module = hslc_compile_hsl_source(source, "c5_shared_no_compute.hina_sl", &error_log);
+        if (!module && error_log && strstr(error_log, "Shared declarations require a compute stage")) {
+            passed++;
+            printf("    Got error: %.60s...\n", error_log);
+        }
+        else { printf("    FAIL: Expected shared declarations error\n"); }
         if (module) hslc_hsl_module_free(module);
         if (error_log) hslc_free_log(error_log);
     }
@@ -2582,6 +2978,196 @@ static bool test_hsl_reflection(void) {
     return passed == total;
 }
 
+static bool test_hsl_limits(void) {
+    printf("Test 31: HSL limits...\n");
+    int passed = 0;
+    int total = 0;
+
+    // L1: Too many specialization constants
+    total++;
+    {
+        char source[8192];
+        char* cursor = source;
+        size_t remaining = sizeof(source);
+        bool ok = true;
+        ok &= test_appendf(&cursor, &remaining, "#hina\n");
+        for (int i = 0; i < 17; i++) {
+            ok &= test_appendf(&cursor, &remaining, "spec_const(%d) int S%d = %d;\n", i, i, i);
+        }
+        ok &= test_appendf(&cursor, &remaining,
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.pos; gl_Position = vec4(in.pos, 1.0); return o; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+            "#hina_end\n");
+        if (!ok) {
+            printf("  L1: FAIL - source overflow\n");
+        } else if (test_expected_failure(
+            "L1: Too many specialization constants",
+            source,
+            "l1_spec_const_over.hina_sl",
+            "Too many specialization constants")) {
+            passed++;
+        }
+    }
+
+    // L2: Too many snippets (definitions)
+    total++;
+    {
+        char source[8192];
+        char* cursor = source;
+        size_t remaining = sizeof(source);
+        bool ok = true;
+        ok &= test_appendf(&cursor, &remaining, "#hina\n");
+        for (int i = 0; i < 17; i++) {
+            ok &= test_appendf(&cursor, &remaining, "snippet S%d { }\n", i);
+        }
+        ok &= test_appendf(&cursor, &remaining,
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.pos; gl_Position = vec4(in.pos, 1.0); return o; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+            "#hina_end\n");
+        if (!ok) {
+            printf("  L2: FAIL - source overflow\n");
+        } else if (test_expected_failure(
+            "L2: Too many snippets",
+            source,
+            "l2_snippet_over.hina_sl",
+            "Too many snippets")) {
+            passed++;
+        }
+    }
+
+    // L3: Too many struct fields
+    total++;
+    {
+        char source[16384];
+        char* cursor = source;
+        size_t remaining = sizeof(source);
+        bool ok = true;
+        ok &= test_appendf(&cursor, &remaining, "#hina\nstruct VertexIn {\n");
+        for (int i = 0; i < 33; i++) {
+            ok &= test_appendf(&cursor, &remaining, "  vec4 f%d;\n", i);
+        }
+        ok &= test_appendf(&cursor, &remaining,
+            "};\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.f0.xyz; gl_Position = vec4(in.f0.xyz, 1.0); return o; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+            "#hina_end\n");
+        if (!ok) {
+            printf("  L3: FAIL - source overflow\n");
+        } else if (test_expected_failure(
+            "L3: Too many fields in struct",
+            source,
+            "l3_struct_fields_over.hina_sl",
+            "Too many fields in struct")) {
+            passed++;
+        }
+    }
+
+    // L4: Too many shared array dimensions
+    total++;
+    if (test_expected_failure(
+        "L4: Too many shared array dimensions",
+        "#hina\n"
+        "shared float data[1][1][1][1][1];\n"
+        "#hina_end\n"
+        "#hina_stage compute entry CSMain\n"
+        "layout(local_size_x = 1) in;\n"
+        "void CSMain() { data[0][0][0][0][0] = 1.0; }\n"
+        "#hina_end\n",
+        "l4_shared_dims_over.hina_sl",
+        "Too many shared array dimensions")) passed++;
+
+    // L5: Too many resource bindings
+    total++;
+    {
+        char source[65536];
+        char* cursor = source;
+        size_t remaining = sizeof(source);
+        bool ok = true;
+        ok &= test_appendf(&cursor, &remaining, "#hina\n");
+        ok &= test_appendf(&cursor, &remaining, "group Scene = 0;\n");
+        for (int i = 0; i < 129; i++) {
+            ok &= test_appendf(&cursor, &remaining,
+                "binding(Scene, 0) uniform(std140) UBO%d { vec4 v; } u%d;\n", i, i);
+        }
+        ok &= test_appendf(&cursor, &remaining,
+            "struct VertexIn { vec3 pos; };\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.pos; gl_Position = vec4(in.pos, 1.0); return o; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+            "#hina_end\n");
+        if (!ok) {
+            printf("  L5: FAIL - source overflow\n");
+        } else if (test_expected_failure(
+            "L5: Too many resource bindings",
+            source,
+            "l5_bindings_over.hina_sl",
+            "Too many resource bindings")) {
+            passed++;
+        }
+    }
+
+    // L6: IO location overflow
+    total++;
+    {
+        char source[16384];
+        char* cursor = source;
+        size_t remaining = sizeof(source);
+        bool ok = true;
+        ok &= test_appendf(&cursor, &remaining, "#hina\nstruct VertexIn {\n");
+        for (int i = 0; i < 17; i++) {
+            ok &= test_appendf(&cursor, &remaining, "  vec4 v%d;\n", i);
+        }
+        ok &= test_appendf(&cursor, &remaining,
+            "};\n"
+            "struct Varyings { vec3 color; };\n"
+            "struct FragOut { vec4 color; };\n"
+            "#hina_end\n"
+            "#hina_stage vertex entry VSMain\n"
+            "Varyings VSMain(VertexIn in) { Varyings o; o.color = in.v0.xyz; gl_Position = vec4(in.v0.xyz, 1.0); return o; }\n"
+            "#hina_end\n"
+            "#hina_stage fragment entry FSMain\n"
+            "FragOut FSMain(Varyings in) { FragOut o; o.color = vec4(in.color, 1.0); return o; }\n"
+            "#hina_end\n");
+        if (!ok) {
+            printf("  L6: FAIL - source overflow\n");
+        } else if (test_expected_failure(
+            "L6: IO location overflow",
+            source,
+            "l6_io_locations_over.hina_sl",
+            "Struct 'VertexIn' uses")) {
+            passed++;
+        }
+    }
+
+    printf("  Limits: %d/%d passed\n", passed, total);
+    return passed == total;
+}
+
 // Test 32: Stress and Edge Cases (I1-I10)
 static bool test_hsl_stress(void) {
     printf("Test 27: HSL stress and edge cases...\n");
@@ -2943,6 +3529,94 @@ static bool test_pragma_once(void) {
     return true;
 }
 
+static bool test_pragma_once_bom(void) {
+    printf("Test 18b: #pragma once with BOM/comments...\n");
+
+    char* error_log = NULL;
+    char path[1024];
+    const char* file_path = hina_resolve_test_path(
+        path, sizeof(path),
+        "examples/shader_test/test_includes/shader_double_include_bom.hina_sl");
+    hina_hsl_module* module = hslc_compile_hsl(file_path, &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    printf("  VS: %zu bytes, FS: %zu bytes\n", module->vs.spirv_size, module->fs.spirv_size);
+    hslc_hsl_module_free(module);
+    printf("  PASSED\n");
+    return true;
+}
+
+static bool test_circular_include(void) {
+    printf("Test 18c: Circular include detection...\n");
+
+    char* error_log = NULL;
+    char path[1024];
+    const char* file_path = hina_resolve_test_path(
+        path, sizeof(path),
+        "examples/shader_test/test_includes/shader_circular_include.hina_sl");
+    hina_hsl_module* module = hslc_compile_hsl(file_path, &error_log);
+
+    if (module) {
+        printf("  UNEXPECTED SUCCESS - should have failed!\n");
+        hslc_hsl_module_free(module);
+        return false;
+    }
+
+    if (!error_log) {
+        printf("  FAIL - No error message returned\n");
+        return false;
+    }
+
+    if (strstr(error_log, "Circular include detected") != NULL) {
+        printf("  OK - Got expected error: %.120s...\n", error_log);
+        hslc_free_log(error_log);
+        printf("  PASSED\n");
+        return true;
+    }
+
+    printf("  FAIL - Unexpected error: %.120s...\n", error_log);
+    hslc_free_log(error_log);
+    return false;
+}
+
+static bool test_include_depth(void) {
+    printf("Test 18d: Include depth limit...\n");
+
+    char* error_log = NULL;
+    char path[1024];
+    const char* file_path = hina_resolve_test_path(
+        path, sizeof(path),
+        "examples/shader_test/test_includes/shader_include_depth.hina_sl");
+    hina_hsl_module* module = hslc_compile_hsl(file_path, &error_log);
+
+    if (module) {
+        printf("  UNEXPECTED SUCCESS - should have failed!\n");
+        hslc_hsl_module_free(module);
+        return false;
+    }
+
+    if (!error_log) {
+        printf("  FAIL - No error message returned\n");
+        return false;
+    }
+
+    if (strstr(error_log, "Maximum include depth exceeded") != NULL) {
+        printf("  OK - Got expected error: %.120s...\n", error_log);
+        hslc_free_log(error_log);
+        printf("  PASSED\n");
+        return true;
+    }
+
+    printf("  FAIL - Unexpected error: %.120s...\n", error_log);
+    hslc_free_log(error_log);
+    return false;
+}
+
 static bool test_double_include_no_once(void) {
     printf("Test 19: Double include without #pragma once (expected failure)...\n");
 
@@ -3144,6 +3818,9 @@ int main(int argc, char** argv) {
 
     printf("\n--- Phase 5: Include & Error Handling ---\n\n");
     if (test_pragma_once()) passed++; else failed++;
+    if (test_pragma_once_bom()) passed++; else failed++;
+    if (test_circular_include()) passed++; else failed++;
+    if (test_include_depth()) passed++; else failed++;
     if (test_double_include_no_once()) passed++; else failed++;
     if (test_snippet_include()) passed++; else failed++;
     if (test_implicit_header()) passed++; else failed++;
@@ -3159,6 +3836,7 @@ int main(int argc, char** argv) {
     if (test_module_serialization()) passed++; else failed++;
 
     printf("\n--- Phase 7: Stress & Edge Cases ---\n\n");
+    if (test_hsl_limits()) passed++; else failed++;
     if (test_hsl_stress()) passed++; else failed++;
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);

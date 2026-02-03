@@ -1,0 +1,24 @@
+#hina
+#include "include_depth_00.glsl"
+
+struct VertexIn { vec3 pos; };
+struct Varyings { vec3 color; };
+struct FragOut { vec4 color; };
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+    out.color = in.pos;
+    gl_Position = vec4(in.pos, 1.0);
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+    FragOut out;
+    out.color = vec4(in.color, 1.0);
+    return out;
+}
+#hina_end

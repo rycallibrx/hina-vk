@@ -25588,12 +25588,19 @@ static bool hslc_parse_stage_header(const char* line_start, const char* line_end
       {
         info->use_all_snippets = true;
         line++;
+        while (line < end && (*line == ' ' || *line == '\t')) line++;
+        if (line < end)
+        {
+          snprintf(error, error_size, "use * cannot be combined with named snippets");
+          return false;
+        }
         break;
       }
       info->used_snippet_count = 0;
-      while (line < end && *line != '\n' && *line != '\r' && info->used_snippet_count < HSL_MAX_USED_SNIPPETS)
+      while (line < end && *line != '\n' && *line != '\r')
       {
-        const char* before = line;
+        while (line < end && (*line == ' ' || *line == '\t' || *line == ',')) line++;
+        if (line >= end || *line == '\n' || *line == '\r') break;
         const char* sn_start = line;
         while (line < end && ((*line >= 'a' && *line <= 'z') || (*line >= 'A' && *line <= 'Z') || (*line >= '0' && *line
           <= '9') || *line == '_'))
@@ -25601,15 +25608,36 @@ static bool hslc_parse_stage_header(const char* line_start, const char* line_end
           line++;
         }
         size_t sn_len = (size_t)(line - sn_start);
-        if (sn_len > 0 && sn_len < HSL_MAX_IDENT_LEN)
+        if (sn_len == 0)
+        {
+          break;
+        }
+        if ((sn_len == 20 && strncmp(sn_start, "early_fragment_tests", 20) == 0) ||
+            (sn_len == 10 && strncmp(sn_start, "depth_less", 10) == 0) ||
+            (sn_len == 13 && strncmp(sn_start, "depth_greater", 13) == 0) ||
+            (sn_len == 9 && strncmp(sn_start, "depth_any", 9) == 0) ||
+            (sn_len == 15 && strncmp(sn_start, "depth_unchanged", 15) == 0))
+        {
+          snprintf(error, error_size, "use must appear after qualifiers");
+          return false;
+        }
+        if (info->used_snippet_count >= HSL_MAX_USED_SNIPPETS)
+        {
+          snprintf(error, error_size, "Too many snippets used per stage");
+          return false;
+        }
+        if (sn_len < HSL_MAX_IDENT_LEN)
         {
           memcpy(info->used_snippets[info->used_snippet_count], sn_start, sn_len);
           info->used_snippets[info->used_snippet_count][sn_len] = '\0';
           info->used_snippet_count++;
         }
-        // Skip comma and whitespace
-        while (line < end && (*line == ' ' || *line == '\t' || *line == ',')) line++;
-        if (line == before) break;
+      }
+      while (line < end && (*line == ' ' || *line == '\t')) line++;
+      if (line < end)
+      {
+        snprintf(error, error_size, "use must appear after qualifiers");
+        return false;
       }
       break;
     }
@@ -26522,6 +26550,25 @@ static bool hslc_validate_resources(hsl_module_ir* ir)
   return true;
 }
 
+static bool hslc_validate_snippet_usage(hsl_module_ir* ir)
+{
+  for (uint32_t i = 0; i < HSL_STAGE_COUNT; i++)
+  {
+    hsl_stage* stage = &ir->stages[i];
+    if (!stage->defined || stage->use_all_snippets) continue;
+    for (uint32_t j = 0; j < stage->used_snippet_count; j++)
+    {
+      const char* name = stage->used_snippets[j];
+      if (!hslc_find_snippet(ir, name))
+      {
+        hslc_ir_error(ir, stage->line, "Unknown snippet '%s' in use list", name);
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 static bool hslc_validate_shared(hsl_module_ir* ir)
 {
   if (ir->shared_decl_count == 0)
@@ -26669,6 +26716,10 @@ static hsl_module_ir* hslc_parse_source(const char* source, const char* source_n
     memcpy(stage->body, sbi->body_start, body_len);
     stage->body[body_len] = '\0';
     stage->body_len = (uint32_t)body_len;
+  }
+  if (!hslc_validate_snippet_usage(ir))
+  {
+    return ir;
   }
   if (!hslc_validate_shared(ir))
   {
@@ -26910,6 +26961,12 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
       char* full_include_path = hslc_path_join(dir, include_path);
       shader_free(dir);
       shader_free(include_path);
+      const char* include_text = included_source;
+      if ((unsigned char)include_text[0] == 0xEF && (unsigned char)include_text[1] == 0xBB &&
+          (unsigned char)include_text[2] == 0xBF)
+      {
+        include_text += 3;
+      }
       // #pragma once: skip if this file was already included with #pragma once
       if (hslc_is_pragma_once_file(ctx, full_include_path))
       {
@@ -26918,7 +26975,7 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
         goto next_line;
       }
       // Track #pragma once for this file
-      if (hslc_has_pragma_once(included_source))
+      if (hslc_has_pragma_once(include_text))
       {
         hslc_mark_pragma_once(ctx, full_include_path);
       }
@@ -26927,7 +26984,7 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
       // Emit #line for included file (using numeric source ID)
       hslc_sb_appendf(sb, "#line 1 %u\n", include_source_id);
       // Recursively expand
-      bool ok = hslc_expand_includes_impl(ctx, sb, full_include_path, included_source);
+      bool ok = hslc_expand_includes_impl(ctx, sb, full_include_path, include_text);
       shader_free(included_source);
       shader_free(full_include_path);
       if (!ok)
@@ -26996,7 +27053,12 @@ static char* hslc_expand_includes(hsl_include_context* ctx, const char* filename
     hslc_sb_free(&sb);
     return NULL;
   }
-  if (!hslc_expand_includes_impl(ctx, &sb, filename, source))
+  const char* src = source;
+  if (src && (unsigned char)src[0] == 0xEF && (unsigned char)src[1] == 0xBB && (unsigned char)src[2] == 0xBF)
+  {
+    src += 3;
+  }
+  if (!hslc_expand_includes_impl(ctx, &sb, filename, src))
   {
     hslc_sb_free(&sb);
     return NULL;
