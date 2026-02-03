@@ -4182,9 +4182,13 @@ static uint64_t hina_latest_pending_ticket(hina_context* ctx);
 
 static VkCommandPool hina_get_cmd_pool(hina_context* ctx, hina_queue queue, uint32_t slot, bool immediate);
 
+#ifdef HINA_DEBUG
 static void hina_set_object_name(hina_context* ctx, uint64_t handle, VkObjectType type, const char* name);
-
 static void hina_set_object_namef(hina_context* ctx, uint64_t handle, VkObjectType type, const char* fmt, ...);
+#else
+#define hina_set_object_name(ctx, handle, type, name) ((void)0)
+#define hina_set_object_namef(ctx, handle, type, fmt, ...) ((void)0)
+#endif
 
 static bool hina_init_pipeline_cache(hina_context* ctx, const hina_desc* desc);
 
@@ -5971,6 +5975,7 @@ static VkAttachmentStoreOp hina_store_to_vk(uint8_t op) { return (VkAttachmentSt
 static VkStencilOp hina_stencil_op_to_vk(uint8_t op) { return (VkStencilOp)op; }
 
 // Debug / validation helpers
+#ifdef HINA_DEBUG
 static VKAPI_ATTR VkBool32 VKAPI_CALL hina_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                                           VkDebugUtilsMessageTypeFlagsEXT types,
                                                           const VkDebugUtilsMessengerCallbackDataEXT* cb,
@@ -5998,6 +6003,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL hina_debug_callback(VkDebugUtilsMessageSev
   }
   return VK_FALSE;
 }
+#endif
 
 bool hina_get_gpu_memory_stats(hina_gpu_memory_stats* out_stats)
 {
@@ -7216,6 +7222,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
     }
   }
   // Optional debug utils extension - only add if available
+#ifdef HINA_DEBUG
   bool has_debug_utils = false;
   if ((ctx->core.device->config.enable_validation || ctx->core.device->config.log_fn || ctx->core.device->config.
                                                                                              enable_debug_names) &&
@@ -7232,6 +7239,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
       HINA_LOGW(ctx, "VK_EXT_debug_utils not available, debug callbacks disabled");
     }
   }
+#endif
   if (heap_alloc && available_exts) hina_free_host(available_exts);
   // Query the highest supported instance API version
   uint32_t instance_api_version = VK_API_VERSION_1_0;
@@ -7252,6 +7260,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
   const VkApplicationInfo app = {
     .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "hina-vk", .apiVersion = instance_api_version
   };
+#ifdef HINA_DEBUG
   const VkDebugUtilsMessengerCreateInfoEXT dbg_info = {
     .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
     .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
@@ -7259,10 +7268,13 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
     VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
     .pfnUserCallback = hina_debug_callback, .pUserData = ctx
   };
+#endif
   VkInstanceCreateInfo ici = {0};
   ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   ici.pApplicationInfo = &app;
+#ifdef HINA_DEBUG
   static const char* layers[1] = {"VK_LAYER_KHRONOS_validation"};
+#endif
   if (desc->instance_ext_count && desc->instance_exts)
   {
     // Validate user-provided extensions are available
@@ -7278,6 +7290,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
     ici.enabledExtensionCount = desc->instance_ext_count;
     ici.ppEnabledExtensionNames = desc->instance_exts;
     HINA_LOGI(ctx, "using %u user-provided instance extensions", desc->instance_ext_count);
+#ifdef HINA_DEBUG
     // Check if user provided debug_utils
     has_debug_utils = false;
     for (uint32_t i = 0; i < desc->instance_ext_count; ++i)
@@ -7288,6 +7301,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
         break;
       }
     }
+#endif
   }
   else
   {
@@ -7295,6 +7309,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
     ici.ppEnabledExtensionNames = default_exts;
     HINA_LOGI(ctx, "using %u default instance extensions", ext_count);
   }
+#ifdef HINA_DEBUG
   ctx->core.device->config.has_debug_utils = has_debug_utils;
   // Only attach debug messenger if VK_EXT_debug_utils is enabled
   if (has_debug_utils && (ctx->core.device->config.log_fn || ctx->core.device->config.enable_validation))
@@ -7331,6 +7346,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
       HINA_LOGW(ctx, "validation layer requested but not available");
     }
   }
+#endif
   HINA_LOGI(ctx, "calling vkCreateInstance with %u extensions", ici.enabledExtensionCount);
   VkResult result = vkCreateInstance(&ici, NULL, &ctx->core.device->core.instance);
   if (result != VK_SUCCESS)
@@ -8923,9 +8939,15 @@ bool hina_init(const hina_desc* desc)
   dev->config.init_flags = desc->flags;
   dev->surface.present_mode = HINA_PRESENT_MODE_FIFO;
   dev->surface.swapchain_desc = (hina_swapchain_desc){.present_mode = HINA_PRESENT_MODE_FIFO};
+#ifdef HINA_DEBUG
   dev->config.terminate_on_validation_error = (desc->flags & HINA_INIT_TERMINATE_ON_ERROR_BIT) != 0;
   dev->config.enable_validation = (desc->flags & HINA_INIT_VALIDATION_BIT) != 0;
+#if defined(__ANDROID__)
+  dev->config.enable_debug_names = false; // Android drivers crash in vkSetDebugUtilsObjectNameEXT
+#else
   dev->config.enable_debug_names = (desc->flags & HINA_DEBUG_NAMES_BIT) != 0 || dev->config.enable_validation;
+#endif
+#endif
   dev->config.force_legacy_renderpass = (desc->flags & HINA_DEBUG_FORCE_LEGACY_RENDERPASS_BIT) != 0;
   dev->config.disable_timeline_semaphore = (desc->flags & HINA_DEBUG_NO_TIMELINE_SEMAPHORE_BIT) != 0;
   dev->config.force_single_queue = (desc->flags & HINA_DEBUG_FORCE_SINGLE_QUEUE_BIT) != 0;
@@ -22832,6 +22854,7 @@ void hina_cmd_acquire_buffer(hina_cmd* cmd, hina_buffer buf, hina_queue src_queu
   HINA_DEBUG_ADD_BARRIERS(ctx, 1);
 }
 
+#ifdef HINA_DEBUG
 static bool hina_debug_names_enabled(hina_context* ctx)
 {
   return ctx->core.device && ctx->core.device->core.device && ctx->core.device->config.enable_debug_names &&
@@ -22859,6 +22882,7 @@ static void hina_set_object_namef(hina_context* ctx, uint64_t handle, VkObjectTy
   name[sizeof(name) - 1] = '\0';
   hina_set_object_name(ctx, handle, type, name);
 }
+#endif
 
 void* hina_get_vk_buffer(hina_buffer buf)
 {
@@ -22920,6 +22944,7 @@ void* hina_get_vk_command_buffer(hina_cmd* cmd)
 
 void hina_cmd_begin_label(hina_cmd* cmd, const char* name, float color[4])
 {
+#ifdef HINA_DEBUG
   HINA_ASSERT(cmd && name);
   if (cmd->ctx->core.device->config.has_debug_utils)
   {
@@ -22927,19 +22952,27 @@ void hina_cmd_begin_label(hina_cmd* cmd, const char* name, float color[4])
     if (color) memcpy(label.color, color, sizeof(float) * 4);
     vkCmdBeginDebugUtilsLabelEXT(cmd->vk_cmd, &label);
   }
+#else
+  (void)cmd; (void)name; (void)color;
+#endif
 }
 
 void hina_cmd_end_label(hina_cmd* cmd)
 {
+#ifdef HINA_DEBUG
   HINA_ASSERT(cmd);
   if (cmd->ctx->core.device->config.has_debug_utils)
   {
     vkCmdEndDebugUtilsLabelEXT(cmd->vk_cmd);
   }
+#else
+  (void)cmd;
+#endif
 }
 
 void hina_cmd_insert_label(hina_cmd* cmd, const char* name, float color[4])
 {
+#ifdef HINA_DEBUG
   HINA_ASSERT(cmd && name);
   if (cmd->ctx->core.device->config.has_debug_utils)
   {
@@ -22947,6 +22980,9 @@ void hina_cmd_insert_label(hina_cmd* cmd, const char* name, float color[4])
     if (color) memcpy(label.color, color, sizeof(float) * 4);
     vkCmdInsertDebugUtilsLabelEXT(cmd->vk_cmd, &label);
   }
+#else
+  (void)cmd; (void)name; (void)color;
+#endif
 }
 
 bool hina_get_vulkan_handles(hina_vulkan_handles* out_handles)
@@ -23316,6 +23352,8 @@ typedef struct hsl_include_context
   void* user_data;
   char* error_msg;
   hsl_source_map source_map; // Maps source IDs to filenames
+  char* pragma_once_files[HINA_MAX_SOURCE_FILES]; // Resolved paths with #pragma once
+  uint32_t pragma_once_count;
 } hsl_include_context;
 
 // Forward Declarations
@@ -23485,6 +23523,8 @@ static void hslc_include_ctx_init(hsl_include_context* ctx, hslc_load_include_fn
   ctx->user_data = user_data;
   ctx->error_msg = NULL;
   memset(&ctx->source_map, 0, sizeof(ctx->source_map));
+  memset(ctx->pragma_once_files, 0, sizeof(ctx->pragma_once_files));
+  ctx->pragma_once_count = 0;
 }
 
 static void hslc_include_ctx_free(hsl_include_context* ctx)
@@ -23500,6 +23540,11 @@ static void hslc_include_ctx_free(hsl_include_context* ctx)
     ctx->error_msg = NULL;
   }
   hslc_source_map_free(&ctx->source_map);
+  for (uint32_t i = 0; i < ctx->pragma_once_count; i++)
+  {
+    shader_free(ctx->pragma_once_files[i]);
+  }
+  ctx->pragma_once_count = 0;
 }
 
 static void hslc_set_error(hsl_include_context* ctx, const char* fmt, ...)
@@ -24035,6 +24080,7 @@ typedef struct hsl_stage
   uint32_t body_len;
   char used_snippets[HSL_MAX_USED_SNIPPETS][HSL_MAX_IDENT_LEN];
   uint32_t used_snippet_count;
+  bool use_all_snippets;
   bool early_fragment_tests;
   hsl_depth_qual depth_qual;
   bool defined;
@@ -25279,8 +25325,10 @@ typedef struct hsl_stage_block_info
   char entry_name[HSL_MAX_IDENT_LEN];
   char used_snippets[HSL_MAX_USED_SNIPPETS][HSL_MAX_IDENT_LEN];
   uint32_t used_snippet_count;
+  bool use_all_snippets;
   bool early_fragment_tests;
   hsl_depth_qual depth_qual;
+  const char* directive_start; // Pointer to #hina_stage line
   const char* body_start;
   const char* body_end;
   uint32_t start_line;
@@ -25535,6 +25583,13 @@ static bool hslc_parse_stage_header(const char* line_start, const char* line_end
     {
       line += 3;
       while (line < end && (*line == ' ' || *line == '\t')) line++;
+      // Check for use * (all snippets)
+      if (line < end && *line == '*')
+      {
+        info->use_all_snippets = true;
+        line++;
+        break;
+      }
       info->used_snippet_count = 0;
       while (line < end && *line != '\n' && *line != '\r' && info->used_snippet_count < HSL_MAX_USED_SNIPPETS)
       {
@@ -25702,8 +25757,8 @@ static hsl_scan_result hina_scan_blocks(const char* source)
       result.error_line = line_num;
       return result;
     }
-    // Check for #hina_stage
-    if (line_active && found_header && hslc_line_starts_with(line_start, "#hina_stage"))
+    // Check for #hina_stage (allowed after explicit #hina_end or in implicit header mode)
+    if (line_active && !in_header && hslc_line_starts_with(line_start, "#hina_stage"))
     {
       if (result.stage_count >= HSL_STAGE_COUNT)
       {
@@ -25714,6 +25769,7 @@ static hsl_scan_result hina_scan_blocks(const char* source)
       }
       hsl_stage_block_info* stage = &result.stages[result.stage_count];
       memset(stage, 0, sizeof(*stage));
+      stage->directive_start = line_start;
       stage->start_line = line_num;
       if (!hslc_parse_stage_header(line_start, eol, stage, result.error_msg, sizeof(result.error_msg)))
       {
@@ -25779,10 +25835,18 @@ static hsl_scan_result hina_scan_blocks(const char* source)
   }
   if (!found_header)
   {
-    result.had_error = true;
-    snprintf(result.error_msg, sizeof(result.error_msg), "No #hina header block found");
-    result.error_line = 1;
-    return result;
+    if (result.stage_count == 0)
+    {
+      result.had_error = true;
+      snprintf(result.error_msg, sizeof(result.error_msg), "No #hina header block found");
+      result.error_line = 1;
+      return result;
+    }
+    // Implicit header mode: everything from source start to first #hina_stage
+    result.header.start = source;
+    result.header.end = result.stages[0].directive_start;
+    result.header.start_line = 1;
+    result.header.end_line = result.stages[0].start_line;
   }
   return result;
 }
@@ -26298,14 +26362,30 @@ static char* hslc_generate_glsl(hsl_module_ir* ir, hsl_stage* stage, const char*
     hslc_sb_append(&sb, "}\n\n");
   }
   // Emit used snippets
-  for (uint32_t i = 0; i < stage->used_snippet_count; i++)
+  if (stage->use_all_snippets)
   {
-    hsl_snippet* sn = hslc_find_snippet(ir, stage->used_snippets[i]);
-    if (sn && sn->body)
+    for (uint32_t i = 0; i < ir->snippet_count; i++)
     {
-      hslc_sb_appendf(&sb, "// snippet %s\n", sn->name);
-      hslc_sb_append(&sb, sn->body);
-      hslc_sb_append(&sb, "\n\n");
+      hsl_snippet* sn = &ir->snippets[i];
+      if (sn->body)
+      {
+        hslc_sb_appendf(&sb, "// snippet %s\n", sn->name);
+        hslc_sb_append(&sb, sn->body);
+        hslc_sb_append(&sb, "\n\n");
+      }
+    }
+  }
+  else
+  {
+    for (uint32_t i = 0; i < stage->used_snippet_count; i++)
+    {
+      hsl_snippet* sn = hslc_find_snippet(ir, stage->used_snippets[i]);
+      if (sn && sn->body)
+      {
+        hslc_sb_appendf(&sb, "// snippet %s\n", sn->name);
+        hslc_sb_append(&sb, sn->body);
+        hslc_sb_append(&sb, "\n\n");
+      }
     }
   }
   // Emit user's stage body (with reserved keyword transformation)
@@ -26483,16 +26563,20 @@ static bool hslc_validate_shared(hsl_module_ir* ir)
 // Check if source uses HSL syntax
 static bool hslc_check_syntax(const char* source)
 {
-  // Look for #hina followed by whitespace or newline (not #hina_stage, #hina_end)
+  // Look for #hina (explicit header) or #hina_stage (implicit header mode)
   const char* p = source;
   while (*p)
   {
-    // Find #hina
     const char* found = strstr(p, "#hina");
     if (!found) return false;
-    // Check what follows (#hina is 5 chars)
     const char* after = found + 5;
+    // #hina followed by whitespace = explicit header block
     if (*after == '\0' || *after == ' ' || *after == '\t' || *after == '\n' || *after == '\r')
+    {
+      return true;
+    }
+    // #hina_stage = implicit header mode (no #hina block needed)
+    if (strncmp(after, "_stage", 6) == 0)
     {
       return true;
     }
@@ -26525,6 +26609,28 @@ static hsl_module_ir* hslc_parse_source(const char* source, const char* source_n
   char* header_text = (char*)malloc(header_len + 1);
   memcpy(header_text, scan.header.start, header_len);
   header_text[header_len] = '\0';
+  // Strip #line directives from header (include expansion adds them but HSL parser doesn't understand them)
+  {
+    char* r = header_text;
+    char* w = header_text;
+    while (*r)
+    {
+      if (r[0] == '#' && strncmp(r, "#line ", 6) == 0)
+      {
+        while (*r && *r != '\n') r++;
+        if (*r == '\n') r++;
+        continue;
+      }
+      const char* eol = r;
+      while (*eol && *eol != '\n') eol++;
+      if (*eol == '\n') eol++;
+      size_t len = (size_t)(eol - r);
+      if (w != r) memmove(w, r, len);
+      w += len;
+      r = (char*)eol;
+    }
+    *w = '\0';
+  }
   // Step 4: Parse header
   hsl_parser parser = {0};
   hslc_lexer_init(&parser.lexer, header_text);
@@ -26552,6 +26658,7 @@ static hsl_module_ir* hslc_parse_source(const char* source, const char* source_n
     stage->depth_qual = sbi->depth_qual;
     // Copy snippet usage
     stage->used_snippet_count = sbi->used_snippet_count;
+    stage->use_all_snippets = sbi->use_all_snippets;
     for (uint32_t j = 0; j < sbi->used_snippet_count; j++)
     {
       strncpy(stage->used_snippets[j], sbi->used_snippets[j], HSL_MAX_IDENT_LEN - 1);
@@ -26688,6 +26795,42 @@ static char* hslc_parse_include_directive(const char* line)
   return path;
 }
 
+// #pragma once support
+static bool hslc_has_pragma_once(const char* source)
+{
+  // Scan for #pragma once as first non-blank line
+  const char* p = source;
+  while (*p)
+  {
+    // Skip blank lines
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\r' || *p == '\n')
+    {
+      if (*p == '\r' && *(p + 1) == '\n') p += 2; else p++;
+      continue;
+    }
+    // First non-blank line — check for #pragma once
+    return strncmp(p, "#pragma once", 12) == 0 &&
+           (p[12] == '\0' || p[12] == '\n' || p[12] == '\r' || p[12] == ' ' || p[12] == '\t');
+  }
+  return false;
+}
+
+static bool hslc_is_pragma_once_file(hsl_include_context* ctx, const char* path)
+{
+  for (uint32_t i = 0; i < ctx->pragma_once_count; i++)
+  {
+    if (strcmp(ctx->pragma_once_files[i], path) == 0) return true;
+  }
+  return false;
+}
+
+static void hslc_mark_pragma_once(hsl_include_context* ctx, const char* path)
+{
+  if (ctx->pragma_once_count >= HINA_MAX_SOURCE_FILES) return; // Silent fallback
+  ctx->pragma_once_files[ctx->pragma_once_count++] = hslc_strdup(path);
+}
+
 // Recursively expand includes
 static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_builder* sb, const char* filename,
                                       const char* source)
@@ -26756,6 +26899,18 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
       char* full_include_path = hslc_path_join(dir, include_path);
       shader_free(dir);
       shader_free(include_path);
+      // #pragma once: skip if this file was already included with #pragma once
+      if (hslc_is_pragma_once_file(ctx, full_include_path))
+      {
+        shader_free(included_source);
+        shader_free(full_include_path);
+        goto next_line;
+      }
+      // Track #pragma once for this file
+      if (hslc_has_pragma_once(included_source))
+      {
+        hslc_mark_pragma_once(ctx, full_include_path);
+      }
       // Register included file and get its source ID
       uint32_t include_source_id = hslc_source_map_register(&ctx->source_map, full_include_path);
       // Emit #line for included file (using numeric source ID)
@@ -26774,11 +26929,26 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
     }
     else
     {
+      // Reset pragma_once tracking at stage boundaries so each stage gets its own includes
+      const char* trimmed = line_start;
+      while (trimmed < line_end && (*trimmed == ' ' || *trimmed == '\t')) trimmed++;
+      if (line_end - trimmed >= 11 && strncmp(trimmed, "#hina_stage", 11) == 0)
+      {
+        for (uint32_t i = 0; i < ctx->pragma_once_count; i++) shader_free(ctx->pragma_once_files[i]);
+        ctx->pragma_once_count = 0;
+      }
       // Emit #line directive at start of file (using numeric source ID)
       if (at_start)
       {
         hslc_sb_appendf(sb, "#line %u %u\n", line_num, source_id);
         at_start = false;
+      }
+      // Skip #pragma once lines (already processed for dedup tracking)
+      if (line_end - trimmed >= 12 && strncmp(trimmed, "#pragma once", 12) == 0 &&
+          (trimmed[12] == '\0' || trimmed[12] == '\n' || trimmed[12] == '\r' ||
+           trimmed[12] == ' ' || trimmed[12] == '\t' || trimmed + 12 >= line_end))
+      {
+        goto next_line;
       }
       // Copy line as-is
       size_t line_len = (size_t)(line_end - line_start);
@@ -26786,6 +26956,7 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
       hslc_sb_append(sb, "\n");
     }
     // Move to next line
+next_line:
     if (*line_end == '\r' && *(line_end + 1) == '\n')
     {
       line_start = line_end + 2;
@@ -28069,17 +28240,57 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
     }
     return NULL;
   }
+  // Expand includes before HSL parsing (enables #include in #hina blocks)
+  hsl_include_context inc_ctx;
+  hslc_include_ctx_init(&inc_ctx, NULL, NULL);
+  const char* main_name = source_name ? source_name : "<inline>";
+  char* expanded = hslc_expand_includes(&inc_ctx, main_name, source);
+  if (!expanded)
+  {
+    if (out_error && inc_ctx.error_msg)
+    {
+      *out_error = inc_ctx.error_msg;
+      inc_ctx.error_msg = NULL;
+    }
+    hslc_include_ctx_free(&inc_ctx);
+    return NULL;
+  }
+  hslc_include_ctx_free(&inc_ctx);
+  // Strip #line directives from expanded source (HSL parser doesn't understand them;
+  // per-stage compilation will re-expand includes and emit its own #line directives)
+  {
+    char* r = expanded;
+    char* w = expanded;
+    while (*r)
+    {
+      if (r[0] == '#' && strncmp(r, "#line ", 6) == 0)
+      {
+        while (*r && *r != '\n') r++;
+        if (*r == '\n') r++;
+        continue;
+      }
+      const char* eol = r;
+      while (*eol && *eol != '\n') eol++;
+      if (*eol == '\n') eol++;
+      size_t len = (size_t)(eol - r);
+      if (w != r) memmove(w, r, len);
+      w += len;
+      r = (char*)eol;
+    }
+    *w = '\0';
+  }
   // Check for HSL syntax
-  if (!hslc_check_syntax(source))
+  if (!hslc_check_syntax(expanded))
   {
     if (out_error)
     {
       *out_error = hslc_strdup("HSL syntax required. Use #hina/#hina_end blocks.");
     }
+    shader_free(expanded);
     return NULL;
   }
   // Parse HSL to validate syntax and determine module type
-  hsl_module_ir* ir = hslc_parse_source(source, source_name);
+  hsl_module_ir* ir = hslc_parse_source(expanded, source_name);
   if (ir->had_error)
   {
     if (out_error)
@@ -28087,6 +28298,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
       *out_error = hslc_strdup(ir->error_msg);
     }
     hslc_module_ir_free(ir);
+    shader_free(expanded);
     return NULL;
   }
   // Determine module type from parsed stages
@@ -28108,6 +28320,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
         *out_error = hslc_strdup("Cannot mix compute stage with graphics stages");
       }
       hslc_module_ir_free(ir);
+      shader_free(expanded);
       return NULL;
     }
     module_type = HSL_MODULE_COMPUTE;
@@ -28121,6 +28334,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
         *out_error = hslc_strdup("Graphics module requires at least a vertex stage");
       }
       hslc_module_ir_free(ir);
+      shader_free(expanded);
       return NULL;
     }
     module_type = HSL_MODULE_GRAPHICS;
@@ -28143,6 +28357,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
     {
       *out_error = hslc_strdup("Failed to allocate HSL module");
     }
+    shader_free(expanded);
     return NULL;
   }
   memset(module, 0, sizeof(*module));
@@ -28150,39 +28365,44 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
   hsl_module_kind module_kind = module_type == HSL_MODULE_COMPUTE ? HINA_HSL_MODULE_COMPUTE : HINA_HSL_MODULE_GRAPHICS;
   if (module_kind == HINA_HSL_MODULE_COMPUTE)
   {
-    if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_COMPUTE, &module->cs, out_error))
+    if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_COMPUTE, &module->cs, out_error))
     {
+      shader_free(expanded);
       hslc_hsl_module_free(module);
       return NULL;
     }
   }
   else
   {
-    if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_VERTEX, &module->vs, out_error))
+    if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_VERTEX, &module->vs, out_error))
     {
+      shader_free(expanded);
       hslc_hsl_module_free(module);
       return NULL;
     }
     if (has_tcs)
     {
-      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_TESS_CONTROL, &module->tcs, out_error))
+      if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_TESS_CONTROL, &module->tcs, out_error))
       {
+        shader_free(expanded);
         hslc_hsl_module_free(module);
         return NULL;
       }
     }
     if (has_tes)
     {
-      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_TESS_EVAL, &module->tes, out_error))
+      if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_TESS_EVAL, &module->tes, out_error))
       {
+        shader_free(expanded);
         hslc_hsl_module_free(module);
         return NULL;
       }
     }
     if (has_gs)
     {
-      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_GEOMETRY, &module->gs, out_error))
+      if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_GEOMETRY, &module->gs, out_error))
       {
+        shader_free(expanded);
         hslc_hsl_module_free(module);
         return NULL;
       }
@@ -28190,8 +28410,9 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
     // Fragment shader (optional for vertex-only pipelines like depth pre-pass)
     if (has_fragment)
     {
-      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_FRAGMENT, &module->fs, out_error))
+      if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_FRAGMENT, &module->fs, out_error))
       {
+        shader_free(expanded);
         hslc_hsl_module_free(module);
         return NULL;
       }
@@ -28203,6 +28424,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
       {
         *out_error = hslc_strdup("Failed to reflect vertex inputs");
       }
+      shader_free(expanded);
       hslc_hsl_module_free(module);
       return NULL;
     }
@@ -28219,6 +28441,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
                HINA_MAX_VERTEX_ATTRS);
       *out_error = hslc_strdup(msg);
     }
+    shader_free(expanded);
     hslc_hsl_module_free(module);
     return NULL;
   }
@@ -28230,9 +28453,11 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
     {
       *out_error = hslc_strdup("Failed to reflect push constants");
     }
+    shader_free(expanded);
     hslc_hsl_module_free(module);
     return NULL;
   }
+  shader_free(expanded);
   return module;
 }
 

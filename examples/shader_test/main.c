@@ -225,8 +225,57 @@ static bool test_combined_shader(void) {
     return true;
 }
 
+static bool test_multiple_snippets(void) {
+    printf("Test 7: Multiple snippets (use A, B)...\n");
+
+    const char* source =
+        "#hina\n"
+        "struct VertexIn { vec2 a_pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "snippet Math {\n"
+        "  float remap(float v) { return v * 0.5 + 0.5; }\n"
+        "}\n"
+        "snippet Lighting {\n"
+        "  vec3 shade(vec3 n) { return vec3(remap(n.x), remap(n.y), remap(n.z)); }\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage vertex entry VSMain use Math, Lighting\n"
+        "Varyings VSMain(VertexIn in) {\n"
+        "    Varyings out;\n"
+        "    out.color = shade(vec3(in.a_pos, 0.0));\n"
+        "    gl_Position = vec4(in.a_pos, 0.0, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) {\n"
+        "    FragOut out;\n"
+        "    out.color = vec4(in.color, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n";
+
+    char* error_log = NULL;
+    hina_hsl_module* module = hslc_compile_hsl_source(source, "multi_snippet.hina_sl", &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    printf("  VS: %zu, FS: %zu bytes\n", module->vs.spirv_size, module->fs.spirv_size);
+
+    hslc_hsl_module_free(module);
+    printf("  PASSED\n");
+    return true;
+}
+
 static bool test_user_defines(void) {
-    printf("Test 4: User defines injection...\n");
+    printf("Test 9: User defines injection...\n");
 
     // New HSL syntax with preprocessor conditional
     static const char* source_with_defines =
@@ -318,7 +367,7 @@ static const char* test_hsl_source =
     "#hina_end\n";
 
 static bool test_hsl_syntax(void) {
-    printf("Test 5: New HSL syntax (#hina blocks with typed IO)...\n");
+    printf("Test 8: New HSL syntax (#hina blocks with typed IO)...\n");
 
     char* error_log = NULL;
     hina_hsl_module* module = hslc_compile_hsl_source(test_hsl_source, "test_hsl.hina_sl", &error_log);
@@ -388,20 +437,18 @@ static bool test_expected_failure(const char* test_name, const char* source,
 
 // Test 6: HSL Error Handling (new syntax)
 static bool test_hsl_error_handling(void) {
-    printf("Test 6: New HSL error handling (expected failures)...\n");
+    printf("Test 22: New HSL error handling (expected failures)...\n");
     int passed = 0;
     int total = 0;
 
-    // 6a: Missing #hina block
+    // 6a: No HSL directives — not HSL at all
     total++;
     if (test_expected_failure(
-        "6a: Missing #hina block",
-        "// No #hina block - should fail\n"
-        "#hina_stage vertex entry VSMain\n"
-        "Varyings VSMain(VertexIn in) { return Varyings(); }\n"
-        "#hina_end\n",
-        "missing_hsl_block.hina_sl",
-        "No #hina header block")) passed++;
+        "6a: No HSL directives at all",
+        "// Just plain GLSL, no HSL directives\n"
+        "void main() { gl_Position = vec4(0.0); }\n",
+        "not_hsl.hina_sl",
+        "HSL syntax required")) passed++;
 
     // 6b: Missing vertex stage
     total++;
@@ -482,7 +529,7 @@ static bool test_hsl_error_handling(void) {
 
 // Test 7: GLSL compilation errors in new HSL (tests error source mapping)
 static bool test_glsl_errors_in_hsl(void) {
-    printf("Test 7: GLSL compilation errors in new HSL...\n");
+    printf("Test 23: GLSL compilation errors in new HSL...\n");
     int passed = 0;
     int total = 0;
 
@@ -536,7 +583,7 @@ static bool test_glsl_errors_in_hsl(void) {
 
 // Test 9: Error reporting with #include files (tests source map)
 static bool test_include_error_reporting(void) {
-    printf("Test 9: Error reporting with #include files...\n");
+    printf("Test 21: Error reporting with #include files...\n");
     int passed = 0;
     int total = 0;
 
@@ -602,9 +649,9 @@ static bool test_include_error_reporting(void) {
     return passed == total;
 }
 
-// Test 10: Block Scanning (A1-A6)
+// Test 4: Block Scanning (A1-A6)
 static bool test_hsl_block_scanning(void) {
-    printf("Test 10: HSL block scanning...\n");
+    printf("Test 4: HSL block scanning...\n");
     int passed = 0;
     int total = 0;
 
@@ -774,9 +821,9 @@ static bool test_hsl_block_scanning(void) {
     return passed == total;
 }
 
-// Test 11: Groups (C1-C3)
+// Test 5: Groups (C1-C3)
 static bool test_hsl_groups(void) {
-    printf("Test 11: HSL groups...\n");
+    printf("Test 5: HSL groups...\n");
     int passed = 0;
     int total = 0;
 
@@ -884,9 +931,9 @@ static bool test_hsl_groups(void) {
     return passed == total;
 }
 
-// Test 12: Resources (D1-D8, D12)
+// Test 9: Resources (D1-D8, D12)
 static bool test_hsl_resources(void) {
-    printf("Test 12: HSL resources...\n");
+    printf("Test 10: HSL resources...\n");
     int passed = 0;
     int total = 0;
 
@@ -1247,9 +1294,150 @@ static bool test_hsl_resources(void) {
     return passed == total;
 }
 
-// Test 13: IO Structs and Locations (E4-E7, E9)
+static bool test_separated_sampler(void) {
+    printf("Test 11: Separated sampler (texture2D + sampler)...\n");
+
+    const char* source =
+        "#hina\n"
+        "group Scene = 0;\n"
+        "bindings(Scene, start=0) {\n"
+        "  texture texture2D myTex;\n"
+        "  sampler mySampler;\n"
+        "}\n"
+        "struct VertexIn { vec2 a_pos; };\n"
+        "struct Varyings { vec2 uv; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage vertex entry VSMain\n"
+        "Varyings VSMain(VertexIn in) {\n"
+        "    Varyings out;\n"
+        "    out.uv = in.a_pos * 0.5 + 0.5;\n"
+        "    gl_Position = vec4(in.a_pos, 0.0, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) {\n"
+        "    FragOut out;\n"
+        "    out.color = texture(sampler2D(myTex, mySampler), in.uv);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n";
+
+    char* error_log = NULL;
+    hina_hsl_module* module = hslc_compile_hsl_source(source, "sampler_test.hina_sl", &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    bool ok = module->vs.spirv_size > 0 && module->fs.spirv_size > 0 && module->fs.binding_count == 2;
+
+    printf("  VS: %zu, FS: %zu bytes, FS bindings: %u\n",
+           module->vs.spirv_size, module->fs.spirv_size, module->fs.binding_count);
+
+    hslc_hsl_module_free(module);
+    if (ok) printf("  PASSED\n"); else printf("  FAILED\n");
+    return ok;
+}
+
+static bool test_storage_image(void) {
+    printf("Test 12: Storage image resource...\n");
+
+    const char* source =
+        "#hina\n"
+        "group Compute = 0;\n"
+        "bindings(Compute, start=0) {\n"
+        "  image(rgba8) image2D outputImg;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage compute entry CSMain\n"
+        "layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;\n"
+        "void CSMain() {\n"
+        "    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);\n"
+        "    imageStore(outputImg, pos, vec4(1.0, 0.0, 0.0, 1.0));\n"
+        "}\n"
+        "#hina_end\n";
+
+    char* error_log = NULL;
+    hina_hsl_module* module = hslc_compile_hsl_source(source, "image_test.hina_sl", &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    bool ok = module->cs.spirv_size > 0 && module->cs.binding_count == 1;
+
+    printf("  CS: %zu bytes, %u bindings\n", module->cs.spirv_size, module->cs.binding_count);
+
+    hslc_hsl_module_free(module);
+    if (ok) printf("  PASSED\n"); else printf("  FAILED\n");
+    return ok;
+}
+
+static bool test_uniform_scalar(void) {
+    printf("Test 13: uniform(scalar) layout...\n");
+
+    const char* source =
+        "#hina\n"
+        "group Scene = 0;\n"
+        "bindings(Scene, start=0) {\n"
+        "  uniform(scalar) UBO {\n"
+        "    vec3 pos;\n"
+        "    float scale;\n"
+        "  } ubo;\n"
+        "}\n"
+        "struct VertexIn { vec2 a_pos; };\n"
+        "struct Varyings { vec2 uv; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage vertex entry VSMain\n"
+        "Varyings VSMain(VertexIn in) {\n"
+        "    Varyings out;\n"
+        "    out.uv = in.a_pos;\n"
+        "    gl_Position = vec4(in.a_pos * ubo.scale + ubo.pos.xy, 0.0, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) {\n"
+        "    FragOut out;\n"
+        "    out.color = vec4(in.uv, 0.0, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n";
+
+    char* error_log = NULL;
+    hina_hsl_module* module = hslc_compile_hsl_source(source, "scalar_test.hina_sl", &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    bool ok = module->vs.spirv_size > 0 && module->fs.spirv_size > 0 && module->vs.binding_count == 1;
+
+    printf("  VS: %zu, FS: %zu bytes, VS bindings: %u\n",
+           module->vs.spirv_size, module->fs.spirv_size, module->vs.binding_count);
+
+    hslc_hsl_module_free(module);
+    if (ok) printf("  PASSED\n"); else printf("  FAILED\n");
+    return ok;
+}
+
+// Test 6: IO Structs and Locations (E4-E7, E9)
 static bool test_hsl_io_structs(void) {
-    printf("Test 13: HSL IO structs and locations...\n");
+    printf("Test 6: HSL IO structs and locations...\n");
     int passed = 0;
     int total = 0;
 
@@ -1434,7 +1622,7 @@ static bool test_hsl_io_structs(void) {
     return passed == total;
 }
 
-// Test 14: Stage Rules (F1, F4-F9)
+// Test 15: Stage Rules (F1, F4-F9)
 static bool test_hsl_stage_rules(void) {
     printf("Test 14: HSL stage rules...\n");
     int passed = 0;
@@ -1636,7 +1824,7 @@ static bool test_hsl_stage_rules(void) {
     return passed == total;
 }
 
-// Test 15: Compute shader
+// Test 17: Compute shader
 static bool test_hsl_compute(void) {
     printf("Test 15: HSL compute shader...\n");
     int passed = 0;
@@ -1750,9 +1938,142 @@ static bool test_hsl_compute(void) {
     return passed == total;
 }
 
-// Test 16: Codegen Correctness (G1-G6)
+static bool test_tessellation_stages(void) {
+    printf("Test 16: Tessellation stages (TCS+TES)...\n");
+
+    const char* source =
+        "#hina\n"
+        "group Scene = 0;\n"
+        "bindings(Scene, start=0) {\n"
+        "  uniform(std140) UBO { mat4 mvp; } ubo;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage vertex entry VSMain\n"
+        "layout(location = 0) in vec3 inPos;\n"
+        "layout(location = 0) out vec3 outWorldPos;\n"
+        "void VSMain() {\n"
+        "    outWorldPos = inPos;\n"
+        "    gl_Position = vec4(inPos, 1.0);\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage tess_control entry TCSMain\n"
+        "layout(vertices = 3) out;\n"
+        "layout(location = 0) in vec3 inWorldPos[];\n"
+        "layout(location = 0) out vec3 outWorldPos[];\n"
+        "void TCSMain() {\n"
+        "    if (gl_InvocationID == 0) {\n"
+        "        gl_TessLevelOuter[0] = 2.0;\n"
+        "        gl_TessLevelOuter[1] = 2.0;\n"
+        "        gl_TessLevelOuter[2] = 2.0;\n"
+        "        gl_TessLevelInner[0] = 2.0;\n"
+        "    }\n"
+        "    outWorldPos[gl_InvocationID] = inWorldPos[gl_InvocationID];\n"
+        "    gl_out[gl_InvocationID].gl_Position = gl_in[gl_InvocationID].gl_Position;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage tess_eval entry TESMain\n"
+        "layout(triangles, equal_spacing, ccw) in;\n"
+        "layout(location = 0) in vec3 inWorldPos[];\n"
+        "void TESMain() {\n"
+        "    vec3 p = gl_TessCoord.x * gl_in[0].gl_Position.xyz +\n"
+        "             gl_TessCoord.y * gl_in[1].gl_Position.xyz +\n"
+        "             gl_TessCoord.z * gl_in[2].gl_Position.xyz;\n"
+        "    gl_Position = ubo.mvp * vec4(p, 1.0);\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage fragment entry FSMain\n"
+        "layout(location = 0) out vec4 outColor;\n"
+        "void FSMain() {\n"
+        "    outColor = vec4(1.0, 0.5, 0.0, 1.0);\n"
+        "}\n"
+        "#hina_end\n";
+
+    char* error_log = NULL;
+    hina_hsl_module* module = hslc_compile_hsl_source(source, "tess_test.hina_sl", &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    bool ok = module->vs.spirv_size > 0 && module->tcs.spirv_size > 0 &&
+              module->tes.spirv_size > 0 && module->fs.spirv_size > 0;
+
+    printf("  VS: %zu, TCS: %zu, TES: %zu, FS: %zu bytes\n",
+           module->vs.spirv_size, module->tcs.spirv_size,
+           module->tes.spirv_size, module->fs.spirv_size);
+
+    hslc_hsl_module_free(module);
+    if (ok) printf("  PASSED\n"); else printf("  FAILED - missing stage SPIR-V\n");
+    return ok;
+}
+
+static bool test_geometry_stage(void) {
+    printf("Test 17: Geometry stage...\n");
+
+    const char* source =
+        "#hina\n"
+        "struct VertexIn { vec3 a_pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage vertex entry VSMain\n"
+        "Varyings VSMain(VertexIn in) {\n"
+        "    Varyings out;\n"
+        "    out.color = in.a_pos;\n"
+        "    gl_Position = vec4(in.a_pos, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage geometry entry GSMain\n"
+        "layout(triangles) in;\n"
+        "layout(triangle_strip, max_vertices = 3) out;\n"
+        "void GSMain() {\n"
+        "    for (int i = 0; i < 3; i++) {\n"
+        "        gl_Position = gl_in[i].gl_Position;\n"
+        "        EmitVertex();\n"
+        "    }\n"
+        "    EndPrimitive();\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) {\n"
+        "    FragOut out;\n"
+        "    out.color = vec4(in.color, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n";
+
+    char* error_log = NULL;
+    hina_hsl_module* module = hslc_compile_hsl_source(source, "geom_test.hina_sl", &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    bool ok = module->vs.spirv_size > 0 && module->gs.spirv_size > 0 && module->fs.spirv_size > 0;
+
+    printf("  VS: %zu, GS: %zu, FS: %zu bytes\n",
+           module->vs.spirv_size, module->gs.spirv_size, module->fs.spirv_size);
+
+    hslc_hsl_module_free(module);
+    if (ok) printf("  PASSED\n"); else printf("  FAILED - missing stage SPIR-V\n");
+    return ok;
+}
+
+// Test 29: Codegen Correctness (G1-G6)
 static bool test_hsl_codegen(void) {
-    printf("Test 16: HSL codegen correctness...\n");
+    printf("Test 24: HSL codegen correctness...\n");
     int passed = 0;
     int total = 0;
 
@@ -2058,9 +2379,9 @@ static bool test_hsl_codegen(void) {
     return passed == total;
 }
 
-// Test 17: Integration/Reflection (H1-H5)
+// Test 30: Integration/Reflection (H1-H5)
 static bool test_hsl_reflection(void) {
-    printf("Test 17: HSL reflection tests...\n");
+    printf("Test 25: HSL reflection tests...\n");
     int passed = 0;
     int total = 0;
 
@@ -2261,9 +2582,9 @@ static bool test_hsl_reflection(void) {
     return passed == total;
 }
 
-// Test 18: Stress and Edge Cases (I1-I10)
+// Test 32: Stress and Edge Cases (I1-I10)
 static bool test_hsl_stress(void) {
-    printf("Test 18: HSL stress and edge cases...\n");
+    printf("Test 27: HSL stress and edge cases...\n");
     int passed = 0;
     int total = 0;
 
@@ -2465,7 +2786,7 @@ static bool test_hsl_stress(void) {
 }
 
 static bool test_module_serialization(void) {
-    printf("Test 19: Module serialization/deserialization...\n");
+    printf("Test 26: Module serialization/deserialization...\n");
 
     // Compile a module with bindings, vertex inputs, and multiple descriptor sets
     const char* source =
@@ -2600,6 +2921,187 @@ static bool test_module_serialization(void) {
     return match;
 }
 
+static bool test_pragma_once(void) {
+    printf("Test 18: Double include with #pragma once...\n");
+
+    char* error_log = NULL;
+    char path[1024];
+    const char* file_path = hina_resolve_test_path(
+        path, sizeof(path),
+        "examples/shader_test/test_includes/shader_double_include.hina_sl");
+    hina_hsl_module* module = hslc_compile_hsl(file_path, &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    printf("  VS: %zu bytes, FS: %zu bytes\n", module->vs.spirv_size, module->fs.spirv_size);
+    hslc_hsl_module_free(module);
+    printf("  PASSED\n");
+    return true;
+}
+
+static bool test_double_include_no_once(void) {
+    printf("Test 19: Double include without #pragma once (expected failure)...\n");
+
+    char* error_log = NULL;
+    char path[1024];
+    const char* file_path = hina_resolve_test_path(
+        path, sizeof(path),
+        "examples/shader_test/test_includes/shader_double_include_no_once.hina_sl");
+    hina_hsl_module* module = hslc_compile_hsl(file_path, &error_log);
+
+    if (module) {
+        printf("  UNEXPECTED SUCCESS - should have failed with redefinition!\n");
+        hslc_hsl_module_free(module);
+        return false;
+    }
+
+    if (!error_log) {
+        printf("  FAIL - No error message returned\n");
+        return false;
+    }
+
+    printf("  OK - Got expected error: %.120s...\n", error_log);
+    hslc_free_log(error_log);
+    printf("  PASSED\n");
+    return true;
+}
+
+static bool test_snippet_include(void) {
+    printf("Test 20: Shared snippet library via #include in #hina block...\n");
+
+    char* error_log = NULL;
+    char path[1024];
+    const char* file_path = hina_resolve_test_path(
+        path, sizeof(path),
+        "examples/shader_test/test_includes/shader_snippet_include.hina_sl");
+    hina_hsl_module* module = hslc_compile_hsl(file_path, &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    printf("  VS: %zu bytes, FS: %zu bytes\n", module->vs.spirv_size, module->fs.spirv_size);
+    hslc_hsl_module_free(module);
+    printf("  PASSED\n");
+    return true;
+}
+
+static bool test_implicit_header(void) {
+    printf("Test 28: Implicit header mode (no #hina block)...\n");
+
+    const char* source =
+        "struct VertexIn { vec2 a_pos; };\n"
+        "struct Varyings { float dummy; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "\n"
+        "#hina_stage vertex entry VSMain\n"
+        "Varyings VSMain(VertexIn in) {\n"
+        "    Varyings out;\n"
+        "    out.dummy = 1.0;\n"
+        "    gl_Position = vec4(in.a_pos, 0.0, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) {\n"
+        "    FragOut out;\n"
+        "    out.color = vec4(1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n";
+
+    char* error_log = NULL;
+    hina_hsl_module* module = hslc_compile_hsl_source(source, "implicit_header.hina_sl", &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    printf("  VS: %zu, FS: %zu bytes\n", module->vs.spirv_size, module->fs.spirv_size);
+    hslc_hsl_module_free(module);
+    printf("  PASSED\n");
+    return true;
+}
+
+static bool test_use_all_snippets(void) {
+    printf("Test 29: use * (all snippets)...\n");
+
+    const char* source =
+        "#hina\n"
+        "struct VertexIn { vec2 a_pos; };\n"
+        "struct Varyings { vec3 color; };\n"
+        "struct FragOut { vec4 color; };\n"
+        "snippet Math {\n"
+        "  float remap(float v) { return v * 0.5 + 0.5; }\n"
+        "}\n"
+        "snippet Lighting {\n"
+        "  vec3 shade(vec3 n) { return vec3(remap(n.x), remap(n.y), remap(n.z)); }\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage vertex entry VSMain use *\n"
+        "Varyings VSMain(VertexIn in) {\n"
+        "    Varyings out;\n"
+        "    out.color = shade(vec3(in.a_pos, 0.0));\n"
+        "    gl_Position = vec4(in.a_pos, 0.0, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n"
+        "\n"
+        "#hina_stage fragment entry FSMain\n"
+        "FragOut FSMain(Varyings in) {\n"
+        "    FragOut out;\n"
+        "    out.color = vec4(in.color, 1.0);\n"
+        "    return out;\n"
+        "}\n"
+        "#hina_end\n";
+
+    char* error_log = NULL;
+    hina_hsl_module* module = hslc_compile_hsl_source(source, "use_all.hina_sl", &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    printf("  VS: %zu, FS: %zu bytes\n", module->vs.spirv_size, module->fs.spirv_size);
+    hslc_hsl_module_free(module);
+    printf("  PASSED\n");
+    return true;
+}
+
+static bool test_implicit_header_with_include(void) {
+    printf("Test 30: Implicit header + #include from file...\n");
+
+    char* error_log = NULL;
+    char path[1024];
+    const char* file_path = hina_resolve_test_path(
+        path, sizeof(path),
+        "examples/shader_test/test_includes/shader_implicit_header.hina_sl");
+    hina_hsl_module* module = hslc_compile_hsl(file_path, &error_log);
+
+    if (!module) {
+        printf("  FAILED: %s\n", error_log ? error_log : "Unknown error");
+        if (error_log) hslc_free_log(error_log);
+        return false;
+    }
+
+    printf("  VS: %zu bytes, FS: %zu bytes\n", module->vs.spirv_size, module->fs.spirv_size);
+    hslc_hsl_module_free(module);
+    printf("  PASSED\n");
+    return true;
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
     g_exec_path = (argc > 0) ? argv[0] : NULL;
@@ -2615,30 +3117,49 @@ int main(int argc, char** argv) {
     int passed = 0;
     int failed = 0;
 
+    printf("--- Phase 1: Smoke Tests ---\n\n");
     if (test_basic_compilation()) passed++; else failed++;
     if (test_hsl_fragment()) passed++; else failed++;
     if (test_combined_shader()) passed++; else failed++;
-    if (test_user_defines()) passed++; else failed++;
-    if (test_hsl_syntax()) passed++; else failed++;
 
-    printf("\n--- Error Handling Tests ---\n\n");
-    if (test_hsl_error_handling()) passed++; else failed++;
-    if (test_glsl_errors_in_hsl()) passed++; else failed++;
-    if (test_include_error_reporting()) passed++; else failed++;
-
-    printf("\n--- New HSL Syntax Tests ---\n\n");
+    printf("\n--- Phase 2: Syntax & Parsing ---\n\n");
     if (test_hsl_block_scanning()) passed++; else failed++;
     if (test_hsl_groups()) passed++; else failed++;
-    if (test_hsl_resources()) passed++; else failed++;
     if (test_hsl_io_structs()) passed++; else failed++;
+    if (test_multiple_snippets()) passed++; else failed++;
+    if (test_hsl_syntax()) passed++; else failed++;
+    if (test_user_defines()) passed++; else failed++;
+    if (test_hsl_resources()) passed++; else failed++;
+
+    printf("\n--- Phase 3: Resource Types ---\n\n");
+    if (test_separated_sampler()) passed++; else failed++;
+    if (test_storage_image()) passed++; else failed++;
+    if (test_uniform_scalar()) passed++; else failed++;
+
+    printf("\n--- Phase 4: Stage Types ---\n\n");
     if (test_hsl_stage_rules()) passed++; else failed++;
     if (test_hsl_compute()) passed++; else failed++;
+    if (test_tessellation_stages()) passed++; else failed++;
+    if (test_geometry_stage()) passed++; else failed++;
+
+    printf("\n--- Phase 5: Include & Error Handling ---\n\n");
+    if (test_pragma_once()) passed++; else failed++;
+    if (test_double_include_no_once()) passed++; else failed++;
+    if (test_snippet_include()) passed++; else failed++;
+    if (test_implicit_header()) passed++; else failed++;
+    if (test_use_all_snippets()) passed++; else failed++;
+    if (test_implicit_header_with_include()) passed++; else failed++;
+    if (test_include_error_reporting()) passed++; else failed++;
+    if (test_hsl_error_handling()) passed++; else failed++;
+    if (test_glsl_errors_in_hsl()) passed++; else failed++;
+
+    printf("\n--- Phase 6: Reflection & Integration ---\n\n");
     if (test_hsl_codegen()) passed++; else failed++;
     if (test_hsl_reflection()) passed++; else failed++;
-    if (test_hsl_stress()) passed++; else failed++;
-
-    printf("\n--- Serialization Tests ---\n\n");
     if (test_module_serialization()) passed++; else failed++;
+
+    printf("\n--- Phase 7: Stress & Edge Cases ---\n\n");
+    if (test_hsl_stress()) passed++; else failed++;
 
     printf("\n=== Results: %d passed, %d failed ===\n", passed, failed);
 

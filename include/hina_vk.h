@@ -94,7 +94,11 @@
  * - **Frame Lifecycle**: `hina_frame_begin`, `hina_frame_end`, `hina_frame_submit`
  * - **Command Recording**: `hina_cmd_begin`, all `hina_cmd_*` functions
  * - **Resource Destruction**: `hina_destroy_buffer`, `hina_destroy_texture`, etc.
- *   (uses per-frame deferred destruction queues)
+ *   (uses deferred destruction: slot is invalidated immediately, but Vulkan object
+ *   destruction is deferred until in-flight GPU work completes. Callers must not
+ *   destroy resources that will be referenced by future descriptor updates or
+ *   command recordings. For resize workflows, create replacements first, then
+ *   destroy old resources after the frame completes.)
  * - **Immediate Submission**: `hina_submit_immediate`, `hina_wait_ticket`
  * - **Staging/Upload**: `hina_flush_uploads`, `hina_generate_mips`, `hina_download_texture`
  * - **Bind Groups**: `hina_create_bind_group`, `hina_destroy_bind_group`,
@@ -2545,6 +2549,17 @@ typedef struct hina_depth_bias_state
   uint8_t pad_[3]; // 3B
 } hina_depth_bias_state;
 
+typedef struct hina_stencil_face_state
+{
+  hina_stencil_op fail_op;
+  hina_stencil_op pass_op;
+  hina_stencil_op depth_fail_op;
+  hina_compare_op compare_op;
+  uint32_t compare_mask;
+  uint32_t write_mask;
+  uint32_t reference;
+} hina_stencil_face_state;
+
 typedef struct hina_push_constant_range
 {
   uint8_t stage_flags;
@@ -2610,16 +2625,7 @@ typedef struct hina_pipeline_desc
   hina_polygon_mode polygon_mode;
   hina_cull_mode cull_mode;
   hina_front_face front_face;
-  struct
-  {
-    hina_stencil_op fail_op;
-    hina_stencil_op pass_op;
-    hina_stencil_op depth_fail_op;
-    hina_compare_op compare_op;
-    uint32_t compare_mask;
-    uint32_t write_mask;
-    uint32_t reference;
-  } stencil_front, stencil_back;
+  hina_stencil_face_state stencil_front, stencil_back;
 
   /**
    * Render target formats for dynamic rendering.
@@ -2648,7 +2654,7 @@ typedef struct hina_pipeline_desc
   uint32_t gs_specialization_count;
   const hina_specialization_constant* fs_specializations;
   uint32_t fs_specialization_count;
-  
+
   /**
    * Explicit bind group layouts (optional, production path).
    * Count derived from array - first invalid handle terminates (zero-init = use reflection).
@@ -2746,17 +2752,7 @@ typedef struct hina_hsl_pipeline_desc
   hina_polygon_mode polygon_mode;
   hina_cull_mode cull_mode;
   hina_front_face front_face;
-
-  struct
-  {
-    hina_stencil_op fail_op;
-    hina_stencil_op pass_op;
-    hina_stencil_op depth_fail_op;
-    hina_compare_op compare_op;
-    uint32_t compare_mask;
-    uint32_t write_mask;
-    uint32_t reference;
-  } stencil_front, stencil_back;
+  hina_stencil_face_state stencil_front, stencil_back;
 
   /**
    * Render target formats for dynamic rendering.

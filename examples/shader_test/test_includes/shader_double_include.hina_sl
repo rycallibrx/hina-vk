@@ -1,0 +1,37 @@
+// Double include with guard in #hina block - should compile fine
+// Tests that #include works inside #hina header blocks
+
+#hina
+#include "shared_types.glsl"
+#include "shared_types.glsl"
+
+struct VertexIn {
+  vec3 a_position;
+  vec2 a_uv;
+};
+
+struct Varyings {
+  vec2 uv;
+};
+
+struct FragOut {
+  vec4 color;
+};
+#hina_end
+
+#hina_stage vertex entry VSMain
+Varyings VSMain(VertexIn in) {
+    Varyings out;
+    gl_Position = ubo.data.mvp * vec4(in.a_position, 1.0);
+    out.uv = in.a_uv;
+    return out;
+}
+#hina_end
+
+#hina_stage fragment entry FSMain
+FragOut FSMain(Varyings in) {
+    FragOut out;
+    out.color = ubo.data.color;
+    return out;
+}
+#hina_end

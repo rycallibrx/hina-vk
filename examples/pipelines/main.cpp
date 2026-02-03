@@ -299,7 +299,7 @@ static bool example_init(hina_example_app* app) {
 
     // Initialize camera
     app->camera.rotation = glm::vec3(0.0f, 0.0f, 0.0f);
-    app->camera.zoom = -4.0f;
+    app->camera.zoom = -3.0f;
     g_app.rotation_timer = 0.0f;
 
     EXAMPLE_LOGI("Pipelines example initialized");
@@ -339,6 +339,7 @@ static void example_render(hina_example_app* app) {
 
     // Update uniform buffer
     g_app.ubo->projection = glm::perspective(glm::radians(60.0f), aspect, 0.1f, 256.0f);
+    g_app.ubo->projection[1][1] *= -1.0f; // Vulkan Y-flip
 
     glm::mat4 model = glm::mat4(1.0f);
     model = glm::rotate(model, glm::radians(g_app.rotation_timer), glm::vec3(0.0f, 1.0f, 0.0f));

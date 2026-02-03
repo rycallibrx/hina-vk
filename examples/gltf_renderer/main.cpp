@@ -35,7 +35,7 @@
 constexpr int WINDOW_WIDTH = 1280;
 constexpr int WINDOW_HEIGHT = 720;
 constexpr const char* WINDOW_TITLE = "HinaVK GLTF Renderer";
-// No default model shipped - user must provide --gltf=<path>
+// Defaults to box01.glb if no --gltf=<path> provided
 constexpr uint32_t SHADOW_MAP_SIZE = 2048;
 constexpr uint32_t CULL_WORKGROUP_SIZE = 64;
 
@@ -1053,10 +1053,14 @@ int main(int argc, char** argv) {
     }
 
     if (gltf_path.empty()) {
-        // Default for running from VS without command line args
-        // gltf_path = "ABeautifulGame.glb";
-        fprintf(stderr, "No file detected\n");
-        return 1;
+        // Resolve relative to executable directory (MSVC sets CWD to project dir, not output dir)
+        std::string exe_dir;
+        if (argv[0]) {
+            exe_dir = argv[0];
+            size_t last_sep = exe_dir.find_last_of("/\\");
+            exe_dir = (last_sep != std::string::npos) ? exe_dir.substr(0, last_sep + 1) : "";
+        }
+        gltf_path = exe_dir + "box01.glb";
     }
 
     hina_example_app app;
