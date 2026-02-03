@@ -26798,22 +26798,33 @@ static char* hslc_parse_include_directive(const char* line)
 // #pragma once support
 static bool hslc_has_pragma_once(const char* source)
 {
-  // Scan for #pragma once as first non-blank line
   const char* p = source;
-  while (*p)
+  if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+  for (;;)
   {
-    // Skip blank lines
     while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return false;
     if (*p == '\r' || *p == '\n')
     {
       if (*p == '\r' && *(p + 1) == '\n') p += 2; else p++;
       continue;
     }
-    // First non-blank line — check for #pragma once
+    if (p[0] == '/' && p[1] == '/')
+    {
+      while (*p && *p != '\n' && *p != '\r') p++;
+      if (*p == '\r' && *(p + 1) == '\n') p += 2; else if (*p) p++;
+      continue;
+    }
+    if (p[0] == '/' && p[1] == '*')
+    {
+      p += 2;
+      while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+      if (*p) p += 2;
+      continue;
+    }
     return strncmp(p, "#pragma once", 12) == 0 &&
            (p[12] == '\0' || p[12] == '\n' || p[12] == '\r' || p[12] == ' ' || p[12] == '\t');
   }
-  return false;
 }
 
 static bool hslc_is_pragma_once_file(hsl_include_context* ctx, const char* path)
@@ -28365,7 +28376,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
   hsl_module_kind module_kind = module_type == HSL_MODULE_COMPUTE ? HINA_HSL_MODULE_COMPUTE : HINA_HSL_MODULE_GRAPHICS;
   if (module_kind == HINA_HSL_MODULE_COMPUTE)
   {
-    if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_COMPUTE, &module->cs, out_error))
+    if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_COMPUTE, &module->cs, out_error))
     {
       shader_free(expanded);
       hslc_hsl_module_free(module);
@@ -28374,7 +28385,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
   }
   else
   {
-    if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_VERTEX, &module->vs, out_error))
+    if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_VERTEX, &module->vs, out_error))
     {
       shader_free(expanded);
       hslc_hsl_module_free(module);
@@ -28382,7 +28393,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
     }
     if (has_tcs)
     {
-      if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_TESS_CONTROL, &module->tcs, out_error))
+      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_TESS_CONTROL, &module->tcs, out_error))
       {
         shader_free(expanded);
         hslc_hsl_module_free(module);
@@ -28391,7 +28402,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
     }
     if (has_tes)
     {
-      if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_TESS_EVAL, &module->tes, out_error))
+      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_TESS_EVAL, &module->tes, out_error))
       {
         shader_free(expanded);
         hslc_hsl_module_free(module);
@@ -28400,7 +28411,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
     }
     if (has_gs)
     {
-      if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_GEOMETRY, &module->gs, out_error))
+      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_GEOMETRY, &module->gs, out_error))
       {
         shader_free(expanded);
         hslc_hsl_module_free(module);
@@ -28410,7 +28421,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
     // Fragment shader (optional for vertex-only pipelines like depth pre-pass)
     if (has_fragment)
     {
-      if (!hslc_compile_stage(expanded, source_name, HINA_SHADER_STAGE_FRAGMENT, &module->fs, out_error))
+      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_FRAGMENT, &module->fs, out_error))
       {
         shader_free(expanded);
         hslc_hsl_module_free(module);
