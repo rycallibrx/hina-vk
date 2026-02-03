@@ -2382,6 +2382,33 @@ typedef struct hslc_compile_desc
 } hslc_compile_desc;
 
 /**
+ * @brief Module compilation descriptor for extended control.
+ *
+ * Use with hslc_compile_hsl_module_ex() when you need custom include loading
+ * (e.g., from asset archives, virtual filesystems, or memory).
+ */
+typedef struct hslc_hsl_module_desc
+{
+  const char* source;                   // HSL source code (required)
+  const char* source_name;              // Optional name for diagnostics (e.g., "shader.hina_sl"); NULL => "<inline>"
+  hslc_load_include_fn load_include_fn; // Custom include loader, or NULL for default file loading
+  void* user_data;                      // User data passed to load_include_fn
+} hslc_hsl_module_desc;
+
+/**
+ * @brief Compile HSL source with extended options.
+ *
+ * Unlike hslc_compile_hsl_source(), this function allows custom include loading
+ * for use cases where includes can't be resolved from the filesystem
+ * (virtual filesystems, asset archives, in-memory shaders).
+ *
+ * @param desc Module compilation descriptor
+ * @param out_error Optional error message (free with hslc_free_log)
+ * @return Module pointer on success, NULL on failure
+ */
+HINA_API hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, char** out_error);
+
+/**
  * @brief Compiled shader output from hslc_compile.
  * Contains SPIR-V bytecode and reflected specialization constants.
  */

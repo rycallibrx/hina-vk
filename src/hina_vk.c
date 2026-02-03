@@ -28018,11 +28018,18 @@ static void hslc_free_stage_data(hina_shader_stage_data* stage)
 }
 
 // Helper: Compile a single stage and populate stage data with reflection
-static bool hslc_compile_stage(const char* source, const char* filename, hina_shader_stage stage,
-                               hina_shader_stage_data* out_stage, char** out_error)
+static bool hslc_compile_stage_ex(const char* source, const char* filename, hina_shader_stage stage,
+                                  hslc_load_include_fn load_fn, void* user_data,
+                                  hina_shader_stage_data* out_stage, char** out_error)
 {
   memset(out_stage, 0, sizeof(*out_stage));
-  hslc_compile_desc desc = {.filename = filename, .source = source, .stage = stage,};
+  hslc_compile_desc desc = {
+    .filename = filename,
+    .source = source,
+    .stage = stage,
+    .load_include_fn = load_fn,
+    .user_data = user_data,
+  };
   hslc_shader_desc shader = {0};
   if (!hslc_compile(&desc, &shader, out_error))
   {
@@ -28097,6 +28104,13 @@ static bool hslc_compile_stage(const char* source, const char* filename, hina_sh
     spvReflectDestroyShaderModule(&spv_module);
   }
   return true;
+}
+
+// Backward-compatible wrapper
+static bool hslc_compile_stage(const char* source, const char* filename, hina_shader_stage stage,
+                               hina_shader_stage_data* out_stage, char** out_error)
+{
+  return hslc_compile_stage_ex(source, filename, stage, NULL, NULL, out_stage, out_error);
 }
 
 // Helper: Reflect vertex inputs from VS SPIR-V
@@ -28303,7 +28317,261 @@ hina_hsl_module* hslc_compile_hsl(const char* filepath, char** out_error)
   return result;
 }
 
+hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, char** out_error)
+{
+  if (!desc || !desc->source)
+  {
+    if (out_error)
+    {
+      *out_error = hslc_strdup("hslc_compile_hsl_module_ex: desc or desc->source is NULL");
+    }
+    return NULL;
+  }
+  const char* source = desc->source;
+  const char* source_name = desc->source_name;
+  const char* parse_name = source_name ? source_name : "<inline>";
+  hslc_load_include_fn load_fn = desc->load_include_fn;
+  void* user_data = desc->user_data;
+  // Expand includes before HSL parsing (enables #include in #hina blocks)
+  hsl_include_context inc_ctx;
+  hslc_include_ctx_init(&inc_ctx, load_fn, user_data);
+  char* expanded = hslc_expand_includes(&inc_ctx, parse_name, source);
+  if (!expanded)
+  {
+    if (out_error && inc_ctx.error_msg)
+    {
+      *out_error = inc_ctx.error_msg;
+      inc_ctx.error_msg = NULL;
+    }
+    hslc_include_ctx_free(&inc_ctx);
+    return NULL;
+  }
+  hslc_include_ctx_free(&inc_ctx);
+  // Strip #line directives from expanded source (HSL parser doesn't understand them;
+  // per-stage compilation will re-expand includes and emit its own #line directives)
+  {
+    char* r = expanded;
+    char* w = expanded;
+    while (*r)
+    {
+      if (r[0] == '#' && strncmp(r, "#line ", 6) == 0)
+      {
+        while (*r && *r != '\n') r++;
+        if (*r == '\n') r++;
+        continue;
+      }
+      const char* eol = r;
+      while (*eol && *eol != '\n') eol++;
+      if (*eol == '\n') eol++;
+      size_t len = (size_t)(eol - r);
+      if (w != r) memmove(w, r, len);
+      w += len;
+      r = (char*)eol;
+    }
+    *w = '\0';
+  }
+  // Check for HSL syntax
+  if (!hslc_check_syntax(expanded))
+  {
+    if (out_error)
+    {
+      *out_error = hslc_strdup("HSL syntax required. Use #hina/#hina_end blocks.");
+    }
+    shader_free(expanded);
+    return NULL;
+  }
+  // Parse HSL to validate syntax and determine module type
+  hsl_module_ir* ir = hslc_parse_source(expanded, parse_name);
+  if (ir->had_error)
+  {
+    if (out_error)
+    {
+      *out_error = hslc_strdup(ir->error_msg);
+    }
+    hslc_module_ir_free(ir);
+    shader_free(expanded);
+    return NULL;
+  }
+  // Determine module type from parsed stages
+  bool has_vertex = ir->stages[HSL_STAGE_VERTEX].defined;
+  bool has_fragment = ir->stages[HSL_STAGE_FRAGMENT].defined;
+  bool has_compute = ir->stages[HSL_STAGE_COMPUTE].defined;
+  typedef enum
+  {
+    HSL_MODULE_GRAPHICS = 0,
+    HSL_MODULE_COMPUTE
+  } hsl_module_type;
+  hsl_module_type module_type;
+  if (has_compute)
+  {
+    if (has_vertex || has_fragment)
+    {
+      if (out_error)
+      {
+        *out_error = hslc_strdup("Cannot mix compute stage with graphics stages");
+      }
+      hslc_module_ir_free(ir);
+      shader_free(expanded);
+      return NULL;
+    }
+    module_type = HSL_MODULE_COMPUTE;
+  }
+  else
+  {
+    if (!has_vertex)
+    {
+      if (out_error)
+      {
+        *out_error = hslc_strdup("Graphics module requires at least a vertex stage");
+      }
+      hslc_module_ir_free(ir);
+      shader_free(expanded);
+      return NULL;
+    }
+    module_type = HSL_MODULE_GRAPHICS;
+    // Warn about vertex-only modules (might be unintentional)
+    if (has_vertex && !has_fragment)
+    {
+      SHADER_LOGW("  Compiling vertex-only module (no fragment stage). "
+                  "This is valid for depth pre-pass but may be unintentional.");
+    }
+  }
+  // Detect optional stages from parsed IR before freeing
+  bool has_tcs = ir->stages[HSL_STAGE_TESS_CONTROL].defined;
+  bool has_tes = ir->stages[HSL_STAGE_TESS_EVAL].defined;
+  bool has_gs = ir->stages[HSL_STAGE_GEOMETRY].defined;
+  hslc_module_ir_free(ir);
+  hina_hsl_module* module = shader_alloc(sizeof(hina_hsl_module));
+  if (!module)
+  {
+    if (out_error)
+    {
+      *out_error = hslc_strdup("Failed to allocate HSL module");
+    }
+    shader_free(expanded);
+    return NULL;
+  }
+  memset(module, 0, sizeof(*module));
+  module->source_name = hslc_strdup(parse_name);
+  hsl_module_kind module_kind = module_type == HSL_MODULE_COMPUTE ? HINA_HSL_MODULE_COMPUTE : HINA_HSL_MODULE_GRAPHICS;
+  if (module_kind == HINA_HSL_MODULE_COMPUTE)
+  {
+    if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_COMPUTE, load_fn, user_data, &module->cs,
+                               out_error))
+    {
+      shader_free(expanded);
+      hslc_hsl_module_free(module);
+      return NULL;
+    }
+  }
+  else
+  {
+    if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_VERTEX, load_fn, user_data, &module->vs,
+                               out_error))
+    {
+      shader_free(expanded);
+      hslc_hsl_module_free(module);
+      return NULL;
+    }
+    if (has_tcs)
+    {
+      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_TESS_CONTROL, load_fn, user_data, &module->tcs,
+                                 out_error))
+      {
+        shader_free(expanded);
+        hslc_hsl_module_free(module);
+        return NULL;
+      }
+    }
+    if (has_tes)
+    {
+      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_TESS_EVAL, load_fn, user_data, &module->tes,
+                                 out_error))
+      {
+        shader_free(expanded);
+        hslc_hsl_module_free(module);
+        return NULL;
+      }
+    }
+    if (has_gs)
+    {
+      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_GEOMETRY, load_fn, user_data, &module->gs,
+                                 out_error))
+      {
+        shader_free(expanded);
+        hslc_hsl_module_free(module);
+        return NULL;
+      }
+    }
+    // Fragment shader (optional for vertex-only pipelines like depth pre-pass)
+    if (has_fragment)
+    {
+      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_FRAGMENT, load_fn, user_data, &module->fs,
+                                 out_error))
+      {
+        shader_free(expanded);
+        hslc_hsl_module_free(module);
+        return NULL;
+      }
+    }
+    // Reflect vertex inputs
+    if (!hslc_reflect_vertex_inputs(&module->vs, &module->vertex_inputs, &module->vertex_input_count))
+    {
+      if (out_error)
+      {
+        *out_error = hslc_strdup("Failed to reflect vertex inputs");
+      }
+      shader_free(expanded);
+      hslc_hsl_module_free(module);
+      return NULL;
+    }
+  }
+  // Validate Vulkan 1.0 limits using SPIR-V reflection data
+  if (module->vertex_input_count > HINA_MAX_VERTEX_ATTRS)
+  {
+    if (out_error)
+    {
+      char msg[256];
+      snprintf(msg, sizeof(msg),
+               "Vulkan 1.0 limit exceeded: Vertex shader has %u input attributes, "
+               "but Vulkan 1.0 guarantees only %d (maxVertexInputAttributes)", module->vertex_input_count,
+               HINA_MAX_VERTEX_ATTRS);
+      *out_error = hslc_strdup(msg);
+    }
+    shader_free(expanded);
+    hslc_hsl_module_free(module);
+    return NULL;
+  }
+  // Reflect push constants
+  if (!hslc_reflect_push_constants(&module->vs, &module->tcs, &module->tes, &module->gs, &module->fs, &module->cs,
+                                   &module->push_constants, &module->push_constant_count))
+  {
+    if (out_error)
+    {
+      *out_error = hslc_strdup("Failed to reflect push constants");
+    }
+    shader_free(expanded);
+    hslc_hsl_module_free(module);
+    return NULL;
+  }
+  shader_free(expanded);
+  return module;
+}
+
 hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_name, char** out_error)
+{
+  hslc_hsl_module_desc desc = {
+    .source = source,
+    .source_name = source_name,
+    .load_include_fn = NULL,
+    .user_data = NULL,
+  };
+  return hslc_compile_hsl_module_ex(&desc, out_error);
+}
+
+// Legacy implementation preserved as reference (now forwarded to hslc_compile_hsl_module_ex)
+#if 0
+hina_hsl_module* hslc_compile_hsl_source_legacy(const char* source, const char* source_name, char** out_error)
 {
   if (!source)
   {
@@ -28533,6 +28801,7 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
   shader_free(expanded);
   return module;
 }
+#endif // Legacy implementation
 
 void hslc_hsl_module_free(hina_hsl_module* module)
 {
