@@ -101,23 +101,42 @@ if(HINA_VK_ENABLE_SHADER_COMPILER)
     endif()
 endif()
 
-# SDL2 (for examples)
-if(NOT TARGET SDL2-static AND NOT TARGET SDL2::SDL2 AND HINA_HAS_THIRD_PARTY)
-    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-    set(SDL_STATIC ON CACHE BOOL "" FORCE)
-    set(SDL_TEST OFF CACHE BOOL "" FORCE)
-    set(SDL2_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
-    add_subdirectory(third_party/SDL2)
-    set_target_properties(SDL2-static PROPERTIES FOLDER "hina-vk/SDL2")
-    if(TARGET SDL2main)
-        set_target_properties(SDL2main PROPERTIES FOLDER "hina-vk/SDL2")
+# SDL2 and Dear ImGui are only needed for examples.
+if(HINA_VK_BUILD_EXAMPLES)
+    # SDL2 (for examples)
+    if(NOT TARGET SDL2-static AND NOT TARGET SDL2::SDL2 AND HINA_HAS_THIRD_PARTY)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST OFF CACHE BOOL "" FORCE)
+        set(SDL2_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
+        add_subdirectory(third_party/SDL2)
+        set_target_properties(SDL2-static PROPERTIES FOLDER "hina-vk/SDL2")
+        if(TARGET SDL2main)
+            set_target_properties(SDL2main PROPERTIES FOLDER "hina-vk/SDL2")
+        endif()
+    endif()
+
+    # Dear ImGui (for examples)
+    if(NOT TARGET imgui)
+        set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
+        if(EXISTS ${IMGUI_DIR}/imgui.cpp)
+            add_library(imgui STATIC
+                ${IMGUI_DIR}/imgui.cpp
+                ${IMGUI_DIR}/imgui_demo.cpp
+                ${IMGUI_DIR}/imgui_draw.cpp
+                ${IMGUI_DIR}/imgui_tables.cpp
+                ${IMGUI_DIR}/imgui_widgets.cpp
+            )
+            target_include_directories(imgui PUBLIC ${IMGUI_DIR})
+            set_target_properties(imgui PROPERTIES FOLDER "hina-vk/ImGui")
+        endif()
     endif()
 endif()
 
 # KTX - Khronos Texture format library (minimal subset for KTX1 loading only)
-# Note: We build a minimal ktx_read target. If you have your own KTX, just provide
-# a ktx_read target before including hina-vk.
-if(NOT TARGET ktx_read AND HINA_HAS_THIRD_PARTY)
+# Only needed by examples. If you have your own KTX, provide a ktx_read target
+# before including hina-vk.
+if(HINA_VK_BUILD_EXAMPLES AND NOT TARGET ktx_read AND HINA_HAS_THIRD_PARTY)
     set(KTX_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ktx)
     set(KTX_SOURCES
         ${KTX_DIR}/lib/src/texture.c
@@ -173,22 +192,6 @@ if(HINA_VK_ENABLE_TRACY)
     endif()
 endif()
 
-# Dear ImGui (for examples)
-if(NOT TARGET imgui)
-    set(IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui)
-    if(EXISTS ${IMGUI_DIR}/imgui.cpp)
-        add_library(imgui STATIC
-            ${IMGUI_DIR}/imgui.cpp
-            ${IMGUI_DIR}/imgui_demo.cpp
-            ${IMGUI_DIR}/imgui_draw.cpp
-            ${IMGUI_DIR}/imgui_tables.cpp
-            ${IMGUI_DIR}/imgui_widgets.cpp
-        )
-        target_include_directories(imgui PUBLIC ${IMGUI_DIR})
-        set_target_properties(imgui PROPERTIES FOLDER "hina-vk/ImGui")
-    endif()
-endif()
-
 # ---------------------------------------------------------------------------
 # Library target
 # ---------------------------------------------------------------------------
@@ -218,8 +221,6 @@ add_library(hina::vk ALIAS hina-vk)
 
 set_target_properties(hina-vk PROPERTIES
     FOLDER "hina-vk"
-    VERSION ${PROJECT_VERSION}
-    SOVERSION ${PROJECT_VERSION_MAJOR}
     C_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
 )
@@ -274,15 +275,6 @@ endif()
 
 set_target_properties(hina-vk PROPERTIES LINKER_LANGUAGE CXX)
 
-# Enable LTO/IPO for Release builds when supported
-include(CheckIPOSupported)
-check_ipo_supported(RESULT HINA_IPO_SUPPORTED OUTPUT HINA_IPO_ERROR)
-if (HINA_IPO_SUPPORTED)
-    set_property(TARGET hina-vk PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-else()
-    message(STATUS "LTO disabled: ${HINA_IPO_ERROR}")
-endif()
-
 target_compile_definitions(hina-vk PRIVATE VOLK_STATIC_DEFINES)
 
 if (WIN32)
@@ -293,41 +285,37 @@ elseif (UNIX)
     target_compile_definitions(hina-vk PRIVATE VK_USE_PLATFORM_XLIB_KHR)
 endif()
 
-
-# ---------------------------------------------------------------------------
-# Example Helper Function
-# ---------------------------------------------------------------------------
-# Helper function to set up an example with common dependencies including ImGui
-function(hina_add_example TARGET_NAME)
-    # Link against hina-vk and SDL2
-    target_link_libraries(${TARGET_NAME} PRIVATE hina-vk SDL2-static)
-    if(TARGET SDL2main)
-        target_link_libraries(${TARGET_NAME} PRIVATE SDL2main)
-    endif()
-
-    # GLM include path and configuration
-    target_include_directories(${TARGET_NAME} PRIVATE
-        ${CMAKE_SOURCE_DIR}/third_party/glm
-    )
-    target_compile_definitions(${TARGET_NAME} PRIVATE
-        GLM_FORCE_RADIANS
-        GLM_FORCE_DEPTH_ZERO_TO_ONE
-    )
-
-    # Add ImGui support if available
-    if(TARGET imgui)
-        target_link_libraries(${TARGET_NAME} PRIVATE imgui)
-        target_compile_definitions(${TARGET_NAME} PRIVATE HINA_EXAMPLE_HAS_IMGUI)
-    endif()
-
-    # Set folder for IDE organization
-    set_target_properties(${TARGET_NAME} PROPERTIES FOLDER "Examples")
-endfunction()
-
 # ---------------------------------------------------------------------------
 # Examples
 # ---------------------------------------------------------------------------
 if(HINA_VK_BUILD_EXAMPLES)
+    # Helper function to set up an example with common dependencies including ImGui
+    function(hina_add_example TARGET_NAME)
+        # Link against hina-vk and SDL2
+        target_link_libraries(${TARGET_NAME} PRIVATE hina-vk SDL2-static)
+        if(TARGET SDL2main)
+            target_link_libraries(${TARGET_NAME} PRIVATE SDL2main)
+        endif()
+
+        # GLM include path and configuration
+        target_include_directories(${TARGET_NAME} PRIVATE
+            ${CMAKE_SOURCE_DIR}/third_party/glm
+        )
+        target_compile_definitions(${TARGET_NAME} PRIVATE
+            GLM_FORCE_RADIANS
+            GLM_FORCE_DEPTH_ZERO_TO_ONE
+        )
+
+        # Add ImGui support if available
+        if(TARGET imgui)
+            target_link_libraries(${TARGET_NAME} PRIVATE imgui)
+            target_compile_definitions(${TARGET_NAME} PRIVATE HINA_EXAMPLE_HAS_IMGUI)
+        endif()
+
+        # Set folder for IDE organization
+        set_target_properties(${TARGET_NAME} PROPERTIES FOLDER "Examples")
+    endfunction()
+
     add_subdirectory(examples)
 endif()
 

@@ -2034,8 +2034,8 @@ HINA_API void hina_cmd_bind_transient_group(hina_cmd* cmd, uint32_t set, hina_tr
 //
 // The shader module is a standalone compilation library that can be used
 // independently of the Vulkan rendering module. It handles:
-// Threading: Shader compilation is not thread-safe. Call hslc_compile* from one
-// thread at a time.
+// Threading: hslc_* entry points are internally synchronized.
+// Calls are thread-safe but serialized.
 // - HSL (Hina Shader Language) preprocessing
 // - GLSL to SPIR-V compilation via glslang
 // - SPIR-V reflection via spirv-reflect

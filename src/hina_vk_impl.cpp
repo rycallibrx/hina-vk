@@ -70,7 +70,7 @@ void hina_tracy_vk_context_name(void* ctx, const char* name)
 extern "C" {
 
 // Catches divergent derivatives (valid SPIR-V but undefined behavior)
-static std::string g_lint_warnings;
+static thread_local std::string g_lint_warnings;
 
 bool hina_spirv_lint(const uint32_t* spirv_words, size_t word_count)
 {
@@ -101,7 +101,8 @@ const char* hina_spirv_lint_get_warnings(void)
     return g_lint_warnings.empty() ? nullptr : g_lint_warnings.c_str();
 }
 
-// Release thread-local string memory (call during shutdown)
+// Clears only the calling thread's lint buffer.
+// Other threads release their thread_local state at thread exit.
 void hina_spirv_lint_cleanup(void)
 {
     g_lint_warnings.clear();

@@ -270,6 +270,7 @@ typedef CRITICAL_SECTION mtx_t;
 typedef DWORD thrd_t;
 
 enum { mtx_plain = 0 };
+enum { mtx_recursive = 1 };
 
 static int mtx_init(mtx_t* mtx, int type) { (void)type; InitializeCriticalSection(mtx); return 0; }
 
@@ -284,9 +285,24 @@ static thrd_t thrd_current(void) { return GetCurrentThreadId(); }
 #elif defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 // POSIX: Use pthread_mutex_t for mtx_t
 #include <pthread.h>
-typedef pthread_mutex_t mtx_t; typedef pthread_t thrd_t; enum { mtx_plain = 0 };
+typedef pthread_mutex_t mtx_t; typedef pthread_t thrd_t; enum { mtx_plain = 0, mtx_recursive = 1 };
 
-static int mtx_init(mtx_t* mtx, int type) { (void)type; return pthread_mutex_init(mtx, NULL) == 0 ? 0 : -1; }
+static int mtx_init(mtx_t* mtx, int type)
+{
+  pthread_mutexattr_t attr;
+  if (pthread_mutexattr_init(&attr) != 0) return -1;
+  if (type == mtx_recursive)
+  {
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0)
+    {
+      pthread_mutexattr_destroy(&attr);
+      return -1;
+    }
+  }
+  int rc = pthread_mutex_init(mtx, &attr);
+  pthread_mutexattr_destroy(&attr);
+  return rc == 0 ? 0 : -1;
+}
 
 static int mtx_lock(mtx_t* mtx) { return pthread_mutex_lock(mtx) == 0 ? 0 : -1; }
 
@@ -375,10 +391,11 @@ static HINA_INLINE int32_t hina_atomic_cas32(hina_atomic32_t* ptr, int32_t old_v
 static HINA_INLINE int32_t hina_atomic_cas32_weak(hina_atomic32_t* ptr, int32_t old_val, int32_t new_val) { return _InterlockedCompareExchange(ptr, new_val, old_val); }
 
 /* --- 64-bit Operations --- */
-static HINA_INLINE int64_t hina_atomic_load64(const hina_atomic64_t* ptr) {
-    int64_t val = *ptr;
-    _ReadWriteBarrier();
-    return val;
+static HINA_INLINE int64_t hina_atomic_load64(const hina_atomic64_t* ptr)
+{
+  HINA_ASSERTF((((uintptr_t)ptr & 7u) == 0u), "hina_atomic_load64: unaligned pointer");
+  // Use interlocked RMW-with-no-op to guarantee an atomic 64-bit read on MSVC.
+  return _InterlockedCompareExchange64((hina_atomic64_t*)ptr, 0, 0);
 }
 
 static HINA_INLINE void hina_atomic_store64(hina_atomic64_t* ptr, int64_t val) { _InterlockedExchange64(ptr, val); }
@@ -425,7 +442,11 @@ static HINA_INLINE int32_t hina_atomic_cas32_weak(hina_atomic32_t* ptr, int32_t 
   return expected;
 }
 /* --- 64-bit Operations --- */
-static HINA_INLINE int64_t hina_atomic_load64(const hina_atomic64_t* ptr) { return __atomic_load_n(ptr, __ATOMIC_ACQUIRE); }
+static HINA_INLINE int64_t hina_atomic_load64(const hina_atomic64_t* ptr)
+{
+  HINA_ASSERTF((((uintptr_t)ptr & 7u) == 0u), "hina_atomic_load64: unaligned pointer");
+  return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
 
 static HINA_INLINE void hina_atomic_store64(hina_atomic64_t* ptr, int64_t val) { __atomic_store_n(ptr, val, __ATOMIC_RELEASE); }
 
@@ -828,6 +849,8 @@ HINA_STATIC_ASSERT((HINA_PERSISTENT_ALLOC_ALIGN & (HINA_PERSISTENT_ALLOC_ALIGN -
                    persistent_alloc_align_must_be_pow2);
 // Sentinel for freelist termination and invalid arena offsets
 #define HINA_SLOT_FREE_SENTINEL     UINT16_MAX
+// Upload ticket state
+#define HINA_UPLOAD_TICKET_NONE UINT64_C(0)
 
 // Arena offset type: replaces heap pointers for variable-size data
 typedef uint32_t hina_arena_offset;
@@ -1441,7 +1464,6 @@ typedef struct HINA_ALIGN(128) hina_global_storage
 #define HINA_POOL_FIELD(name, slot_type, cap, init) HINA_POOL(slot_type) name;
   HINA_POOL_LIST(HINA_POOL_FIELD)
 #undef HINA_POOL_FIELD
-
   /* Persistent arena (TLSF-style allocator for long-lived data) */
   hina_spinlock persistent_lock;
   hina_allocator persistent_alloc; // TLSF-style allocator
@@ -1478,6 +1500,44 @@ extern hina_global_storage g_storage;
 #define HINA_DESC_SET_ENTRY(idx) (&g_storage.desc_set_pool.slots[idx])
 #define HINA_PIPELINE_ENTRY(idx) (&g_storage.pipeline_pool.slots[idx])
 #define HINA_QUERY_ENTRY(idx) (&g_storage.query_pool.slots[idx])
+
+static HINA_INLINE bool hina_upload_pending_test(const hina_atomic32_t* pending_words, uint16_t idx)
+{
+  uint32_t word_idx = (uint32_t)idx >> 5;
+  uint32_t bit = 1u << ((uint32_t)idx & 31u);
+  return (((uint32_t)hina_atomic_load32(&pending_words[word_idx])) & bit) != 0u;
+}
+
+static HINA_INLINE void hina_upload_pending_set(hina_atomic32_t* pending_words, uint16_t idx)
+{
+  uint32_t word_idx = (uint32_t)idx >> 5;
+  uint32_t bit = 1u << ((uint32_t)idx & 31u);
+  int32_t old_word;
+  int32_t new_word;
+  do
+  {
+    old_word = hina_atomic_load32(&pending_words[word_idx]);
+    new_word = old_word | (int32_t)bit;
+    if (new_word == old_word) return;
+  }
+  while (hina_atomic_cas32(&pending_words[word_idx], old_word, new_word) != old_word);
+}
+
+static HINA_INLINE void hina_upload_pending_clear(hina_atomic32_t* pending_words, uint16_t idx)
+{
+  uint32_t word_idx = (uint32_t)idx >> 5;
+  uint32_t bit = 1u << ((uint32_t)idx & 31u);
+  int32_t old_word;
+  int32_t new_word;
+  do
+  {
+    old_word = hina_atomic_load32(&pending_words[word_idx]);
+    new_word = old_word & ~(int32_t)bit;
+    if (new_word == old_word) return;
+  }
+  while (hina_atomic_cas32(&pending_words[word_idx], old_word, new_word) != old_word);
+}
+
 // Host memory allocation from persistent arena (TLSF-style allocator)
 // All allocations come from the VM-backed persistent arena in g_storage.
 // Thread-safe via spinlock, 16-byte aligned.
@@ -1766,7 +1826,8 @@ static HINA_INLINE bool hina_buffer_slot_valid(hina_buffer h)
   uint16_t idx = h.id & 0xFFFF;
   uint16_t gen = h.id >> 16;
   if (HINA_UNLIKELY(idx >= g_storage.buffer_pool.meta.committed)) return false;
-  return HINA_LIKELY(g_storage.buffer_pool.slots[idx].generation == gen);
+  const hina_buffer_slot* slot = &g_storage.buffer_pool.slots[idx];
+  return HINA_LIKELY(slot->generation == gen && slot->next_free == HINA_SLOT_FREE_SENTINEL);
 }
 
 static HINA_INLINE hina_buffer_slot* hina_buffer_slot_get_valid(hina_buffer h)
@@ -1775,8 +1836,9 @@ static HINA_INLINE hina_buffer_slot* hina_buffer_slot_get_valid(hina_buffer h)
   uint16_t idx = h.id & 0xFFFF;
   uint16_t gen = h.id >> 16;
   if (HINA_UNLIKELY(idx >= g_storage.buffer_pool.meta.committed)) return NULL;
-  if (HINA_UNLIKELY(g_storage.buffer_pool.slots[idx].generation != gen)) return NULL;
-  return &g_storage.buffer_pool.slots[idx];
+  hina_buffer_slot* slot = &g_storage.buffer_pool.slots[idx];
+  if (HINA_UNLIKELY(slot->generation != gen || slot->next_free != HINA_SLOT_FREE_SENTINEL)) return NULL;
+  return slot;
 }
 
 static HINA_INLINE hina_texture hina_texture_slot_alloc(void)
@@ -1800,7 +1862,8 @@ static HINA_INLINE bool hina_texture_slot_valid(hina_texture h)
   uint16_t idx = h.id & 0xFFFF;
   uint16_t gen = h.id >> 16;
   if (HINA_UNLIKELY(idx >= g_storage.texture_pool.meta.committed)) return false;
-  return HINA_LIKELY(g_storage.texture_pool.slots[idx].generation == gen);
+  const hina_texture_slot* slot = &g_storage.texture_pool.slots[idx];
+  return HINA_LIKELY(slot->generation == gen && slot->next_free == HINA_SLOT_FREE_SENTINEL);
 }
 
 static HINA_INLINE hina_sampler hina_sampler_slot_alloc(void)
@@ -2479,13 +2542,41 @@ typedef struct hina_staging_page_pool
 // Maximum resources that can be staged before requiring a flush
 // Covers typical frame workloads without overflow
 #define HINA_MAX_STAGED_PER_FLUSH 256u
+#define HINA_MAX_UPLOAD_BATCHES   16u
+#define HINA_UPLOAD_BATCH_MASK    (HINA_MAX_UPLOAD_BATCHES - 1u)
+#define HINA_UPLOAD_PENDING_WORDS(count) (((count) + 31u) / 32u)
+HINA_STATIC_ASSERT((HINA_MAX_UPLOAD_BATCHES & (HINA_MAX_UPLOAD_BATCHES - 1u)) == 0,
+                   upload_batch_count_must_be_pow2);
 
 // Staged resource tracking for batched auto-flush
 typedef struct hina_staged_list
 {
-  uint16_t indices[HINA_MAX_STAGED_PER_FLUSH];
+  uint32_t handles[HINA_MAX_STAGED_PER_FLUSH];
   uint16_t count;
 } hina_staged_list;
+
+typedef struct hina_upload_batch
+{
+  uint64_t ticket;
+  uint16_t buffer_count;
+  uint16_t texture_count;
+  uint32_t buffer_handles[HINA_MAX_STAGED_PER_FLUSH];
+  uint32_t texture_handles[HINA_MAX_STAGED_PER_FLUSH];
+} hina_upload_batch;
+
+// Global upload tracking shared by all contexts on a device.
+// INVARIANT: A resource handle appears in at most one pending batch.
+// If re-staging of the same handle is introduced, retirement ordering must
+// be updated to avoid setting ready bits from older batches.
+typedef struct hina_upload_batch_ring
+{
+  hina_spinlock lock;
+  uint32_t head;
+  uint32_t tail;
+  hina_upload_batch entries[HINA_MAX_UPLOAD_BATCHES];
+  hina_atomic32_t buffer_pending[HINA_UPLOAD_PENDING_WORDS(HINA_POOL_MAX_BUFFERS)];
+  hina_atomic32_t texture_pending[HINA_UPLOAD_PENDING_WORDS(HINA_POOL_MAX_TEXTURES)];
+} hina_upload_batch_ring;
 
 // CONTEXT: Staging context (semantic grouping)
 // NOTE: Staging has its own dedicated command pool, decoupled from per-frame graphics pools.
@@ -2512,7 +2603,7 @@ typedef struct hina_staging_context
   } retired;
 
   // Staged resource tracking (resources copied to staging but not yet submitted)
-  // Cleared when staging is flushed, used to batch STAGED→PENDING transitions
+  // Entries move into the device-global upload batch ring on flush.
   hina_staged_list staged_buffers;
   hina_staged_list staged_textures;
 
@@ -2713,6 +2804,7 @@ typedef struct hina_device
     hina_atomic64_t submission_counter; // 8
     hina_submission_entry submissions[HINA_MAX_FRAMES_IN_FLIGHT * 16]; // 48 slots for complex scenes
     hina_zombie_list zombies[HINA_MAX_FRAMES_IN_FLIGHT];
+    hina_upload_batch_ring uploads;
     // Mutually exclusive: timeline semaphores OR legacy fences
     // Check has_timeline_semaphore to determine which union member is valid
     union
@@ -3647,6 +3739,129 @@ static void hina_push_zombie_lane_fast(hina_context* ctx, hina_queue_lane* lane,
 
 // Forward declaration for staging flush (needed by deferred destroy)
 static hina_ticket hina_staging_ctx_flush(hina_context* ctx);
+static hina_ticket hina_auto_flush_staged(hina_context* ctx);
+
+static HINA_INLINE hina_upload_batch_ring* hina_upload_ring_get(hina_context* ctx)
+{
+  HINA_ASSERT(ctx && ctx->core.device);
+  return &ctx->core.device->sync.uploads;
+}
+
+static HINA_INLINE bool hina_buffer_upload_pending(hina_context* ctx, uint16_t idx)
+{
+  HINA_ASSERT(idx < HINA_POOL_MAX_BUFFERS);
+  return hina_upload_pending_test(hina_upload_ring_get(ctx)->buffer_pending, idx);
+}
+
+static HINA_INLINE void hina_buffer_upload_pending_set(hina_context* ctx, uint16_t idx)
+{
+  HINA_ASSERT(idx < HINA_POOL_MAX_BUFFERS);
+  hina_upload_pending_set(hina_upload_ring_get(ctx)->buffer_pending, idx);
+}
+
+static HINA_INLINE void hina_buffer_upload_pending_clear(hina_context* ctx, uint16_t idx)
+{
+  HINA_ASSERT(idx < HINA_POOL_MAX_BUFFERS);
+  hina_upload_pending_clear(hina_upload_ring_get(ctx)->buffer_pending, idx);
+}
+
+static HINA_INLINE bool hina_texture_upload_pending(hina_context* ctx, uint16_t idx)
+{
+  HINA_ASSERT(idx < HINA_POOL_MAX_TEXTURES);
+  return hina_upload_pending_test(hina_upload_ring_get(ctx)->texture_pending, idx);
+}
+
+static HINA_INLINE void hina_texture_upload_pending_set(hina_context* ctx, uint16_t idx)
+{
+  HINA_ASSERT(idx < HINA_POOL_MAX_TEXTURES);
+  hina_upload_pending_set(hina_upload_ring_get(ctx)->texture_pending, idx);
+}
+
+static HINA_INLINE void hina_texture_upload_pending_clear(hina_context* ctx, uint16_t idx)
+{
+  HINA_ASSERT(idx < HINA_POOL_MAX_TEXTURES);
+  hina_upload_pending_clear(hina_upload_ring_get(ctx)->texture_pending, idx);
+}
+
+static HINA_INLINE bool hina_upload_ticket_completed(hina_context* ctx, uint64_t ticket)
+{
+  if (!ticket) return true;
+  if (!vkWaitSemaphores)
+  {
+    return hina_atomic_load32(&ctx->core.device->sync.fence.staging_busy) == 0;
+  }
+  uint8_t lane_idx = hina_ticket_lane(ticket);
+  HINA_ASSERTF(lane_idx < HINA_MAX_QUEUE_LANES, "upload ticket has invalid lane index");
+  return hina_lane_completed_value(ctx, lane_idx) >= hina_ticket_value(ticket);
+}
+
+static HINA_INLINE bool hina_buffer_handle_live(uint32_t handle_id)
+{
+  uint16_t idx = (uint16_t)(handle_id & 0xFFFFu);
+  uint16_t gen = (uint16_t)(handle_id >> 16);
+  if (idx >= g_storage.buffer_pool.meta.committed) return false;
+  const hina_buffer_slot* slot = &g_storage.buffer_pool.slots[idx];
+  return slot->next_free == HINA_SLOT_FREE_SENTINEL && slot->generation == gen;
+}
+
+static HINA_INLINE bool hina_texture_handle_live(uint32_t handle_id)
+{
+  uint16_t idx = (uint16_t)(handle_id & 0xFFFFu);
+  uint16_t gen = (uint16_t)(handle_id >> 16);
+  if (idx >= g_storage.texture_pool.meta.committed) return false;
+  const hina_texture_slot* slot = &g_storage.texture_pool.slots[idx];
+  return slot->next_free == HINA_SLOT_FREE_SENTINEL && slot->generation == gen;
+}
+
+static void hina_upload_ring_retire_completed_locked(hina_context* ctx, hina_upload_batch_ring* ring)
+{
+  while (ring->head != ring->tail)
+  {
+    hina_upload_batch* batch = &ring->entries[ring->head & HINA_UPLOAD_BATCH_MASK];
+    if (!hina_upload_ticket_completed(ctx, batch->ticket)) break;
+
+    for (uint32_t i = 0; i < batch->buffer_count; ++i)
+    {
+      uint32_t handle_id = batch->buffer_handles[i];
+      uint16_t idx = (uint16_t)(handle_id & 0xFFFFu);
+      if (hina_buffer_handle_live(handle_id))
+      {
+        HINA_BUF_HOT(idx)->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
+        hina_buffer_upload_pending_clear(ctx, idx);
+      }
+    }
+    for (uint32_t i = 0; i < batch->texture_count; ++i)
+    {
+      uint32_t handle_id = batch->texture_handles[i];
+      uint16_t idx = (uint16_t)(handle_id & 0xFFFFu);
+      if (hina_texture_handle_live(handle_id))
+      {
+        HINA_TEX_HOT(idx)->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
+        hina_texture_upload_pending_clear(ctx, idx);
+      }
+    }
+
+    batch->ticket = 0;
+    batch->buffer_count = 0;
+    batch->texture_count = 0;
+    ring->head += 1;
+  }
+}
+
+static uint64_t hina_upload_ring_find_ticket_locked(const hina_upload_batch_ring* ring, uint32_t handle_id, bool is_texture)
+{
+  for (uint32_t i = ring->head; i != ring->tail; ++i)
+  {
+    const hina_upload_batch* batch = &ring->entries[i & HINA_UPLOAD_BATCH_MASK];
+    const uint32_t* handles = is_texture ? batch->texture_handles : batch->buffer_handles;
+    uint32_t count = is_texture ? batch->texture_count : batch->buffer_count;
+    for (uint32_t j = 0; j < count; ++j)
+    {
+      if (handles[j] == handle_id) return batch->ticket;
+    }
+  }
+  return 0;
+}
 
 // Flush any pending staging work before deferred destruction.
 // This ensures copy commands targeting the resource are submitted before we
@@ -3657,7 +3872,12 @@ static void hina_flush_pending_staging_for_destroy(hina_context* ctx)
   hina_staging_context* sc = &ctx->staging;
   bool has_pending = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
   bool has_staged = sc->staged_buffers.count > 0 || sc->staged_textures.count > 0;
-  if (has_pending || has_staged)
+  if (has_staged)
+  {
+    hina_auto_flush_staged(ctx);
+    return;
+  }
+  if (has_pending)
   {
     hina_staging_ctx_flush(ctx);
   }
@@ -7400,7 +7620,9 @@ static bool hina_is_extension_enabled(const char* const* exts, uint32_t count, c
   if (!exts || count == 0 || !ext_name) return false;
   for (uint32_t i = 0; i < count; ++i)
   {
-    if (strcmp(exts[i], ext_name) == 0) return true;
+    const char* ext = exts[i];
+    if (!ext) continue;
+    if (strcmp(ext, ext_name) == 0) return true;
   }
   return false;
 }
@@ -7931,6 +8153,7 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
     for (uint32_t i = 0; i < desc->device_ext_count; ++i)
     {
       const char* ext = desc->device_exts[i];
+      if (!ext || ext[0] == '\0') continue;
       bool duplicate = false;
       for (uint32_t j = 0; j < merged_count; ++j)
       {
@@ -10201,7 +10424,47 @@ static hina_ticket hina_auto_flush_staged(hina_context* ctx)
 
   // Flush the staging context to submit all pending copies
   hina_ticket ticket = hina_staging_ctx_flush(ctx);
-  // Clear the staged lists (upload readiness tracked via last_submit_ticket + ready bit)
+  // Submission failed: keep staged lists and pending bits untouched.
+  if (ticket == HINA_UPLOAD_TICKET_NONE)
+  {
+    return 0;
+  }
+
+  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);
+  hina_poll_lane_completions(ctx);
+  hina_spin_lock(&ring->lock);
+  hina_upload_ring_retire_completed_locked(ctx, ring);
+  while ((ring->tail - ring->head) >= HINA_MAX_UPLOAD_BATCHES)
+  {
+    hina_ticket wait_ticket = ring->entries[ring->head & HINA_UPLOAD_BATCH_MASK].ticket;
+    if (!wait_ticket)
+    {
+      HINA_ASSERTF(false, "upload batch ring overflow with empty head ticket");
+      ring->head += 1;
+      continue;
+    }
+    hina_spin_unlock(&ring->lock);
+    hina_staging_ctx_wait(ctx, wait_ticket);
+    hina_poll_lane_completions(ctx);
+    hina_spin_lock(&ring->lock);
+    hina_upload_ring_retire_completed_locked(ctx, ring);
+  }
+
+  hina_upload_batch* batch = &ring->entries[ring->tail & HINA_UPLOAD_BATCH_MASK];
+  batch->ticket = ticket;
+  batch->buffer_count = sc->staged_buffers.count;
+  batch->texture_count = sc->staged_textures.count;
+  if (batch->buffer_count)
+  {
+    memcpy(batch->buffer_handles, sc->staged_buffers.handles, (size_t)batch->buffer_count * sizeof(uint32_t));
+  }
+  if (batch->texture_count)
+  {
+    memcpy(batch->texture_handles, sc->staged_textures.handles, (size_t)batch->texture_count * sizeof(uint32_t));
+  }
+  ring->tail += 1;
+  hina_spin_unlock(&ring->lock);
+
   sc->staged_buffers.count = 0;
   sc->staged_textures.count = 0;
 
@@ -10209,9 +10472,10 @@ static hina_ticket hina_auto_flush_staged(hina_context* ctx)
 }
 
 // Add a buffer to the staged list (called when staging data, before flush)
-static HINA_INLINE void hina_staging_add_buffer(hina_context* ctx, uint16_t idx)
+static HINA_INLINE void hina_staging_add_buffer(hina_context* ctx, uint32_t handle_id)
 {
   hina_staging_context* sc = &ctx->staging;
+  uint16_t idx = (uint16_t)(handle_id & 0xFFFFu);
   if (sc->staged_buffers.count >= HINA_MAX_STAGED_PER_FLUSH)
   {
     // Buffer pressure: flush to make room
@@ -10219,17 +10483,32 @@ static HINA_INLINE void hina_staging_add_buffer(hina_context* ctx, uint16_t idx)
   }
   if (sc->staged_buffers.count < HINA_MAX_STAGED_PER_FLUSH)
   {
-    sc->staged_buffers.indices[sc->staged_buffers.count++] = idx;
+#ifndef NDEBUG
+    for (uint32_t i = 0; i < sc->staged_buffers.count; ++i)
+    {
+      HINA_ASSERTF(sc->staged_buffers.handles[i] != handle_id,
+                   "staging_add_buffer: handle staged twice before flush");
+    }
+#endif
+    sc->staged_buffers.handles[sc->staged_buffers.count++] = handle_id;
     // Clear upload_ready bit - will be set when upload completes
     hina_buffer_hot* hot = HINA_BUF_HOT(idx);
     hot->config.flags_packed &= ~HINA_BUFFER_UPLOAD_READY_BIT;
+    hina_buffer_upload_pending_set(ctx, idx);
+  }
+  else
+  {
+    HINA_BUF_HOT(idx)->config.flags_packed &= ~HINA_BUFFER_UPLOAD_READY_BIT;
+    hina_buffer_upload_pending_set(ctx, idx);
+    HINA_LOGE(ctx, "staging_add_buffer: staged buffer list overflow after flush");
   }
 }
 
 // Add a texture to the staged list (called when staging data, before flush)
-static HINA_INLINE void hina_staging_add_texture(hina_context* ctx, uint16_t idx)
+static HINA_INLINE void hina_staging_add_texture(hina_context* ctx, uint32_t handle_id)
 {
   hina_staging_context* sc = &ctx->staging;
+  uint16_t idx = (uint16_t)(handle_id & 0xFFFFu);
   if (sc->staged_textures.count >= HINA_MAX_STAGED_PER_FLUSH)
   {
     // Buffer pressure: flush to make room
@@ -10237,10 +10516,24 @@ static HINA_INLINE void hina_staging_add_texture(hina_context* ctx, uint16_t idx
   }
   if (sc->staged_textures.count < HINA_MAX_STAGED_PER_FLUSH)
   {
-    sc->staged_textures.indices[sc->staged_textures.count++] = idx;
+#ifndef NDEBUG
+    for (uint32_t i = 0; i < sc->staged_textures.count; ++i)
+    {
+      HINA_ASSERTF(sc->staged_textures.handles[i] != handle_id,
+                   "staging_add_texture: handle staged twice before flush");
+    }
+#endif
+    sc->staged_textures.handles[sc->staged_textures.count++] = handle_id;
     // Clear upload_ready bit - will be set when upload completes
     hina_texture_hot* hot = HINA_TEX_HOT(idx);
     hot->texture_dim &= ~HINA_TEXTURE_UPLOAD_READY_BIT;
+    hina_texture_upload_pending_set(ctx, idx);
+  }
+  else
+  {
+    HINA_TEX_HOT(idx)->texture_dim &= ~HINA_TEXTURE_UPLOAD_READY_BIT;
+    hina_texture_upload_pending_set(ctx, idx);
+    HINA_LOGE(ctx, "staging_add_texture: staged texture list overflow after flush");
   }
 }
 
@@ -10576,6 +10869,10 @@ static VkCommandBuffer hina_staging_ctx_acquire_owner_cmd(hina_context* ctx, uin
 
 hina_ticket hina_ctx_flush_staging(hina_context* ctx)
 {
+  if (ctx->staging.staged_buffers.count > 0 || ctx->staging.staged_textures.count > 0)
+  {
+    return hina_auto_flush_staged(ctx);
+  }
   return hina_staging_ctx_flush(ctx);
 }
 
@@ -11311,9 +11608,14 @@ hina_buffer hina_ctx_make_buffer(hina_context* ctx, const hina_buffer_desc* desc
 #ifdef HINA_DEBUG
   if (desc->label) hina_debug_name_add(handle.id, VK_OBJECT_TYPE_BUFFER, desc->label);
 #endif
-  if (!desc->initial_data) return handle;
   uint16_t idx = hina_id_index(handle.id);
   hina_buffer_hot* hot = HINA_BUF_HOT(idx);
+  hina_buffer_upload_pending_clear(ctx, idx);
+  if (!desc->initial_data)
+  {
+    hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
+    return handle;
+  }
   // Fast path: directly mapped buffer
   if (hot->vk.mapped)
   {
@@ -11330,12 +11632,13 @@ hina_buffer hina_ctx_make_buffer(hina_context* ctx, const hina_buffer_desc* desc
   // Data is copied to staging buffer but NOT submitted yet (deferred/batched)
   if (!hina_staging_upload_chunked(ctx, hot, 0, desc->initial_data, desc->size))
   {
-    HINA_LOGW(ctx, "failed to stage buffer data (%" PRIu64 " bytes)", (uint64_t)desc->size);
-    // Staging failed - leave ready bit cleared (it's 0 by default)
-    return handle;
+    HINA_LOGE(ctx, "failed to stage buffer data (%" PRIu64 " bytes)", (uint64_t)desc->size);
+    // Staging failure is a hard creation failure: destroy partial resource and return invalid.
+    hina_ctx_destroy_buffer(ctx, handle);
+    return (hina_buffer){HINA_INVALID_HANDLE};
   }
   // Add to staged list - flush will happen at frame boundary or on demand
-  hina_staging_add_buffer(ctx, idx);
+  hina_staging_add_buffer(ctx, handle.id);
   return handle;
 }
 
@@ -11354,6 +11657,7 @@ void hina_ctx_destroy_buffer(hina_context* ctx, hina_buffer buf)
   hina_buffer_hot* hot = HINA_BUF_HOT(idx);
   VkBuffer vk_buf = hot->vk.buffer;
   VmaAllocation vma_alloc = hot->vk.allocation;
+  hina_buffer_upload_pending_clear(ctx, idx);
   memset(hot, 0, sizeof(*hot));
   hina_buffer_slot_free(idx);
   HINA_DEFER_DESTROY_BUFFER(ctx, vk_buf, vma_alloc);
@@ -12174,6 +12478,7 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
   HINA_ASSERT(handle.id != HINA_INVALID_HANDLE && "texture pool exhausted");
   uint16_t idx = hina_id_index(handle.id);
   hina_texture_hot* hot = HINA_TEX_HOT(idx);
+  hina_texture_upload_pending_clear(ctx, idx);
   uint32_t depth = desc->type == HINA_TEX_TYPE_3D ? (desc->depth ? desc->depth : 1u) : 1u;
   if (desc->type != HINA_TEX_TYPE_3D && desc->depth > 1)
   {
@@ -12327,7 +12632,11 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
   // Upload initial data first (if provided) - this transitions image to correct layout
   // Data is staged but NOT submitted yet (deferred/batched for efficiency)
   bool upload_succeeded = false;
-  if (desc->initial_data)
+  if (!desc->initial_data)
+  {
+    hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
+  }
+  else
   {
     VkPipelineStageFlags owner_shader_stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     if (owning_family == ctx->core.device->queue.compute_family &&
@@ -12340,7 +12649,7 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
     {
       // Add to staged list - flush will happen at frame boundary or on demand
       // Update layout state optimistically (will be correct after flush)
-      hina_staging_add_texture(ctx, idx);
+      hina_staging_add_texture(ctx, handle.id);
       hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       hot->state.access = VK_ACCESS_SHADER_READ_BIT;
       hot->state.stages = owner_shader_stages;
@@ -12365,13 +12674,22 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
           // Wait immediately for the fallback transition since this is an error recovery path
           hina_ctx_wait_ticket(ctx, t);
           hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
+          hina_texture_upload_pending_clear(ctx, idx);
         }
-        // If submit failed, leave ready bit cleared (will block on first use)
+        else
+        {
+          // Fallback transition failed to submit; keep resource explicitly not-ready.
+          hina_texture_upload_pending_set(ctx, idx);
+        }
         hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         hot->state.access = VK_ACCESS_SHADER_READ_BIT;
         hot->state.stages = owner_shader_stages;
       }
-      // If cmd allocation failed, leave ready bit cleared (will block on first use)
+      else
+      {
+        // Fallback transition command couldn't be allocated; keep resource explicitly not-ready.
+        hina_texture_upload_pending_set(ctx, idx);
+      }
     }
   }
   (void)format; // Suppress unused warning
@@ -12859,6 +13177,7 @@ void hina_ctx_destroy_texture(hina_context* ctx, hina_texture tex)
     }
   }
   hina_texture_hot temp = *hot;
+  hina_texture_upload_pending_clear(ctx, idx);
   memset(hot, 0, sizeof(*hot));
   hina_texture_slot_free(idx);
   // Only defer if we own the image (swapchain textures don't own their images)
@@ -13085,7 +13404,10 @@ void hina_wait_buffer(hina_buffer b)
   // Fast path: already marked ready
   if (HINA_BUFFER_IS_UPLOAD_READY(hot->config.flags_packed)) return;
   // Slow path: flush any staged uploads and wait for completion
-  hina_buffer_upload_ready(&g_hina_ctx, idx);
+  if (!hina_buffer_upload_ready(&g_hina_ctx, idx))
+  {
+    HINA_LOGW(&g_hina_ctx, "hina_wait_buffer: upload still pending for buffer slot %u", idx);
+  }
 }
 
 void hina_wait_texture(hina_texture t)
@@ -13096,7 +13418,10 @@ void hina_wait_texture(hina_texture t)
   // Fast path: already marked ready
   if (HINA_TEXTURE_IS_UPLOAD_READY(hot->texture_dim)) return;
   // Slow path: flush any staged uploads and wait for completion
-  hina_texture_upload_ready(&g_hina_ctx, idx);
+  if (!hina_texture_upload_ready(&g_hina_ctx, idx))
+  {
+    HINA_LOGW(&g_hina_ctx, "hina_wait_texture: upload still pending for texture slot %u", idx);
+  }
 }
 
 // Public API: Explicitly flush all staged uploads
@@ -13485,7 +13810,7 @@ static hina_bind_group hina_ctx_create_bind_group_internal(hina_context* ctx, co
           // Fast-path: skip atomic check if already marked ready in hot struct
           if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
           {
-            hina_buffer_upload_ready(ctx, buf_slot_idx);
+            (void)hina_buffer_upload_ready(ctx, buf_slot_idx);
           }
 #ifdef HINA_DEBUG
           hina_debug_validate_buffer_binding(ctx, e->type, e->buffer.buffer, e->buffer.offset, e->buffer.size,
@@ -13512,7 +13837,7 @@ static hina_bind_group hina_ctx_create_bind_group_internal(hina_context* ctx, co
           // Fast-path: skip atomic check if already marked ready in hot struct
           if (!HINA_TEXTURE_IS_UPLOAD_READY(thot->texture_dim))
           {
-            hina_texture_upload_ready(ctx, view_slot->parent_idx);
+            (void)hina_texture_upload_ready(ctx, view_slot->parent_idx);
           }
           image_infos[img_idx].imageView = view_slot->view;
           image_infos[img_idx].imageLayout = e->type == HINA_DESC_TYPE_STORAGE_IMAGE
@@ -13557,7 +13882,7 @@ static hina_bind_group hina_ctx_create_bind_group_internal(hina_context* ctx, co
           // Fast-path: skip atomic check if already marked ready in hot struct
           if (!HINA_TEXTURE_IS_UPLOAD_READY(thot->texture_dim))
           {
-            hina_texture_upload_ready(ctx, view_slot->parent_idx);
+            (void)hina_texture_upload_ready(ctx, view_slot->parent_idx);
           }
           image_infos[img_idx].imageView = view_slot->view;
           image_infos[img_idx].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -13579,7 +13904,7 @@ static hina_bind_group hina_ctx_create_bind_group_internal(hina_context* ctx, co
           // Fast-path: skip atomic check if already marked ready in hot struct
           if (!HINA_TEXTURE_IS_UPLOAD_READY(thot->texture_dim))
           {
-            hina_texture_upload_ready(ctx, view_slot->parent_idx);
+            (void)hina_texture_upload_ready(ctx, view_slot->parent_idx);
           }
           image_infos[img_idx].imageView = view_slot->view;
           // Determine correct layout based on format and device capabilities
@@ -14111,10 +14436,10 @@ static VkPipelineLayout hina_build_layout_from_reflection(hina_context* ctx, hin
 
 // Build pipeline layout from explicit bind group layouts
 static VkPipelineLayout hina_build_layout_from_explicit_bind_groups(hina_context* ctx,
-                                                                    const hina_bind_group_layout* layouts,
-                                                                    uint32_t layout_count,
-                                                                    const hina_push_constant_range* ranges,
-                                                                    uint32_t range_count,
+                                                                     const hina_bind_group_layout* layouts,
+                                                                     uint32_t layout_count,
+                                                                     const hina_push_constant_range* ranges,
+                                                                     uint32_t range_count,
                                                                     VkShaderStageFlags* out_pc_stages,
                                                                     uint32_t* out_pc_size,
                                                                     VkDescriptorSetLayout* out_vk_layouts)
@@ -14159,6 +14484,51 @@ static VkPipelineLayout hina_build_layout_from_explicit_bind_groups(hina_context
   if (out_pc_stages) *out_pc_stages = pc_stages;
   if (out_pc_size) *out_pc_size = pc_size;
   return layout;
+}
+
+static void hina_pipeline_reflection_apply_explicit_layouts(hina_context* ctx, hina_pipeline_reflection* reflection,
+                                                            const hina_bind_group_layout* bind_group_layouts,
+                                                            uint32_t explicit_layout_count,
+                                                            const VkDescriptorSetLayout* explicit_vk_layouts)
+{
+  if (!reflection) return;
+  for (uint32_t i = 0; i < reflection->set_count; ++i)
+  {
+    if (reflection->set_layouts[i])
+    {
+      vkDestroyDescriptorSetLayout(ctx->core.device->core.device, reflection->set_layouts[i], NULL);
+      reflection->set_layouts[i] = VK_NULL_HANDLE;
+    }
+  }
+  reflection->borrowed_layout_mask = 0;
+  for (uint32_t i = 0; i < explicit_layout_count; ++i)
+  {
+    reflection->set_layouts[i] = explicit_vk_layouts[i];
+    if (i < 32) reflection->borrowed_layout_mask |= 1u << i;
+  }
+  reflection->set_count = explicit_layout_count;
+  // Keep reflected stages consistent with explicit layout stage masks.
+  for (uint32_t set_idx = 0; set_idx < explicit_layout_count; ++set_idx)
+  {
+    if (!hina_bind_group_layout_is_valid(bind_group_layouts[set_idx])) continue;
+    uint16_t lidx = hina_id_index(bind_group_layouts[set_idx].id);
+    hina_desc_layout_slot* layout_slot = HINA_DESC_LAYOUT_ENTRY(lidx);
+    for (uint32_t entry_idx = 0; entry_idx < layout_slot->entry_count; ++entry_idx)
+    {
+      uint8_t binding_num = layout_slot->entries[entry_idx].binding;
+      uint8_t layout_stages = hina_layout_entry_stage_flags_raw(layout_slot->entries[entry_idx].flags);
+      if (!layout_stages) continue;
+      for (uint32_t rb_idx = 0; rb_idx < reflection->binding_count; ++rb_idx)
+      {
+        if (reflection->bindings[rb_idx].set == set_idx &&
+            reflection->bindings[rb_idx].binding == binding_num)
+        {
+          reflection->bindings[rb_idx].stages = hina_stage_mask_to_vk(layout_stages);
+          break;
+        }
+      }
+    }
+  }
 }
 
 // Returns VK_NULL_HANDLE on failure. Sets *created_temp if a new module was created.
@@ -14629,7 +14999,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   };
   // Build color attachment formats from desc
   // Note: color_attachment_count was already computed above for blend state
-  VkFormat color_formats[HINA_MAX_COLOR_ATTACHMENTS];
+  VkFormat color_formats[HINA_MAX_COLOR_ATTACHMENTS] = {VK_FORMAT_UNDEFINED};
   for (uint32_t i = 0; i < color_attachment_count; ++i)
     color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
   // Convert depth/stencil formats
@@ -14756,7 +15126,7 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     {
       // Use the actual color format from the pipeline descriptor, not the swapchain format
       // This ensures render pass compatibility when rendering to offscreen targets
-      VkFormat legacy_color_fmt = color_formats[0];
+      VkFormat legacy_color_fmt = color_attachment_count ? color_formats[0] : VK_FORMAT_UNDEFINED;
       VkFormat legacy_depth_fmt = depth_fmt;
       // Use COLOR_ATTACHMENT_OPTIMAL as final layout - explicit transitions handle the rest
       // Per Vulkan spec, initial/final layouts don't affect render pass compatibility
@@ -15496,59 +15866,16 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     // Count derived from array - first invalid handle terminates (zero-init = use reflection)
     VkPipelineLayout layout = VK_NULL_HANDLE;
     uint32_t explicit_layout_count = hina_count_bind_group_layouts(desc->bind_group_layouts);
+    VkDescriptorSetLayout explicit_vk_layouts[HINA_MAX_DESCRIPTOR_SETS] = {VK_NULL_HANDLE};
+    const bool use_explicit_layouts = explicit_layout_count > 0;
     if (explicit_layout_count > 0)
     {
       // Production path: Use explicit bind group layouts
-      VkDescriptorSetLayout explicit_vk_layouts[HINA_MAX_DESCRIPTOR_SETS];
       layout = hina_build_layout_from_explicit_bind_groups(ctx, desc->bind_group_layouts, explicit_layout_count,
                                                            desc->push_constant_ranges, desc->push_constant_range_count,
                                                            &e->push_constant_stages, &e->push_constant_size,
                                                            explicit_vk_layouts);
       e->set_layout_count = explicit_layout_count;
-      // Copy explicit layouts to reflection for consistent access during binding
-      if (e->reflection)
-      {
-        for (uint32_t i = 0; i < e->reflection->set_count; ++i)
-        {
-          if (e->reflection->set_layouts[i])
-          {
-            vkDestroyDescriptorSetLayout(ctx->core.device->core.device, e->reflection->set_layouts[i], NULL);
-            e->reflection->set_layouts[i] = VK_NULL_HANDLE;
-          }
-        }
-        e->reflection->borrowed_layout_mask = 0;
-        for (uint32_t i = 0; i < explicit_layout_count; ++i)
-        {
-          e->reflection->set_layouts[i] = explicit_vk_layouts[i];
-          if (i < 32) e->reflection->borrowed_layout_mask |= 1u << i;
-        }
-        e->reflection->set_count = explicit_layout_count;
-        // Update reflection binding stage flags to match explicit layouts
-        // This fixes validation mismatch when user layout specifies narrower stages than shader reflection
-        for (uint32_t set_idx = 0; set_idx < explicit_layout_count; ++set_idx)
-        {
-          if (!hina_bind_group_layout_is_valid(desc->bind_group_layouts[set_idx])) continue;
-          uint16_t lidx = hina_id_index(desc->bind_group_layouts[set_idx].id);
-          hina_desc_layout_slot* layout_slot = HINA_DESC_LAYOUT_ENTRY(lidx);
-          for (uint32_t entry_idx = 0; entry_idx < layout_slot->entry_count; ++entry_idx)
-          {
-            uint8_t binding_num = layout_slot->entries[entry_idx].binding;
-            uint8_t layout_stages = hina_layout_entry_stage_flags_raw(layout_slot->entries[entry_idx].flags);
-            if (!layout_stages) continue; // No explicit stages, keep module's stages
-            // Find and update matching reflection binding
-            for (uint32_t rb_idx = 0; rb_idx < e->reflection->binding_count; ++rb_idx)
-            {
-              if (e->reflection->bindings[rb_idx].set == set_idx &&
-                  e->reflection->bindings[rb_idx].binding == binding_num)
-              {
-                e->reflection->bindings[rb_idx].stages = hina_stage_mask_to_vk(layout_stages);
-                break;
-              }
-            }
-          }
-        }
-      }
-      HINA_LOGI(ctx, "Using %u explicit bind group layout(s) (production path)", explicit_layout_count);
     }
     else
     {
@@ -15565,6 +15892,12 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
       e->reflection = NULL;
       hina_pipeline_slot_free(idx);
       return (hina_pipeline){HINA_INVALID_HANDLE};
+    }
+    if (use_explicit_layouts)
+    {
+      hina_pipeline_reflection_apply_explicit_layouts(ctx, e->reflection, desc->bind_group_layouts, explicit_layout_count,
+                                                      explicit_vk_layouts);
+      HINA_LOGI(ctx, "Using %u explicit bind group layout(s) (production path)", explicit_layout_count);
     }
     // Create VkShaderModule directly from module SPIR-V
     VkShaderModuleCreateInfo cs_ci = {
@@ -15743,59 +16076,16 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   // Count derived from array - first invalid handle terminates (zero-init = use reflection)
   VkPipelineLayout layout = VK_NULL_HANDLE;
   uint32_t explicit_layout_count = hina_count_bind_group_layouts(desc->bind_group_layouts);
+  VkDescriptorSetLayout explicit_vk_layouts[HINA_MAX_DESCRIPTOR_SETS] = {VK_NULL_HANDLE};
+  const bool use_explicit_layouts = explicit_layout_count > 0;
   if (explicit_layout_count > 0)
   {
     // Production path: Use explicit bind group layouts
-    VkDescriptorSetLayout explicit_vk_layouts[HINA_MAX_DESCRIPTOR_SETS];
     layout = hina_build_layout_from_explicit_bind_groups(ctx, desc->bind_group_layouts, explicit_layout_count,
                                                          desc->push_constant_ranges, desc->push_constant_range_count,
                                                          &e->push_constant_stages, &e->push_constant_size,
                                                          explicit_vk_layouts);
     e->set_layout_count = explicit_layout_count;
-    // Copy explicit layouts to reflection for consistent access during binding
-    if (e->reflection)
-    {
-      for (uint32_t i = 0; i < e->reflection->set_count; ++i)
-      {
-        if (e->reflection->set_layouts[i])
-        {
-          vkDestroyDescriptorSetLayout(ctx->core.device->core.device, e->reflection->set_layouts[i], NULL);
-          e->reflection->set_layouts[i] = VK_NULL_HANDLE;
-        }
-      }
-      e->reflection->borrowed_layout_mask = 0;
-      for (uint32_t i = 0; i < explicit_layout_count; ++i)
-      {
-        e->reflection->set_layouts[i] = explicit_vk_layouts[i];
-        if (i < 32) e->reflection->borrowed_layout_mask |= 1u << i;
-      }
-      e->reflection->set_count = explicit_layout_count;
-      // Update reflection binding stage flags to match explicit layouts
-      // This fixes validation mismatch when user layout specifies narrower stages than shader reflection
-      for (uint32_t set_idx = 0; set_idx < explicit_layout_count; ++set_idx)
-      {
-        if (!hina_bind_group_layout_is_valid(desc->bind_group_layouts[set_idx])) continue;
-        uint16_t lidx = hina_id_index(desc->bind_group_layouts[set_idx].id);
-        hina_desc_layout_slot* layout_slot = HINA_DESC_LAYOUT_ENTRY(lidx);
-        for (uint32_t entry_idx = 0; entry_idx < layout_slot->entry_count; ++entry_idx)
-        {
-          uint8_t binding_num = layout_slot->entries[entry_idx].binding;
-          uint8_t layout_stages = hina_layout_entry_stage_flags_raw(layout_slot->entries[entry_idx].flags);
-          if (!layout_stages) continue; // No explicit stages, keep module's stages
-          // Find and update matching reflection binding
-          for (uint32_t rb_idx = 0; rb_idx < e->reflection->binding_count; ++rb_idx)
-          {
-            if (e->reflection->bindings[rb_idx].set == set_idx &&
-                e->reflection->bindings[rb_idx].binding == binding_num)
-            {
-              e->reflection->bindings[rb_idx].stages = hina_stage_mask_to_vk(layout_stages);
-              break;
-            }
-          }
-        }
-      }
-    }
-    HINA_LOGI(ctx, "Using %u explicit bind group layout(s) (production path)", explicit_layout_count);
   }
   else
   {
@@ -15812,6 +16102,12 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     e->reflection = NULL;
     hina_pipeline_slot_free(idx);
     return (hina_pipeline){HINA_INVALID_HANDLE};
+  }
+  if (use_explicit_layouts)
+  {
+    hina_pipeline_reflection_apply_explicit_layouts(ctx, e->reflection, desc->bind_group_layouts, explicit_layout_count,
+                                                    explicit_vk_layouts);
+    HINA_LOGI(ctx, "Using %u explicit bind group layout(s) (production path)", explicit_layout_count);
   }
   // Create or reuse VkShaderModules (cached if cache provided, temp otherwise)
   // Track which modules are temporary (need destruction after pipeline creation)
@@ -16205,7 +16501,7 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     .pDynamicStates = dyn_states
   };
   // Build color attachment formats for dynamic rendering
-  VkFormat vk_color_formats[HINA_MAX_COLOR_ATTACHMENTS];
+  VkFormat vk_color_formats[HINA_MAX_COLOR_ATTACHMENTS] = {VK_FORMAT_UNDEFINED};
   for (uint32_t i = 0; i < color_count; ++i)
     vk_color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
   // Dynamic rendering local read: chain attachment location/input index info for tile passes
@@ -16322,7 +16618,7 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     {
       // Use the actual color format from the pipeline descriptor, not the swapchain format
       // This ensures render pass compatibility when rendering to offscreen targets
-      VkFormat legacy_color_fmt = vk_color_formats[0];
+      VkFormat legacy_color_fmt = color_count ? vk_color_formats[0] : VK_FORMAT_UNDEFINED;
       VkFormat legacy_depth_fmt = hina_format_to_vk(desc->depth_format);
       VkSampleCountFlagBits vk_samples = hina_samples_to_vk(desc->samples);
       // Use COLOR_ATTACHMENT_OPTIMAL as final layout - explicit transitions handle the rest
@@ -18630,13 +18926,11 @@ void hina_cmd_bind_buffer(hina_cmd* cmd, uint32_t slot, hina_buffer buf, size_t 
   {
     uint16_t idx = hina_id_index(buf.id);
     hina_buffer_hot* bhot = HINA_BUF_HOT(idx);
-#ifdef HINA_DEBUG
     if (!hina_buffer_upload_ready(cmd->ctx, idx))
     {
       HINA_LOGW(cmd->ctx, "hina_cmd_bind_buffer: buffer upload not ready (slot %u)", idx);
       return;
     }
-#endif
     HINA_ASSERTF(HINA_BUFFER_GET_OWNER(bhot->config.flags_packed) == cmd->family_idx,
                  "hina_cmd_bind_buffer: buffer owned by queue family %u but used on queue family %u - use hina_cmd_acquire_buffer",
                  HINA_BUFFER_GET_OWNER(bhot->config.flags_packed), cmd->family_idx);
@@ -18672,13 +18966,11 @@ void hina_cmd_bind_storage_image(hina_cmd* cmd, uint32_t slot, hina_texture_view
     uint16_t view_idx = hina_id_index(view.id);
     hina_texture_view_slot* vs = hina_texture_view_slot_get(view_idx);
     hina_texture_hot* thot = HINA_TEX_HOT(vs->parent_idx);
-#ifdef HINA_DEBUG
     if (!hina_texture_upload_ready(cmd->ctx, vs->parent_idx))
     {
       HINA_LOGW(cmd->ctx, "hina_cmd_bind_storage_image: texture upload not ready (slot %u)", vs->parent_idx);
       return;
     }
-#endif
     HINA_ASSERTF(thot->owning_family == cmd->family_idx,
                  "hina_cmd_bind_storage_image: texture owned by queue family %u but used on queue family %u - use hina_cmd_acquire_texture",
                  thot->owning_family, cmd->family_idx);
@@ -19155,9 +19447,10 @@ static void hina_flush_explicit_groups(hina_cmd* cmd)
   while (dirty_mask)
   {
     uint32_t i = hina_ctz32(dirty_mask);
+    HINA_ASSERT(i < 32u);
     dirty_mask &= dirty_mask - 1; // Clear lowest set bit
     // Check for transient set first (takes precedence)
-    if (cmd->transient_sets_mask & 1u << i)
+    if ((cmd->transient_sets_mask & (1u << i)) != 0u)
     {
       sets[i] = cmd->transient_sets[i];
       // Copy dynamic offsets for transient sets (same as persistent)
@@ -19894,7 +20187,11 @@ void hina_cmd_apply_vertex_input(hina_cmd* cmd, const hina_vertex_input* b)
         // Fast-path: skip atomic check if already marked ready in hot struct
         if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
         {
-          hina_buffer_upload_ready(cmd->ctx, idx);
+          if (!hina_buffer_upload_ready(cmd->ctx, idx))
+          {
+            HINA_LOGW(cmd->ctx, "hina_cmd_apply_vertex_input: vertex buffer upload pending (slot %u)", idx);
+            return;
+          }
         }
         // Assert vertex buffer has VERTEX_BUFFER usage flag
         HINA_ASSERTF((bhot->config.usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) != 0,
@@ -19921,7 +20218,11 @@ void hina_cmd_apply_vertex_input(hina_cmd* cmd, const hina_vertex_input* b)
       // Fast-path: skip atomic check if already marked ready in hot struct
       if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
       {
-        hina_buffer_upload_ready(cmd->ctx, idx);
+        if (!hina_buffer_upload_ready(cmd->ctx, idx))
+        {
+          HINA_LOGW(cmd->ctx, "hina_cmd_apply_vertex_input: index buffer upload pending (slot %u)", idx);
+          return;
+        }
       }
       // Assert index buffer has INDEX_BUFFER usage flag
       HINA_ASSERTF((bhot->config.usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) != 0,
@@ -20021,7 +20322,11 @@ void hina_cmd_draw_indexed_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uin
   // Fast-path: skip atomic check if already marked ready in hot struct
   if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
   {
-    hina_buffer_upload_ready(cmd->ctx, buf_idx);
+    if (!hina_buffer_upload_ready(cmd->ctx, buf_idx))
+    {
+      HINA_LOGW(cmd->ctx, "hina_cmd_draw_indexed_indirect: indirect buffer upload pending (slot %u)", buf_idx);
+      return;
+    }
   }
   // Assert queue ownership (exclusive sharing mode)
   // Also allow pending acquire (deferred ownership update for multi-threaded recording)
@@ -20161,7 +20466,11 @@ void hina_cmd_dispatch_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_
   // Fast-path: skip atomic check if already marked ready in hot struct
   if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
   {
-    hina_buffer_upload_ready(cmd->ctx, buf_idx);
+    if (!hina_buffer_upload_ready(cmd->ctx, buf_idx))
+    {
+      HINA_LOGW(cmd->ctx, "hina_cmd_dispatch_indirect: indirect buffer upload pending (slot %u)", buf_idx);
+      return;
+    }
   }
   // Assert queue ownership (exclusive sharing mode)
   // Also allow pending acquire (deferred ownership update for multi-threaded recording)
@@ -20466,8 +20775,10 @@ static void hina_poll_lane_completions(hina_context* ctx)
   }
 }
 
-// Simplified upload ready logic: just check bit, flush, wait for global ticket, set bit
-// No per-resource state tracking - uses global last_submit_ticket from staging context
+// Upload readiness model:
+// - fast path: ready bit in hot data
+// - pending bitset: resource has an in-flight or staged upload
+// - global batch ring: maps submission tickets back to resource handles
 static bool hina_buffer_upload_ready(hina_context* ctx, uint16_t idx)
 {
   hina_buffer_hot* hot = HINA_BUF_HOT(idx);
@@ -20478,38 +20789,51 @@ static bool hina_buffer_upload_ready(hina_context* ctx, uint16_t idx)
     return true;
   }
 
-  // Slow path: flush any pending staged uploads
-  // IMPORTANT: Don't flush if we're currently recording (pending_cmd != NULL)
-  // as that would end the command buffer mid-recording and cause validation errors
-  hina_staging_context* sc = &ctx->staging;
-  bool has_staged = sc->staged_buffers.count > 0 || sc->staged_textures.count > 0;
-  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
-  if (has_staged && !is_recording)
+  if (!hina_buffer_upload_pending(ctx, idx))
   {
-    hina_auto_flush_staged(ctx);
+    hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
+    return true;
   }
 
-  // Wait for all pending uploads to complete (both transfer and graphics queues)
-  // Only wait if not currently recording (can't wait on ourselves)
-  if (!is_recording)
+  // Try local auto-flush (safe only when we're not recording in this context).
+  hina_staging_context* sc = &ctx->staging;
+  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
+  if (!is_recording && (sc->staged_buffers.count > 0 || sc->staged_textures.count > 0))
   {
-    if (sc->last_submit_ticket > 0)
+    hina_auto_flush_staged(ctx);
+    if (!hina_buffer_upload_pending(ctx, idx))
     {
-      hina_staging_ctx_wait(ctx, sc->last_submit_ticket);
+      hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
+      return true;
     }
-    if (sc->last_gfx_submit_ticket > 0)
-    {
-      hina_staging_ctx_wait(ctx, sc->last_gfx_submit_ticket);
-    }
-    if (sc->last_comp_submit_ticket > 0)
-    {
-      hina_staging_ctx_wait(ctx, sc->last_comp_submit_ticket);
-    }
-    // Mark as ready only if we actually waited
-    hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
   }
-  // If still recording, the resource isn't ready yet but will be after frame submit
-  return !is_recording;
+
+  uint32_t handle_id = ((uint32_t)g_storage.buffer_pool.slots[idx].generation << 16) | idx;
+  uint64_t wait_ticket = 0;
+  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);
+  hina_poll_lane_completions(ctx);
+  hina_spin_lock(&ring->lock);
+  hina_upload_ring_retire_completed_locked(ctx, ring);
+  if (hina_buffer_upload_pending(ctx, idx))
+  {
+    wait_ticket = hina_upload_ring_find_ticket_locked(ring, handle_id, false);
+  }
+  hina_spin_unlock(&ring->lock);
+  if (!wait_ticket)
+  {
+    return !hina_buffer_upload_pending(ctx, idx);
+  }
+
+  hina_staging_ctx_wait(ctx, wait_ticket);
+  hina_poll_lane_completions(ctx);
+  hina_spin_lock(&ring->lock);
+  hina_upload_ring_retire_completed_locked(ctx, ring);
+  bool pending = hina_buffer_upload_pending(ctx, idx);
+  hina_spin_unlock(&ring->lock);
+  if (pending) return false;
+
+  hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
+  return true;
 }
 
 static bool hina_texture_upload_ready(hina_context* ctx, uint16_t idx)
@@ -20522,38 +20846,51 @@ static bool hina_texture_upload_ready(hina_context* ctx, uint16_t idx)
     return true;
   }
 
-  // Slow path: flush any pending staged uploads
-  // IMPORTANT: Don't flush if we're currently recording (pending_cmd != NULL)
-  // as that would end the command buffer mid-recording and cause validation errors
-  hina_staging_context* sc = &ctx->staging;
-  bool has_staged = sc->staged_buffers.count > 0 || sc->staged_textures.count > 0;
-  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
-  if (has_staged && !is_recording)
+  if (!hina_texture_upload_pending(ctx, idx))
   {
-    hina_auto_flush_staged(ctx);
+    hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
+    return true;
   }
 
-  // Wait for all pending uploads to complete (both transfer and graphics queues)
-  // Only wait if not currently recording (can't wait on ourselves)
-  if (!is_recording)
+  // Try local auto-flush (safe only when we're not recording in this context).
+  hina_staging_context* sc = &ctx->staging;
+  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
+  if (!is_recording && (sc->staged_buffers.count > 0 || sc->staged_textures.count > 0))
   {
-    if (sc->last_submit_ticket > 0)
+    hina_auto_flush_staged(ctx);
+    if (!hina_texture_upload_pending(ctx, idx))
     {
-      hina_staging_ctx_wait(ctx, sc->last_submit_ticket);
+      hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
+      return true;
     }
-    if (sc->last_gfx_submit_ticket > 0)
-    {
-      hina_staging_ctx_wait(ctx, sc->last_gfx_submit_ticket);
-    }
-    if (sc->last_comp_submit_ticket > 0)
-    {
-      hina_staging_ctx_wait(ctx, sc->last_comp_submit_ticket);
-    }
-    // Mark as ready only if we actually waited
-    hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
   }
-  // If still recording, the resource isn't ready yet but will be after frame submit
-  return !is_recording;
+
+  uint32_t handle_id = ((uint32_t)g_storage.texture_pool.slots[idx].generation << 16) | idx;
+  uint64_t wait_ticket = 0;
+  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);
+  hina_poll_lane_completions(ctx);
+  hina_spin_lock(&ring->lock);
+  hina_upload_ring_retire_completed_locked(ctx, ring);
+  if (hina_texture_upload_pending(ctx, idx))
+  {
+    wait_ticket = hina_upload_ring_find_ticket_locked(ring, handle_id, true);
+  }
+  hina_spin_unlock(&ring->lock);
+  if (!wait_ticket)
+  {
+    return !hina_texture_upload_pending(ctx, idx);
+  }
+
+  hina_staging_ctx_wait(ctx, wait_ticket);
+  hina_poll_lane_completions(ctx);
+  hina_spin_lock(&ring->lock);
+  hina_upload_ring_retire_completed_locked(ctx, ring);
+  bool pending = hina_texture_upload_pending(ctx, idx);
+  hina_spin_unlock(&ring->lock);
+  if (pending) return false;
+
+  hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
+  return true;
 }
 
 static void hina_flush_all_lane_zombies(hina_context* ctx)
@@ -20571,6 +20908,10 @@ static void hina_flush_all_lane_zombies(hina_context* ctx)
 static void hina_poll_submissions_locked(hina_context* ctx)
 {
   hina_poll_lane_completions(ctx);
+  hina_upload_batch_ring* upload_ring = hina_upload_ring_get(ctx);
+  hina_spin_lock(&upload_ring->lock);
+  hina_upload_ring_retire_completed_locked(ctx, upload_ring);
+  hina_spin_unlock(&upload_ring->lock);
   for (size_t i = 0; i < HINA_ARRAY_SIZE(ctx->core.device->sync.submissions); ++i)
   {
     hina_submission_entry* e = &ctx->core.device->sync.submissions[i];
@@ -22261,6 +22602,7 @@ static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* 
     hina_texture tex = hina_texture_slot_alloc();
     uint16_t idx = hina_id_index(tex.id);
     hina_texture_hot* hot = HINA_TEX_HOT(idx);
+    hina_texture_upload_pending_clear(ctx, idx);
     hot->vk.image = images[i];
     hot->vk.default_view = view;
     hot->dims.format = chosen.format;
@@ -22274,7 +22616,7 @@ static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* 
     hot->state.access = 0;
     hot->state.stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     hot->owns_image = false;
-    hot->texture_dim = HINA_TEX_DIM_2D;
+    hot->texture_dim = HINA_TEX_DIM_2D | HINA_TEXTURE_UPLOAD_READY_BIT;
     // Register swapchain view in the texture view pool.
     hina_texture_view default_view_handle = hina_texture_view_slot_alloc();
     HINA_ASSERT(default_view_handle.id != HINA_INVALID_HANDLE && "texture_view pool exhausted");
@@ -22405,12 +22747,21 @@ static hina_swapchain_image hina_ctx_acquire_swapchain_image(hina_context* ctx)
                                      ctx->core.device->surface.swapchain.resources.acquire_semaphores[sem_index],
                                      VK_NULL_HANDLE, &idx);
   // Cold path: Swapchain out of date (window resize) - recreate and retry
+  // On desktop, VK_SUBOPTIMAL_KHR also triggers recreation because different GPU drivers
+  // return SUBOPTIMAL vs OUT_OF_DATE inconsistently on resize, causing stale swapchain dimensions.
+  // On Android, SUBOPTIMAL is expected for pre-rotation and should not trigger recreation.
+#ifdef __ANDROID__
   if (r == VK_ERROR_OUT_OF_DATE_KHR)
+#else
+  if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
+#endif
   {
     r = hina_acquire_handle_out_of_date(ctx, &idx, &sem_index);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) return result; // Recreation failed
   }
-  if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;
+#ifdef __ANDROID__
+  if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS; // Android: allow suboptimal for pre-rotation
+#endif
   if (r == VK_ERROR_SURFACE_LOST_KHR || (r < 0 && r != VK_ERROR_OUT_OF_DATE_KHR))
   {
     HINA_LOGW(ctx, "Surface lost (VkResult=%d), marking for recreation", (int)r);
@@ -22461,7 +22812,12 @@ static void hina_ctx_present(hina_context* ctx, hina_swapchain_image image)
     .pSwapchains = &ctx->core.device->surface.swapchain.vk.swapchain, .pImageIndices = &img_index
   };
   VkResult r = hina_queue_lane_present(ctx->core.device, ctx->core.device->queue.lanes.indices.present_idx, &pi);
+  // On desktop, recreate on SUBOPTIMAL (see acquire path comment for rationale)
+#ifdef __ANDROID__
   if (r == VK_ERROR_OUT_OF_DATE_KHR)
+#else
+  if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
+#endif
   {
     const hina_swapchain_desc* sd = &ctx->core.device->surface.swapchain_desc;
     hina_create_swapchain(ctx, sd);
@@ -22471,7 +22827,11 @@ static void hina_ctx_present(hina_context* ctx, hina_swapchain_image image)
     HINA_LOGW(ctx, "Surface lost during present (VkResult=%d), marking for recreation", (int)r);
     hina_atomic_store32(&ctx->core.device->surface.surface_lost, 1);
   }
+#ifdef __ANDROID__
   else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
+#else
+  else if (r != VK_SUCCESS)
+#endif
   {
     HINA_VK_CHECK(ctx, r);
   }
@@ -23229,6 +23589,39 @@ static struct
   hslc_log_fn log_fn;
   void* log_user_data;
 } g_shader_state = {0};
+static mtx_t g_shader_state_lock;
+static hina_atomic32_t g_shader_state_lock_ready = 0;
+static hina_spinlock g_shader_state_lock_init = {0};
+
+static void hslc_state_lock(void)
+{
+  if (hina_atomic_load32_relaxed(&g_shader_state_lock_ready) == 0)
+  {
+    hina_spin_lock(&g_shader_state_lock_init);
+    if (hina_atomic_load32_relaxed(&g_shader_state_lock_ready) == 0)
+    {
+      if (mtx_init(&g_shader_state_lock, mtx_recursive) != 0)
+      {
+        hina_spin_unlock(&g_shader_state_lock_init);
+        HINA_FATAL("Failed to initialize shader state lock");
+      }
+      hina_atomic_store32_release(&g_shader_state_lock_ready, 1);
+    }
+    hina_spin_unlock(&g_shader_state_lock_init);
+  }
+  if (mtx_lock(&g_shader_state_lock) != 0)
+  {
+    HINA_FATAL("Failed to lock shader state lock");
+  }
+}
+
+static void hslc_state_unlock(void)
+{
+  if (mtx_unlock(&g_shader_state_lock) != 0)
+  {
+    HINA_FATAL("Failed to unlock shader state lock");
+  }
+}
 
 // Internal Allocator Functions (uses stdlib)
 static void* shader_alloc(size_t size)
@@ -23244,13 +23637,17 @@ static void shader_free(void* ptr)
 // Internal Logging Functions
 static void shader_log(hina_log_level level, const char* fmt, ...)
 {
-  if (!g_shader_state.log_fn) return;
+  hslc_state_lock();
+  hslc_log_fn log_fn = g_shader_state.log_fn;
+  void* log_user_data = g_shader_state.log_user_data;
+  hslc_state_unlock();
+  if (!log_fn) return;
   char buf[1024];
   va_list args;
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  g_shader_state.log_fn(level, buf, g_shader_state.log_user_data);
+  log_fn(level, buf, log_user_data);
 }
 
 #define SHADER_LOGI(...) shader_log(HINA_LOG_INFO, __VA_ARGS__)
@@ -23259,8 +23656,10 @@ static void shader_log(hina_log_level level, const char* fmt, ...)
 // Shader Module Init/Shutdown
 bool hslc_init(const hslc_config* config)
 {
+  hslc_state_lock();
   if (g_shader_state.initialized)
   {
+    hslc_state_unlock();
     return true; // Already initialized
   }
   // Store logging callback
@@ -23277,35 +23676,45 @@ bool hslc_init(const hslc_config* config)
   // Initialize glslang
   if (!glslang_initialize_process())
   {
+    hslc_state_unlock();
     SHADER_LOGE("Failed to initialize glslang");
     return false;
   }
   g_shader_state.glslang_initialized = true;
   g_shader_state.initialized = true;
+  hslc_state_unlock();
   SHADER_LOGI("Shader module initialized");
   return true;
 }
 
 void hslc_shutdown(void)
 {
+  hslc_state_lock();
   if (!g_shader_state.initialized)
   {
+    hslc_state_unlock();
     return;
   }
-  // Release thread-local SPIRV linter state
+  // Clears only the calling thread's lint buffer; other threads free theirs at thread exit.
   hina_spirv_lint_cleanup();
   if (g_shader_state.glslang_initialized)
   {
     glslang_finalize_process();
     g_shader_state.glslang_initialized = false;
   }
+  // Shutdown is serialized by g_shader_state_lock. Callers should avoid
+  // concurrent compile+shutdown lifecycle transitions at application level.
   SHADER_LOGI("Shader module shutdown");
   memset(&g_shader_state, 0, sizeof(g_shader_state));
+  hslc_state_unlock();
 }
 
 bool hslc_is_initialized(void)
 {
-  return g_shader_state.initialized;
+  hslc_state_lock();
+  bool initialized = g_shader_state.initialized;
+  hslc_state_unlock();
+  return initialized;
 }
 
 // Preprocessor Constants
@@ -27356,16 +27765,22 @@ bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stag
                        uint32_t** out_words, size_t* out_word_count)
 {
   if (!source || !out_words || !out_word_count) return false;
+  hslc_state_lock();
   // Auto-initialize shader module if not already done
   if (!g_shader_state.initialized)
   {
     if (!hslc_init(NULL))
     {
+      hslc_state_unlock();
       return false;
     }
   }
   char* code = shader_alloc(length + 1);
-  if (!code) return false;
+  if (!code)
+  {
+    hslc_state_unlock();
+    return false;
+  }
   memcpy(code, source, length);
   code[length] = '\0';
   glslang_stage_t gstage = hslc_hina_to_glslang_stage(stage);
@@ -27381,18 +27796,21 @@ bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stag
   if (!shader)
   {
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   if (!glslang_shader_preprocess(shader, &input))
   {
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   if (!glslang_shader_parse(shader, &input))
   {
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   glslang_program_t* program = glslang_program_create();
@@ -27400,6 +27818,7 @@ bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stag
   {
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   glslang_program_add_shader(program, shader);
@@ -27408,6 +27827,7 @@ bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stag
     glslang_program_delete(program);
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   // Generate SPIR-V with validation and optimization enabled
@@ -27421,6 +27841,7 @@ bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stag
     glslang_program_delete(program);
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   uint32_t* out = shader_alloc(sizeof(uint32_t) * words);
@@ -27429,6 +27850,7 @@ bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stag
     glslang_program_delete(program);
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   glslang_program_SPIRV_get(program, out);
@@ -27437,6 +27859,7 @@ bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stag
   glslang_program_delete(program);
   glslang_shader_delete(shader);
   shader_free(code);
+  hslc_state_unlock();
   return true;
 }
 
@@ -27477,6 +27900,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
                                            size_t* out_word_count, char** out_log)
 {
   if (!source || !out_words || !out_word_count) return false;
+  hslc_state_lock();
   // Auto-initialize shader module if not already done
   if (!g_shader_state.initialized)
   {
@@ -27487,12 +27911,17 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
         *out_log = (char*)shader_alloc(64);
         if (*out_log) strcpy(*out_log, "Failed to initialize shader module");
       }
+      hslc_state_unlock();
       return false;
     }
   }
   size_t length = strlen(source);
   char* code = shader_alloc(length + 1);
-  if (!code) return false;
+  if (!code)
+  {
+    hslc_state_unlock();
+    return false;
+  }
   memcpy(code, source, length + 1);
   glslang_stage_t gstage = hslc_hina_to_glslang_stage(stage);
   const glslang_input_t input = {
@@ -27512,6 +27941,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
       *out_log = (char*)shader_alloc(64);
       if (*out_log) strcpy(*out_log, "Failed to create shader object");
     }
+    hslc_state_unlock();
     return false;
   }
   // Preprocess
@@ -27529,6 +27959,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     }
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   // Parse
@@ -27546,6 +27977,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     }
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   // Link
@@ -27559,6 +27991,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
       *out_log = (char*)shader_alloc(64);
       if (*out_log) strcpy(*out_log, "Failed to create program object");
     }
+    hslc_state_unlock();
     return false;
   }
   glslang_program_add_shader(program, shader);
@@ -27577,6 +28010,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     glslang_program_delete(program);
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   // Generate SPIR-V with validation and optimization enabled
@@ -27606,6 +28040,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     glslang_program_delete(program);
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   uint32_t* out = shader_alloc(sizeof(uint32_t) * words);
@@ -27614,6 +28049,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     glslang_program_delete(program);
     glslang_shader_delete(shader);
     shader_free(code);
+    hslc_state_unlock();
     return false;
   }
   glslang_program_SPIRV_get(program, out);
@@ -27634,6 +28070,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
   glslang_program_delete(program);
   glslang_shader_delete(shader);
   shader_free(code);
+  hslc_state_unlock();
   return true;
 }
 
@@ -28568,240 +29005,6 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
   };
   return hslc_compile_hsl_module_ex(&desc, out_error);
 }
-
-// Legacy implementation preserved as reference (now forwarded to hslc_compile_hsl_module_ex)
-#if 0
-hina_hsl_module* hslc_compile_hsl_source_legacy(const char* source, const char* source_name, char** out_error)
-{
-  if (!source)
-  {
-    if (out_error)
-    {
-      *out_error = hslc_strdup("hslc_compile_hsl_source: source is NULL");
-    }
-    return NULL;
-  }
-  // Expand includes before HSL parsing (enables #include in #hina blocks)
-  hsl_include_context inc_ctx;
-  hslc_include_ctx_init(&inc_ctx, NULL, NULL);
-  const char* main_name = source_name ? source_name : "<inline>";
-  char* expanded = hslc_expand_includes(&inc_ctx, main_name, source);
-  if (!expanded)
-  {
-    if (out_error && inc_ctx.error_msg)
-    {
-      *out_error = inc_ctx.error_msg;
-      inc_ctx.error_msg = NULL;
-    }
-    hslc_include_ctx_free(&inc_ctx);
-    return NULL;
-  }
-  hslc_include_ctx_free(&inc_ctx);
-  // Strip #line directives from expanded source (HSL parser doesn't understand them;
-  // per-stage compilation will re-expand includes and emit its own #line directives)
-  {
-    char* r = expanded;
-    char* w = expanded;
-    while (*r)
-    {
-      if (r[0] == '#' && strncmp(r, "#line ", 6) == 0)
-      {
-        while (*r && *r != '\n') r++;
-        if (*r == '\n') r++;
-        continue;
-      }
-      const char* eol = r;
-      while (*eol && *eol != '\n') eol++;
-      if (*eol == '\n') eol++;
-      size_t len = (size_t)(eol - r);
-      if (w != r) memmove(w, r, len);
-      w += len;
-      r = (char*)eol;
-    }
-    *w = '\0';
-  }
-  // Check for HSL syntax
-  if (!hslc_check_syntax(expanded))
-  {
-    if (out_error)
-    {
-      *out_error = hslc_strdup("HSL syntax required. Use #hina/#hina_end blocks.");
-    }
-    shader_free(expanded);
-    return NULL;
-  }
-  // Parse HSL to validate syntax and determine module type
-  hsl_module_ir* ir = hslc_parse_source(expanded, source_name);
-  if (ir->had_error)
-  {
-    if (out_error)
-    {
-      *out_error = hslc_strdup(ir->error_msg);
-    }
-    hslc_module_ir_free(ir);
-    shader_free(expanded);
-    return NULL;
-  }
-  // Determine module type from parsed stages
-  bool has_vertex = ir->stages[HSL_STAGE_VERTEX].defined;
-  bool has_fragment = ir->stages[HSL_STAGE_FRAGMENT].defined;
-  bool has_compute = ir->stages[HSL_STAGE_COMPUTE].defined;
-  typedef enum
-  {
-    HSL_MODULE_GRAPHICS = 0,
-    HSL_MODULE_COMPUTE
-  } hsl_module_type;
-  hsl_module_type module_type;
-  if (has_compute)
-  {
-    if (has_vertex || has_fragment)
-    {
-      if (out_error)
-      {
-        *out_error = hslc_strdup("Cannot mix compute stage with graphics stages");
-      }
-      hslc_module_ir_free(ir);
-      shader_free(expanded);
-      return NULL;
-    }
-    module_type = HSL_MODULE_COMPUTE;
-  }
-  else
-  {
-    if (!has_vertex)
-    {
-      if (out_error)
-      {
-        *out_error = hslc_strdup("Graphics module requires at least a vertex stage");
-      }
-      hslc_module_ir_free(ir);
-      shader_free(expanded);
-      return NULL;
-    }
-    module_type = HSL_MODULE_GRAPHICS;
-    // Warn about vertex-only modules (might be unintentional)
-    if (has_vertex && !has_fragment)
-    {
-      SHADER_LOGW("  Compiling vertex-only module (no fragment stage). "
-                  "This is valid for depth pre-pass but may be unintentional.");
-    }
-  }
-  // Detect optional stages from parsed IR before freeing
-  bool has_tcs = ir->stages[HSL_STAGE_TESS_CONTROL].defined;
-  bool has_tes = ir->stages[HSL_STAGE_TESS_EVAL].defined;
-  bool has_gs = ir->stages[HSL_STAGE_GEOMETRY].defined;
-  hslc_module_ir_free(ir);
-  hina_hsl_module* module = shader_alloc(sizeof(hina_hsl_module));
-  if (!module)
-  {
-    if (out_error)
-    {
-      *out_error = hslc_strdup("Failed to allocate HSL module");
-    }
-    shader_free(expanded);
-    return NULL;
-  }
-  memset(module, 0, sizeof(*module));
-  module->source_name = hslc_strdup(source_name ? source_name : "<inline>");
-  hsl_module_kind module_kind = module_type == HSL_MODULE_COMPUTE ? HINA_HSL_MODULE_COMPUTE : HINA_HSL_MODULE_GRAPHICS;
-  if (module_kind == HINA_HSL_MODULE_COMPUTE)
-  {
-    if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_COMPUTE, &module->cs, out_error))
-    {
-      shader_free(expanded);
-      hslc_hsl_module_free(module);
-      return NULL;
-    }
-  }
-  else
-  {
-    if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_VERTEX, &module->vs, out_error))
-    {
-      shader_free(expanded);
-      hslc_hsl_module_free(module);
-      return NULL;
-    }
-    if (has_tcs)
-    {
-      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_TESS_CONTROL, &module->tcs, out_error))
-      {
-        shader_free(expanded);
-        hslc_hsl_module_free(module);
-        return NULL;
-      }
-    }
-    if (has_tes)
-    {
-      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_TESS_EVAL, &module->tes, out_error))
-      {
-        shader_free(expanded);
-        hslc_hsl_module_free(module);
-        return NULL;
-      }
-    }
-    if (has_gs)
-    {
-      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_GEOMETRY, &module->gs, out_error))
-      {
-        shader_free(expanded);
-        hslc_hsl_module_free(module);
-        return NULL;
-      }
-    }
-    // Fragment shader (optional for vertex-only pipelines like depth pre-pass)
-    if (has_fragment)
-    {
-      if (!hslc_compile_stage(source, source_name, HINA_SHADER_STAGE_FRAGMENT, &module->fs, out_error))
-      {
-        shader_free(expanded);
-        hslc_hsl_module_free(module);
-        return NULL;
-      }
-    }
-    // Reflect vertex inputs
-    if (!hslc_reflect_vertex_inputs(&module->vs, &module->vertex_inputs, &module->vertex_input_count))
-    {
-      if (out_error)
-      {
-        *out_error = hslc_strdup("Failed to reflect vertex inputs");
-      }
-      shader_free(expanded);
-      hslc_hsl_module_free(module);
-      return NULL;
-    }
-  }
-  // Validate Vulkan 1.0 limits using SPIR-V reflection data
-  if (module->vertex_input_count > HINA_MAX_VERTEX_ATTRS)
-  {
-    if (out_error)
-    {
-      char msg[256];
-      snprintf(msg, sizeof(msg),
-               "Vulkan 1.0 limit exceeded: Vertex shader has %u input attributes, "
-               "but Vulkan 1.0 guarantees only %d (maxVertexInputAttributes)", module->vertex_input_count,
-               HINA_MAX_VERTEX_ATTRS);
-      *out_error = hslc_strdup(msg);
-    }
-    shader_free(expanded);
-    hslc_hsl_module_free(module);
-    return NULL;
-  }
-  // Reflect push constants
-  if (!hslc_reflect_push_constants(&module->vs, &module->tcs, &module->tes, &module->gs, &module->fs, &module->cs,
-                                   &module->push_constants, &module->push_constant_count))
-  {
-    if (out_error)
-    {
-      *out_error = hslc_strdup("Failed to reflect push constants");
-    }
-    shader_free(expanded);
-    hslc_hsl_module_free(module);
-    return NULL;
-  }
-  shader_free(expanded);
-  return module;
-}
-#endif // Legacy implementation
 
 void hslc_hsl_module_free(hina_hsl_module* module)
 {
