@@ -137,6 +137,14 @@ static bool example_init(hina_example_app* app) {
         EXAMPLE_LOGE("Failed to create output storage buffer");
         return false;
     }
+    // Transient bind group writes don't auto-wait; flush and wait the initial
+    // staged uploads before first frame uses these buffers as storage descriptors.
+    hina_ticket init_uploads = hina_flush_uploads();
+    if (init_uploads) {
+        hina_wait_ticket(init_uploads);
+    }
+    hina_wait_buffer(g_app.ssbo_in);
+    hina_wait_buffer(g_app.ssbo_out);
 
     // Create Compute UBO
     hina_buffer_desc ubo_desc = {0};

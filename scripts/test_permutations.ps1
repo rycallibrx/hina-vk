@@ -1,4 +1,4 @@
-# test_permutations.ps1 - Stress test core examples across flag permutations
+# test_permutations.ps1 - Stress test examples across flag permutations
 #
 # Usage:
 #   .\scripts\test_permutations.ps1                   # Full stress run (2s each)
@@ -32,7 +32,7 @@ $BuildDir = Join-Path $RepoRoot "build"
 $LogDir = Join-Path $BuildDir "test_logs"
 
 # Configuration
-$CoreExamples = @(
+$QuickCoreExamples = @(
     "triangle",             # swapchain + basic graphics
     "pipelines",            # pipeline churn + render pass usage
     "descriptorsets",       # descriptor pools/updates + MSAA resolve
@@ -132,6 +132,23 @@ function Find-ExampleExe {
         }
     }
     return $null
+}
+
+function Get-DiscoveredExamples {
+    param(
+        [string]$ExamplesRoot
+    )
+
+    if (-not (Test-Path $ExamplesRoot)) {
+        return @()
+    }
+
+    $examples = Get-ChildItem -Path $ExamplesRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName "CMakeLists.txt") } |
+        Select-Object -ExpandProperty Name |
+        Sort-Object
+
+    return @($examples)
 }
 
 # Validation error patterns
@@ -337,6 +354,21 @@ if ($Quick) {
     $PerfDuration = 2.0
 }
 
+# Default example selection:
+# - Quick mode: curated core set with smart per-example flags
+# - Full mode: auto-discover all example targets from examples/*/CMakeLists.txt
+$ExamplesRoot = Join-Path $RepoRoot "examples"
+$CoreExamples = @()
+if ($Quick) {
+    $CoreExamples = @($QuickCoreExamples)
+} else {
+    $CoreExamples = Get-DiscoveredExamples -ExamplesRoot $ExamplesRoot
+    if ($CoreExamples.Count -eq 0) {
+        # Fallback to curated set if discovery fails
+        $CoreExamples = @($QuickCoreExamples)
+    }
+}
+
 # Filter examples if specified
 if ($Example -ne "") {
     $CoreExamples = @($Example)
@@ -446,7 +478,7 @@ foreach ($ExampleName in $CoreExamples) {
         Write-Host "[$TestNum/$TotalTests] Testing: $ExampleName" -ForegroundColor Yellow
         Write-Host "  Flags: $FlagsStr" -ForegroundColor Gray
 
-        $AllArgs = $Flags + @("--duration=$Duration")
+        $AllArgs = @($Flags) + @("--duration=$Duration")
         $TimeoutMs = [int](($Duration + 5) * 1000)
 
         try {
