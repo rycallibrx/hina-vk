@@ -134,8 +134,8 @@
  *   buffers and textures before writing descriptors.
  * - **Vertex/Index binding**: `hina_cmd_apply_vertex_input()` waits for vertex and
  *   index buffers' uploads to complete.
- * - **Indirect commands**: `hina_cmd_draw_indexed_indirect()` and
- *   `hina_cmd_dispatch_indirect()` wait for the indirect buffer's upload.
+ * - **Indirect commands**: `hina_cmd_draw_indirect()`, `hina_cmd_draw_indexed_indirect()`,
+ *   and `hina_cmd_dispatch_indirect()` wait for the indirect buffer's upload.
  * - **Slot-based bindings**: `hina_cmd_bind_buffer()` and `hina_cmd_bind_storage_image()`
  *   check upload readiness before accepting a binding.
  *
@@ -2547,6 +2547,13 @@ typedef struct hina_specialization_constant
   } value;
 } hina_specialization_constant;
 
+typedef struct hina_stage_specialization
+{
+  hina_shader_stage stage; // HINA_SHADER_STAGE_VERTEX, HINA_SHADER_STAGE_FRAGMENT, etc.
+  const hina_specialization_constant* constants;
+  uint32_t count;
+} hina_stage_specialization;
+
 // Forward declaration for tile pass layout (full definition below hina_tile_pass_desc)
 typedef struct hina_tile_pass_layout hina_tile_pass_layout;
 /**
@@ -2602,17 +2609,9 @@ typedef struct hina_pipeline_desc
   // Push Constants
   uint32_t push_constant_range_count;
   const hina_push_constant_range* push_constant_ranges;
-  // Specialization Constants (optional, per-stage)
-  const hina_specialization_constant* vs_specializations;
-  uint32_t vs_specialization_count;
-  const hina_specialization_constant* tcs_specializations;
-  uint32_t tcs_specialization_count;
-  const hina_specialization_constant* tes_specializations;
-  uint32_t tes_specialization_count;
-  const hina_specialization_constant* gs_specializations;
-  uint32_t gs_specialization_count;
-  const hina_specialization_constant* fs_specializations;
-  uint32_t fs_specialization_count;
+  // Specialization Constants (optional, tagged by stage)
+  const hina_stage_specialization* specializations;
+  uint32_t specialization_count;
 
   /**
    * Explicit bind group layouts (optional, production path).
@@ -2639,6 +2638,9 @@ typedef struct hina_compute_pipeline_desc
   hina_shader cs;
   uint32_t push_constant_range_count;
   const hina_push_constant_range* push_constant_ranges;
+  // Specialization Constants (optional, use HINA_SHADER_STAGE_COMPUTE)
+  const hina_stage_specialization* specializations;
+  uint32_t specialization_count;
   /**
    * Explicit bind group layouts (optional).
    * Count derived from array - first invalid handle terminates (zero-init = use reflection).
@@ -2725,17 +2727,9 @@ typedef struct hina_hsl_pipeline_desc
   const hina_tile_pass_layout* tile_layout; // Required when subpass_index > 0 (subpass_index < subpass_count)
   uint32_t push_constant_range_count;
   const hina_push_constant_range* push_constant_ranges;
-  // Specialization Constants (optional, per-stage)
-  const hina_specialization_constant* vs_specializations;
-  uint32_t vs_specialization_count;
-  const hina_specialization_constant* tcs_specializations;
-  uint32_t tcs_specialization_count;
-  const hina_specialization_constant* tes_specializations;
-  uint32_t tes_specialization_count;
-  const hina_specialization_constant* gs_specializations;
-  uint32_t gs_specialization_count;
-  const hina_specialization_constant* fs_specializations;
-  uint32_t fs_specialization_count;
+  // Specialization Constants (optional, tagged by stage)
+  const hina_stage_specialization* specializations;
+  uint32_t specialization_count;
   /**
    * Explicit bind group layouts (optional, production path).
    * Count derived from array - first invalid handle terminates (zero-init = use reflection).
@@ -2759,8 +2753,8 @@ HINA_API hina_hsl_pipeline_desc hina_hsl_pipeline_desc_default(void);
  * The module contains reflection data that validates specialization constants
  * and can auto-generate vertex layouts.
  *
- * @note For compute modules, graphics state fields are ignored and
- *       desc->vs_specializations are applied to the compute stage.
+ * @note For compute modules, graphics state fields are ignored and only
+ *       HINA_SHADER_STAGE_COMPUTE specializations are applied.
  *
  * @param module Compiled HSL module from hslc_compile_hsl()
  * @param desc Pipeline state (shader source fields are ignored, uses module's SPIR-V)
@@ -2881,6 +2875,42 @@ typedef struct hina_pass_action
   uint32_t height;
   uint32_t flags; // hina_pass_flags
 } hina_pass_action;
+
+// Convenience: color attachment with CLEAR/STORE and specified clear color
+static inline hina_color_attachment hina_color_attachment_clear(
+  hina_texture_view image, float r, float g, float b, float a)
+{
+  hina_color_attachment attachment = {0};
+  attachment.image = image;
+  attachment.load_op = HINA_LOAD_OP_CLEAR;
+  attachment.store_op = HINA_STORE_OP_STORE;
+  attachment.clear_color[0] = r;
+  attachment.clear_color[1] = g;
+  attachment.clear_color[2] = b;
+  attachment.clear_color[3] = a;
+  return attachment;
+}
+
+// Convenience: color attachment with LOAD/STORE (post-processing, UI overlay)
+static inline hina_color_attachment hina_color_attachment_load(hina_texture_view image)
+{
+  hina_color_attachment attachment = {0};
+  attachment.image = image;
+  attachment.load_op = HINA_LOAD_OP_LOAD;
+  attachment.store_op = HINA_STORE_OP_STORE;
+  return attachment;
+}
+
+// Convenience: depth attachment with CLEAR/STORE
+static inline hina_depth_attachment hina_depth_attachment_clear(hina_texture_view image, float depth)
+{
+  hina_depth_attachment attachment = {0};
+  attachment.image = image;
+  attachment.load_op = HINA_LOAD_OP_CLEAR;
+  attachment.store_op = HINA_STORE_OP_STORE;
+  attachment.depth_clear = depth;
+  return attachment;
+}
 
 /**
  * @brief Begin a dynamic render pass.
@@ -3027,6 +3057,9 @@ HINA_API void hina_cmd_draw(hina_cmd* cmd, uint32_t vtx_count, uint32_t instance
 
 HINA_API void hina_cmd_draw_indexed(hina_cmd* cmd, uint32_t idx_count, uint32_t instance_count, uint32_t first_index,
                                     int32_t vertex_offset, uint32_t first_instance);
+
+HINA_API void hina_cmd_draw_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t offset, uint32_t draw_count,
+                                     uint32_t stride);
 
 HINA_API void hina_cmd_draw_indexed_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t offset,
                                              uint32_t draw_count, uint32_t stride);
@@ -3258,6 +3291,8 @@ HINA_API bool hina_get_gpu_memory_stats(hina_gpu_memory_stats* out_stats);
 // Note: Use the 'label' field in resource descriptors (hina_buffer_desc, hina_texture_desc,
 // hina_sampler_desc, hina_pipeline_desc) to set debug names at creation time.
 // Texture Query
+HINA_API size_t hina_get_buffer_size(hina_buffer buf);
+
 HINA_API void hina_get_texture_size(hina_texture tex, uint32_t* width, uint32_t* height);
 
 HINA_API void hina_get_texture_extent(hina_texture tex, uint32_t* width, uint32_t* height, uint32_t* depth);

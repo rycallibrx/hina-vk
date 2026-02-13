@@ -6737,6 +6737,70 @@ static VkRenderPass hina_legacy_get_cached_tile_render_pass(hina_context* ctx, h
   return rp;
 }
 
+// Per-subpass depth flags for building subpass dependencies
+#define HINA_TILEDEP_HAS_DEPTH    0x01u
+#define HINA_TILEDEP_DEPTH_INPUT  0x02u
+#define HINA_TILEDEP_DEPTH_RDONLY 0x04u
+
+// Build VkSubpassDependency array for tile render passes.
+// flags[] is one uint8_t per subpass with HINA_TILEDEP_* bits.
+// Returns the number of dependencies written to deps[].
+static uint32_t hina_build_tile_subpass_dependencies(VkSubpassDependency* deps, uint32_t subpass_count,
+                                                      const uint8_t* flags)
+{
+  uint32_t dep_count = 0;
+  // External -> subpass 0
+  deps[dep_count++] = (VkSubpassDependency){
+    .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+    .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+    .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+    .srcAccessMask = 0,
+    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+    .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT
+  };
+  // Subpass N -> Subpass N+1 dependencies
+  for (uint32_t sp = 1; sp < subpass_count; sp++)
+  {
+    const bool depth_sync = (flags[sp - 1] & HINA_TILEDEP_HAS_DEPTH) && (flags[sp] & HINA_TILEDEP_HAS_DEPTH);
+    const bool depth_input = flags[sp] & HINA_TILEDEP_DEPTH_INPUT;
+    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkAccessFlags dst_access = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+    if (depth_sync || depth_input)
+    {
+      const VkPipelineStageFlags depth_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+      src_stage |= depth_stages;
+      dst_stage |= depth_stages;
+      src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+      dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+      if (depth_sync && !(flags[sp] & HINA_TILEDEP_DEPTH_RDONLY))
+        dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
+    deps[dep_count++] = (VkSubpassDependency){
+      .srcSubpass = sp - 1, .dstSubpass = sp, .srcStageMask = src_stage, .dstStageMask = dst_stage,
+      .srcAccessMask = src_access, .dstAccessMask = dst_access, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT
+    };
+  }
+  // Last subpass -> External (synchronize writes before presentation/next pass)
+  {
+    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    if (flags[subpass_count - 1] & HINA_TILEDEP_HAS_DEPTH)
+    {
+      src_stage |= VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+      src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
+    deps[dep_count++] = (VkSubpassDependency){
+      .srcSubpass = subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = src_stage,
+      .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, .srcAccessMask = src_access,
+      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT, .dependencyFlags = 0
+    };
+  }
+  return dep_count;
+}
+
 // Create a multi-subpass render pass for tile-based deferred rendering
 // Attachments from subpass 0 can be used as input attachments in later subpasses
 static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const hina_tile_pass_desc* desc)
@@ -6904,62 +6968,13 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
     };
   }
   // Build subpass dependencies
-  // Need N+1 dependencies: external->0, inter-subpass, and last->external
   VkSubpassDependency dependencies[HINA_MAX_TILE_SUBPASSES + 2];
-  uint32_t dep_count = 0;
-  // External -> subpass 0
-  dependencies[dep_count++] = (VkSubpassDependency){
-    .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
-    .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-    .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-    .srcAccessMask = 0,
-    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-    .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT
-  };
-  // Subpass N -> Subpass N+1 dependencies
-  for (uint32_t sp = 1; sp < subpass_count; sp++)
-  {
-    const hina_tile_subpass* prev_subpass = &desc->subpasses[sp - 1];
-    const hina_tile_subpass* next_subpass = &desc->subpasses[sp];
-    const bool depth_sync = prev_subpass->has_depth && next_subpass->has_depth;
-    const bool depth_input = next_subpass->depth_input;
-    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    VkAccessFlags dst_access = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-    if (depth_sync || depth_input)
-    {
-      const VkPipelineStageFlags depth_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-      src_stage |= depth_stages;
-      dst_stage |= depth_stages;
-      src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-      dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-      if (depth_sync && !next_subpass->depth_read_only)
-        dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    }
-    dependencies[dep_count++] = (VkSubpassDependency){
-      .srcSubpass = sp - 1, .dstSubpass = sp, .srcStageMask = src_stage, .dstStageMask = dst_stage,
-      .srcAccessMask = src_access, .dstAccessMask = dst_access, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT
-    };
-  }
-  // Last subpass -> External (synchronize writes before presentation/next pass)
-  // Match Sascha Willems' pattern: include READ access for blending, MEMORY_READ for external
-  {
-    const hina_tile_subpass* last = &desc->subpasses[subpass_count - 1];
-    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    if (last->has_depth)
-    {
-      src_stage |= VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-      src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    }
-    dependencies[dep_count++] = (VkSubpassDependency){
-      .srcSubpass = subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = src_stage,
-      .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, .srcAccessMask = src_access,
-      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT, .dependencyFlags = 0 // No BY_REGION for external
-    };
-  }
+  uint8_t dep_flags[HINA_MAX_TILE_SUBPASSES];
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
+    dep_flags[sp] = (desc->subpasses[sp].has_depth ? HINA_TILEDEP_HAS_DEPTH : 0)
+                   | (desc->subpasses[sp].depth_input ? HINA_TILEDEP_DEPTH_INPUT : 0)
+                   | (desc->subpasses[sp].depth_read_only ? HINA_TILEDEP_DEPTH_RDONLY : 0);
+  uint32_t dep_count = hina_build_tile_subpass_dependencies(dependencies, subpass_count, dep_flags);
   const VkRenderPassCreateInfo rp_info = {
     .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = att_count, .pAttachments = attachments,
     .subpassCount = subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
@@ -7149,62 +7164,14 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
     };
   }
   // Build subpass dependencies
-  // Need N+1 dependencies: external->0, inter-subpass, and last->external
-  VkSubpassDependency dependencies[HINA_MAX_TILE_SUBPASSES + 2];
-  uint32_t dep_count = 0;
-  // External -> subpass 0
-  dependencies[dep_count++] = (VkSubpassDependency){
-    .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
-    .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-    .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-    .srcAccessMask = 0,
-    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-    .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT
-  };
-  // Subpass N -> Subpass N+1 dependencies
   // Must match hina_legacy_make_tile_render_pass() exactly for render pass compatibility
-  for (uint32_t sp = 1; sp < subpass_count; sp++)
-  {
-    const hina_tile_subpass_layout* prev_subpass = &layout->subpasses[sp - 1];
-    const hina_tile_subpass_layout* next_subpass = &layout->subpasses[sp];
-    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    VkAccessFlags dst_access = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-    const bool depth_sync = prev_subpass->depth_format != HINA_FORMAT_UNDEFINED && next_subpass->depth_format != HINA_FORMAT_UNDEFINED;
-    const bool depth_input = next_subpass->depth_input;
-    if (depth_sync || depth_input)
-    {
-      const VkPipelineStageFlags depth_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-      src_stage |= depth_stages;
-      dst_stage |= depth_stages;
-      src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-      dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-      if (!next_subpass->depth_read_only) dst_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    }
-    dependencies[dep_count++] = (VkSubpassDependency){
-      .srcSubpass = sp - 1, .dstSubpass = sp, .srcStageMask = src_stage, .dstStageMask = dst_stage,
-      .srcAccessMask = src_access, .dstAccessMask = dst_access, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT
-    };
-  }
-  // Last subpass -> External (synchronize writes before presentation/next pass)
-  // Match Sascha Willems' pattern: include READ access for blending, MEMORY_READ for external
-  {
-    const hina_tile_subpass_layout* last = &layout->subpasses[subpass_count - 1];
-    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    VkAccessFlags src_access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    if (last->depth_format != HINA_FORMAT_UNDEFINED)
-    {
-      src_stage |= VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-      src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    }
-    dependencies[dep_count++] = (VkSubpassDependency){
-      .srcSubpass = subpass_count - 1, .dstSubpass = VK_SUBPASS_EXTERNAL, .srcStageMask = src_stage,
-      .dstStageMask = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, .srcAccessMask = src_access,
-      .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT, .dependencyFlags = 0 // No BY_REGION for external
-    };
-  }
+  VkSubpassDependency dependencies[HINA_MAX_TILE_SUBPASSES + 2];
+  uint8_t dep_flags[HINA_MAX_TILE_SUBPASSES];
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
+    dep_flags[sp] = (layout->subpasses[sp].depth_format != HINA_FORMAT_UNDEFINED ? HINA_TILEDEP_HAS_DEPTH : 0)
+                   | (layout->subpasses[sp].depth_input ? HINA_TILEDEP_DEPTH_INPUT : 0)
+                   | (layout->subpasses[sp].depth_read_only ? HINA_TILEDEP_DEPTH_RDONLY : 0);
+  uint32_t dep_count = hina_build_tile_subpass_dependencies(dependencies, subpass_count, dep_flags);
   const VkRenderPassCreateInfo rp_info = {
     .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = att_count, .pAttachments = attachments,
     .subpassCount = subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
@@ -10599,50 +10566,34 @@ static HINA_INLINE void hina_staging_add_texture(hina_context* ctx, uint32_t han
   }
 }
 
-// Get the staging command buffer, starting recording if needed
-// Uses dedicated staging pool - completely decoupled from per-frame graphics pools
-static VkCommandBuffer hina_staging_ctx_acquire_cmd(hina_context* ctx)
-{
-  hina_staging_context* sc = &ctx->staging;
-  // If no dedicated pool was created, we cannot do staging
-
-  if (!sc->cmd_pool || !sc->vk_cmd)
-  {
-    HINA_LOGE(ctx, "Staging command pool not initialized");
-    return VK_NULL_HANDLE;
-  }
+// Thread-affinity check for staging operations (debug only)
 #ifndef NDEBUG
-  // Thread-affinity check: hina_context is not thread-safe
-  // Each context should only be used from a single thread
-  thrd_t current = thrd_current();
-  if (!sc->owner_thread_set)
-  {
-    sc->owner_thread = current;
-    sc->owner_thread_set = true;
-  }
-  else
-  {
-    HINA_ASSERT(
-      thrd_equal(sc->owner_thread, current) && "hina_context is not thread-safe! Use one context per thread.");
-  }
+#define HINA_STAGING_CHECK_THREAD(sc) do { \
+    thrd_t _current = thrd_current(); \
+    if (!(sc)->owner_thread_set) { \
+      (sc)->owner_thread = _current; \
+      (sc)->owner_thread_set = true; \
+    } else { \
+      HINA_ASSERT(thrd_equal((sc)->owner_thread, _current) && \
+        "hina_context is not thread-safe! Use one context per thread."); \
+    } \
+  } while(0)
+#else
+#define HINA_STAGING_CHECK_THREAD(sc) ((void)(sc))
 #endif
-  // If already recording, just return the existing command buffer
-  if (sc->pending_cmd)
-  {
-    HINA_ASSERTF(sc->vk_cmd != VK_NULL_HANDLE, "staging pending_cmd set but vk_cmd is NULL");
-    return sc->vk_cmd;
-  }
 
-  // Wait for the previous staging submission to complete before reusing the command buffer
-  // This is necessary because we only have one command buffer that we reuse
-  if (sc->last_submit_ticket > 0)
+// Wait for a previous staging submission, reset command pool, and begin recording.
+// Returns the command buffer on success, VK_NULL_HANDLE on failure.
+static VkCommandBuffer hina_staging_wait_reset_begin(hina_context* ctx, hina_ticket last_ticket,
+                                                      VkCommandPool pool, VkCommandBuffer cmd,
+                                                      const char* label)
+{
+  if (last_ticket > 0)
   {
     if (vkWaitSemaphores)
     {
-      // Timeline path: wait on the lane's timeline semaphore
-      // The ticket is encoded as (lane_idx << 56) | raw_timeline_value
-      uint8_t lane_idx = hina_ticket_lane(sc->last_submit_ticket);
-      uint64_t raw_value = hina_ticket_value(sc->last_submit_ticket);
+      uint8_t lane_idx = hina_ticket_lane(last_ticket);
+      uint64_t raw_value = hina_ticket_value(last_ticket);
       hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
       HINA_ASSERT(lane->valid);
       if (lane->timeline)
@@ -10653,38 +10604,53 @@ static VkCommandBuffer hina_staging_ctx_acquire_cmd(hina_context* ctx)
         };
         VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
         HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
-                     "vkWaitSemaphores failed in staging acquire: %d", wait_result);
+                     "vkWaitSemaphores failed in staging %s: %d", label, wait_result);
       }
     }
     else
     {
-      // Legacy fence path: wait on the dedicated staging fence
       if (hina_atomic_load32(&ctx->core.device->sync.fence.staging_busy))
       {
         VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging,
                                                VK_TRUE, UINT64_MAX);
         HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
-                     "vkWaitForFences failed in staging acquire: %d", wait_result);
+                     "vkWaitForFences failed in staging %s: %d", label, wait_result);
         hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 0);
       }
     }
   }
-  // Reset the command pool for reuse (we use the same pool/command buffer each time)
-  // Vulkan spec: command buffers must not be pending execution
-  VkResult reset_result = vkResetCommandPool(ctx->core.device->core.device, sc->cmd_pool, 0);
-  HINA_ASSERTF(reset_result == VK_SUCCESS, "vkResetCommandPool failed in staging acquire: %d", reset_result);
-  // Begin recording
+  VkResult reset_result = vkResetCommandPool(ctx->core.device->core.device, pool, 0);
+  HINA_ASSERTF(reset_result == VK_SUCCESS, "vkResetCommandPool failed in staging %s: %d", label, reset_result);
   VkCommandBufferBeginInfo begin = {
     .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
   };
-  if (vkBeginCommandBuffer(sc->vk_cmd, &begin) != VK_SUCCESS)
+  if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS)
   {
-    HINA_LOGE(ctx, "Failed to begin staging command buffer");
+    HINA_LOGE(ctx, "Failed to begin staging %s command buffer", label);
     return VK_NULL_HANDLE;
   }
-  // Mark as "pending" (we use pending_cmd as a flag - set to non-NULL when recording)
-  // We store a dummy non-NULL value to indicate we're recording
-  sc->pending_cmd = (hina_cmd*)1; // Non-NULL sentinel to indicate recording
+  return cmd;
+}
+
+// Get the staging command buffer, starting recording if needed
+// Uses dedicated staging pool - completely decoupled from per-frame graphics pools
+static VkCommandBuffer hina_staging_ctx_acquire_cmd(hina_context* ctx)
+{
+  hina_staging_context* sc = &ctx->staging;
+  if (!sc->cmd_pool || !sc->vk_cmd)
+  {
+    HINA_LOGE(ctx, "Staging command pool not initialized");
+    return VK_NULL_HANDLE;
+  }
+  HINA_STAGING_CHECK_THREAD(sc);
+  if (sc->pending_cmd)
+  {
+    HINA_ASSERTF(sc->vk_cmd != VK_NULL_HANDLE, "staging pending_cmd set but vk_cmd is NULL");
+    return sc->vk_cmd;
+  }
+  if (!hina_staging_wait_reset_begin(ctx, sc->last_submit_ticket, sc->cmd_pool, sc->vk_cmd, "acquire"))
+    return VK_NULL_HANDLE;
+  sc->pending_cmd = (hina_cmd*)1;
   return sc->vk_cmd;
 }
 
@@ -10697,66 +10663,14 @@ static VkCommandBuffer hina_staging_ctx_acquire_gfx_cmd(hina_context* ctx)
     HINA_LOGE(ctx, "Staging graphics command pool not initialized");
     return VK_NULL_HANDLE;
   }
-#ifndef NDEBUG
-  thrd_t current = thrd_current();
-  if (!sc->owner_thread_set)
-  {
-    sc->owner_thread = current;
-    sc->owner_thread_set = true;
-  }
-  else
-  {
-    HINA_ASSERT(
-      thrd_equal(sc->owner_thread, current) && "hina_context is not thread-safe! Use one context per thread.");
-  }
-#endif
+  HINA_STAGING_CHECK_THREAD(sc);
   if (sc->gfx_pending_cmd)
   {
     HINA_ASSERTF(sc->gfx_vk_cmd != VK_NULL_HANDLE, "staging gfx_pending_cmd set but gfx_vk_cmd is NULL");
     return sc->gfx_vk_cmd;
   }
-
-  if (sc->last_gfx_submit_ticket > 0)
-  {
-    if (vkWaitSemaphores)
-    {
-      uint8_t lane_idx = hina_ticket_lane(sc->last_gfx_submit_ticket);
-      uint64_t raw_value = hina_ticket_value(sc->last_gfx_submit_ticket);
-      hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
-      HINA_ASSERT(lane->valid);
-      if (lane->timeline)
-      {
-        VkSemaphoreWaitInfo wi = {
-          .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &lane->timeline,
-          .pValues = &raw_value
-        };
-        VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
-        HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
-                     "vkWaitSemaphores failed in staging gfx acquire: %d", wait_result);
-      }
-    }
-    else
-    {
-      if (hina_atomic_load32(&ctx->core.device->sync.fence.staging_busy))
-      {
-        VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging,
-                                               VK_TRUE, UINT64_MAX);
-        HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
-                     "vkWaitForFences failed in staging gfx acquire: %d", wait_result);
-        hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 0);
-      }
-    }
-  }
-  VkResult reset_result = vkResetCommandPool(ctx->core.device->core.device, sc->gfx_cmd_pool, 0);
-  HINA_ASSERTF(reset_result == VK_SUCCESS, "vkResetCommandPool failed in staging gfx acquire: %d", reset_result);
-  VkCommandBufferBeginInfo begin = {
-    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-  };
-  if (vkBeginCommandBuffer(sc->gfx_vk_cmd, &begin) != VK_SUCCESS)
-  {
-    HINA_LOGE(ctx, "Failed to begin staging graphics command buffer");
+  if (!hina_staging_wait_reset_begin(ctx, sc->last_gfx_submit_ticket, sc->gfx_cmd_pool, sc->gfx_vk_cmd, "gfx acquire"))
     return VK_NULL_HANDLE;
-  }
   sc->gfx_pending_cmd = (hina_cmd*)1;
   return sc->gfx_vk_cmd;
 }
@@ -10846,66 +10760,14 @@ static VkCommandBuffer hina_staging_ctx_acquire_comp_cmd(hina_context* ctx)
       return VK_NULL_HANDLE;
     }
   }
-#ifndef NDEBUG
-  thrd_t current = thrd_current();
-  if (!sc->owner_thread_set)
-  {
-    sc->owner_thread = current;
-    sc->owner_thread_set = true;
-  }
-  else
-  {
-    HINA_ASSERT(
-      thrd_equal(sc->owner_thread, current) && "hina_context is not thread-safe! Use one context per thread.");
-  }
-#endif
+  HINA_STAGING_CHECK_THREAD(sc);
   if (sc->comp_pending_cmd)
   {
     HINA_ASSERTF(sc->comp_vk_cmd != VK_NULL_HANDLE, "staging comp_pending_cmd set but comp_vk_cmd is NULL");
     return sc->comp_vk_cmd;
   }
-
-  if (sc->last_comp_submit_ticket > 0)
-  {
-    if (vkWaitSemaphores)
-    {
-      uint8_t lane_idx = hina_ticket_lane(sc->last_comp_submit_ticket);
-      uint64_t raw_value = hina_ticket_value(sc->last_comp_submit_ticket);
-      hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
-      HINA_ASSERT(lane->valid);
-      if (lane->timeline)
-      {
-        VkSemaphoreWaitInfo wi = {
-          .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &lane->timeline,
-          .pValues = &raw_value
-        };
-        VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
-        HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
-                     "vkWaitSemaphores failed in staging comp acquire: %d", wait_result);
-      }
-    }
-    else
-    {
-      if (hina_atomic_load32(&ctx->core.device->sync.fence.staging_busy))
-      {
-        VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging,
-                                               VK_TRUE, UINT64_MAX);
-        HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
-                     "vkWaitForFences failed in staging comp acquire: %d", wait_result);
-        hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 0);
-      }
-    }
-  }
-  VkResult reset_result = vkResetCommandPool(ctx->core.device->core.device, sc->comp_cmd_pool, 0);
-  HINA_ASSERTF(reset_result == VK_SUCCESS, "vkResetCommandPool failed in staging comp acquire: %d", reset_result);
-  VkCommandBufferBeginInfo begin = {
-    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-  };
-  if (vkBeginCommandBuffer(sc->comp_vk_cmd, &begin) != VK_SUCCESS)
-  {
-    HINA_LOGE(ctx, "Failed to begin staging compute command buffer");
+  if (!hina_staging_wait_reset_begin(ctx, sc->last_comp_submit_ticket, sc->comp_cmd_pool, sc->comp_vk_cmd, "comp acquire"))
     return VK_NULL_HANDLE;
-  }
   sc->comp_pending_cmd = (hina_cmd*)1;
   return sc->comp_vk_cmd;
 }
@@ -14635,6 +14497,70 @@ static void hina_log_pipeline_creation_feedback(hina_context* ctx, const char* p
   }
 }
 
+enum
+{
+  HINA_SPEC_STAGE_VERTEX = 0,
+  HINA_SPEC_STAGE_TESS_CONTROL = 1,
+  HINA_SPEC_STAGE_TESS_EVAL = 2,
+  HINA_SPEC_STAGE_GEOMETRY = 3,
+  HINA_SPEC_STAGE_FRAGMENT = 4,
+  HINA_SPEC_STAGE_COMPUTE = 5,
+  HINA_SPEC_STAGE_COUNT = 6
+};
+
+static uint32_t hina_specialization_stage_index(hina_shader_stage stage)
+{
+  switch (stage)
+  {
+  case HINA_SHADER_STAGE_VERTEX: return HINA_SPEC_STAGE_VERTEX;
+  case HINA_SHADER_STAGE_TESS_CONTROL: return HINA_SPEC_STAGE_TESS_CONTROL;
+  case HINA_SHADER_STAGE_TESS_EVAL: return HINA_SPEC_STAGE_TESS_EVAL;
+  case HINA_SHADER_STAGE_GEOMETRY: return HINA_SPEC_STAGE_GEOMETRY;
+  case HINA_SHADER_STAGE_FRAGMENT: return HINA_SPEC_STAGE_FRAGMENT;
+  case HINA_SHADER_STAGE_COMPUTE: return HINA_SPEC_STAGE_COMPUTE;
+  default: return HINA_SPEC_STAGE_COUNT;
+  }
+}
+
+static const hina_stage_specialization* hina_find_stage_specialization(const hina_stage_specialization* specs,
+                                                                       uint32_t spec_count, hina_shader_stage stage)
+{
+  if (!specs || spec_count == 0) return NULL;
+  for (uint32_t i = 0; i < spec_count; ++i)
+  {
+    if (specs[i].stage == stage) return &specs[i];
+  }
+  return NULL;
+}
+
+static void hina_apply_stage_specialization(const hina_stage_specialization* spec, VkSpecializationMapEntry* entries,
+                                            uint8_t* data, VkSpecializationInfo* out_info)
+{
+  if (!out_info) return;
+  *out_info = (VkSpecializationInfo){0};
+  if (!spec || !entries || !data) return;
+  if (!spec->constants || spec->count == 0) return;
+
+  uint32_t count = spec->count;
+  if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
+
+  uint32_t data_offset = 0;
+  for (uint32_t i = 0; i < count; ++i)
+  {
+    const hina_specialization_constant* sc = &spec->constants[i];
+    entries[i].constantID = sc->constant_id;
+    entries[i].offset = data_offset;
+    entries[i].size = sc->size;
+    memcpy(data + data_offset, &sc->value, sc->size);
+    data_offset += sc->size;
+  }
+
+  out_info->mapEntryCount = count;
+  out_info->pMapEntries = entries;
+  out_info->dataSize = data_offset;
+  out_info->pData = data;
+}
+
 // Internal implementation - used by deprecated wrappers and _ex function
 static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_pipeline_desc* desc)
 {
@@ -14758,6 +14684,18 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   VkSpecializationInfo tes_spec_info = {0};
   VkSpecializationInfo gs_spec_info = {0};
   VkSpecializationInfo fs_spec_info = {0};
+  const hina_stage_specialization* stage_specs[HINA_SPEC_STAGE_COUNT] = {0};
+  if (desc->specializations && desc->specialization_count > 0)
+  {
+    for (uint32_t i = 0; i < desc->specialization_count; ++i)
+    {
+      uint32_t spec_stage = hina_specialization_stage_index(desc->specializations[i].stage);
+      if (spec_stage < HINA_SPEC_STAGE_COUNT && !stage_specs[spec_stage])
+      {
+        stage_specs[spec_stage] = &desc->specializations[i];
+      }
+    }
+  }
   // Get or create shader modules (temp modules will be destroyed after pipeline creation)
   bool vs_temp = false, tcs_temp = false, tes_temp = false, gs_temp = false, fs_temp = false;
   VkShaderModule vs_module = hina_get_or_create_shader_module(ctx, &desc->vs, "vs", &vs_temp);
@@ -14788,25 +14726,10 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   stages_ci[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
   stages_ci[stage_count].module = vs_module;
   stages_ci[stage_count].pName = "main";
-  if (desc->vs_specialization_count > 0 && desc->vs_specializations)
+  if (stage_specs[HINA_SPEC_STAGE_VERTEX])
   {
-    uint32_t count = desc->vs_specialization_count;
-    if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-    uint32_t data_offset = 0;
-    for (uint32_t i = 0; i < count; ++i)
-    {
-      const hina_specialization_constant* sc = &desc->vs_specializations[i];
-      vs_spec_entries[i].constantID = sc->constant_id;
-      vs_spec_entries[i].offset = data_offset;
-      vs_spec_entries[i].size = sc->size;
-      memcpy(vs_spec_data + data_offset, &sc->value, sc->size);
-      data_offset += sc->size;
-    }
-    vs_spec_info.mapEntryCount = count;
-    vs_spec_info.pMapEntries = vs_spec_entries;
-    vs_spec_info.dataSize = data_offset;
-    vs_spec_info.pData = vs_spec_data;
-    stages_ci[stage_count].pSpecializationInfo = &vs_spec_info;
+    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_VERTEX], vs_spec_entries, vs_spec_data, &vs_spec_info);
+    if (vs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &vs_spec_info;
   }
   stage_count++;
   if (has_tcs)
@@ -14815,25 +14738,11 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
     stages_ci[stage_count].module = tcs_module;
     stages_ci[stage_count].pName = "main";
-    if (desc->tcs_specialization_count > 0 && desc->tcs_specializations)
+    if (stage_specs[HINA_SPEC_STAGE_TESS_CONTROL])
     {
-      uint32_t count = desc->tcs_specialization_count;
-      if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-      uint32_t data_offset = 0;
-      for (uint32_t i = 0; i < count; ++i)
-      {
-        const hina_specialization_constant* sc = &desc->tcs_specializations[i];
-        tcs_spec_entries[i].constantID = sc->constant_id;
-        tcs_spec_entries[i].offset = data_offset;
-        tcs_spec_entries[i].size = sc->size;
-        memcpy(tcs_spec_data + data_offset, &sc->value, sc->size);
-        data_offset += sc->size;
-      }
-      tcs_spec_info.mapEntryCount = count;
-      tcs_spec_info.pMapEntries = tcs_spec_entries;
-      tcs_spec_info.dataSize = data_offset;
-      tcs_spec_info.pData = tcs_spec_data;
-      stages_ci[stage_count].pSpecializationInfo = &tcs_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_CONTROL], tcs_spec_entries, tcs_spec_data,
+                                      &tcs_spec_info);
+      if (tcs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tcs_spec_info;
     }
     stage_count++;
   }
@@ -14843,25 +14752,11 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     stages_ci[stage_count].module = tes_module;
     stages_ci[stage_count].pName = "main";
-    if (desc->tes_specialization_count > 0 && desc->tes_specializations)
+    if (stage_specs[HINA_SPEC_STAGE_TESS_EVAL])
     {
-      uint32_t count = desc->tes_specialization_count;
-      if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-      uint32_t data_offset = 0;
-      for (uint32_t i = 0; i < count; ++i)
-      {
-        const hina_specialization_constant* sc = &desc->tes_specializations[i];
-        tes_spec_entries[i].constantID = sc->constant_id;
-        tes_spec_entries[i].offset = data_offset;
-        tes_spec_entries[i].size = sc->size;
-        memcpy(tes_spec_data + data_offset, &sc->value, sc->size);
-        data_offset += sc->size;
-      }
-      tes_spec_info.mapEntryCount = count;
-      tes_spec_info.pMapEntries = tes_spec_entries;
-      tes_spec_info.dataSize = data_offset;
-      tes_spec_info.pData = tes_spec_data;
-      stages_ci[stage_count].pSpecializationInfo = &tes_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_EVAL], tes_spec_entries, tes_spec_data,
+                                      &tes_spec_info);
+      if (tes_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tes_spec_info;
     }
     stage_count++;
   }
@@ -14871,25 +14766,11 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     stages_ci[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
     stages_ci[stage_count].module = gs_module;
     stages_ci[stage_count].pName = "main";
-    if (desc->gs_specialization_count > 0 && desc->gs_specializations)
+    if (stage_specs[HINA_SPEC_STAGE_GEOMETRY])
     {
-      uint32_t count = desc->gs_specialization_count;
-      if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-      uint32_t data_offset = 0;
-      for (uint32_t i = 0; i < count; ++i)
-      {
-        const hina_specialization_constant* sc = &desc->gs_specializations[i];
-        gs_spec_entries[i].constantID = sc->constant_id;
-        gs_spec_entries[i].offset = data_offset;
-        gs_spec_entries[i].size = sc->size;
-        memcpy(gs_spec_data + data_offset, &sc->value, sc->size);
-        data_offset += sc->size;
-      }
-      gs_spec_info.mapEntryCount = count;
-      gs_spec_info.pMapEntries = gs_spec_entries;
-      gs_spec_info.dataSize = data_offset;
-      gs_spec_info.pData = gs_spec_data;
-      stages_ci[stage_count].pSpecializationInfo = &gs_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_GEOMETRY], gs_spec_entries, gs_spec_data,
+                                      &gs_spec_info);
+      if (gs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &gs_spec_info;
     }
     stage_count++;
   }
@@ -14897,25 +14778,10 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   stages_ci[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
   stages_ci[stage_count].module = fs_module;
   stages_ci[stage_count].pName = "main";
-  if (desc->fs_specialization_count > 0 && desc->fs_specializations)
+  if (stage_specs[HINA_SPEC_STAGE_FRAGMENT])
   {
-    uint32_t count = desc->fs_specialization_count;
-    if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-    uint32_t data_offset = 0;
-    for (uint32_t i = 0; i < count; ++i)
-    {
-      const hina_specialization_constant* sc = &desc->fs_specializations[i];
-      fs_spec_entries[i].constantID = sc->constant_id;
-      fs_spec_entries[i].offset = data_offset;
-      fs_spec_entries[i].size = sc->size;
-      memcpy(fs_spec_data + data_offset, &sc->value, sc->size);
-      data_offset += sc->size;
-    }
-    fs_spec_info.mapEntryCount = count;
-    fs_spec_info.pMapEntries = fs_spec_entries;
-    fs_spec_info.dataSize = data_offset;
-    fs_spec_info.pData = fs_spec_data;
-    stages_ci[stage_count].pSpecializationInfo = &fs_spec_info;
+    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_FRAGMENT], fs_spec_entries, fs_spec_data, &fs_spec_info);
+    if (fs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &fs_spec_info;
   }
   stage_count++;
   VkVertexInputBindingDescription bindings[HINA_MAX_VERTEX_BUFFERS];
@@ -15821,6 +15687,18 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   bool has_gs = gs_stage->spirv_data && gs_stage->spirv_size > 0;
   bool has_fs = fs_stage->spirv_data && fs_stage->spirv_size > 0;
   bool has_cs = cs_stage->spirv_data && cs_stage->spirv_size > 0;
+  const hina_stage_specialization* stage_specs[HINA_SPEC_STAGE_COUNT] = {0};
+  if (desc->specializations && desc->specialization_count > 0)
+  {
+    for (uint32_t i = 0; i < desc->specialization_count; ++i)
+    {
+      uint32_t spec_stage = hina_specialization_stage_index(desc->specializations[i].stage);
+      if (spec_stage < HINA_SPEC_STAGE_COUNT && !stage_specs[spec_stage])
+      {
+        stage_specs[spec_stage] = &desc->specializations[i];
+      }
+    }
+  }
   if (has_cs && (has_vs || has_tcs || has_tes || has_gs || has_fs))
   {
     HINA_LOGE(ctx, "HSL module mixes compute and graphics stages");
@@ -15885,10 +15763,11 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   }
   if (has_cs)
   {
+    const hina_stage_specialization* cs_spec = stage_specs[HINA_SPEC_STAGE_COMPUTE];
     // Validate specialization constants against module's reflection data
-    if (desc->vs_specialization_count > 0 && cs_stage->spec_constant_count > 0)
+    if (cs_spec && cs_stage->spec_constant_count > 0)
     {
-      if (!hina_validate_spec_constants(ctx, "CS", desc->vs_specializations, desc->vs_specialization_count,
+      if (!hina_validate_spec_constants(ctx, "CS", cs_spec->constants, cs_spec->count,
                                         cs_stage->spec_constants, cs_stage->spec_constant_count))
       {
         return (hina_pipeline){HINA_INVALID_HANDLE};
@@ -15970,28 +15849,14 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
       .module = cs_module, .pName = "main"
     };
-    // Build specialization info (compute uses vs_specializations)
+    // Build specialization info
     VkSpecializationMapEntry cs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
     uint8_t cs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
     VkSpecializationInfo cs_spec_info = {0};
-    if (desc->vs_specialization_count > 0 && desc->vs_specializations)
+    if (cs_spec)
     {
-      uint32_t count = desc->vs_specialization_count;
-      if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-      uint32_t data_offset = 0;
-      for (uint32_t i = 0; i < count; ++i)
-      {
-        cs_spec_entries[i].constantID = desc->vs_specializations[i].constant_id;
-        cs_spec_entries[i].offset = data_offset;
-        cs_spec_entries[i].size = desc->vs_specializations[i].size;
-        memcpy(cs_spec_data + data_offset, &desc->vs_specializations[i].value, desc->vs_specializations[i].size);
-        data_offset += desc->vs_specializations[i].size;
-      }
-      cs_spec_info.mapEntryCount = count;
-      cs_spec_info.pMapEntries = cs_spec_entries;
-      cs_spec_info.dataSize = data_offset;
-      cs_spec_info.pData = cs_spec_data;
-      stage_ci.pSpecializationInfo = &cs_spec_info;
+      hina_apply_stage_specialization(cs_spec, cs_spec_entries, cs_spec_data, &cs_spec_info);
+      if (cs_spec_info.mapEntryCount > 0) stage_ci.pSpecializationInfo = &cs_spec_info;
     }
     VkComputePipelineCreateInfo ci = {
       .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = stage_ci, .layout = layout
@@ -16063,41 +15928,46 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
   // Validate specialization constants against module's reflection data
-  if (desc->vs_specialization_count > 0 && vs_stage->spec_constant_count > 0)
+  if (stage_specs[HINA_SPEC_STAGE_VERTEX] && vs_stage->spec_constant_count > 0)
   {
-    if (!hina_validate_spec_constants(ctx, "VS", desc->vs_specializations, desc->vs_specialization_count,
+    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_VERTEX];
+    if (!hina_validate_spec_constants(ctx, "VS", spec->constants, spec->count,
                                       vs_stage->spec_constants, vs_stage->spec_constant_count))
     {
       return (hina_pipeline){HINA_INVALID_HANDLE};
     }
   }
-  if (has_tcs && desc->tcs_specialization_count > 0 && tcs_stage->spec_constant_count > 0)
+  if (has_tcs && stage_specs[HINA_SPEC_STAGE_TESS_CONTROL] && tcs_stage->spec_constant_count > 0)
   {
-    if (!hina_validate_spec_constants(ctx, "TCS", desc->tcs_specializations, desc->tcs_specialization_count,
+    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_TESS_CONTROL];
+    if (!hina_validate_spec_constants(ctx, "TCS", spec->constants, spec->count,
                                       tcs_stage->spec_constants, tcs_stage->spec_constant_count))
     {
       return (hina_pipeline){HINA_INVALID_HANDLE};
     }
   }
-  if (has_tes && desc->tes_specialization_count > 0 && tes_stage->spec_constant_count > 0)
+  if (has_tes && stage_specs[HINA_SPEC_STAGE_TESS_EVAL] && tes_stage->spec_constant_count > 0)
   {
-    if (!hina_validate_spec_constants(ctx, "TES", desc->tes_specializations, desc->tes_specialization_count,
+    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_TESS_EVAL];
+    if (!hina_validate_spec_constants(ctx, "TES", spec->constants, spec->count,
                                       tes_stage->spec_constants, tes_stage->spec_constant_count))
     {
       return (hina_pipeline){HINA_INVALID_HANDLE};
     }
   }
-  if (has_gs && desc->gs_specialization_count > 0 && gs_stage->spec_constant_count > 0)
+  if (has_gs && stage_specs[HINA_SPEC_STAGE_GEOMETRY] && gs_stage->spec_constant_count > 0)
   {
-    if (!hina_validate_spec_constants(ctx, "GS", desc->gs_specializations, desc->gs_specialization_count,
+    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_GEOMETRY];
+    if (!hina_validate_spec_constants(ctx, "GS", spec->constants, spec->count,
                                       gs_stage->spec_constants, gs_stage->spec_constant_count))
     {
       return (hina_pipeline){HINA_INVALID_HANDLE};
     }
   }
-  if (has_fs && desc->fs_specialization_count > 0 && fs_stage->spec_constant_count > 0)
+  if (has_fs && stage_specs[HINA_SPEC_STAGE_FRAGMENT] && fs_stage->spec_constant_count > 0)
   {
-    if (!hina_validate_spec_constants(ctx, "FS", desc->fs_specializations, desc->fs_specialization_count,
+    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_FRAGMENT];
+    if (!hina_validate_spec_constants(ctx, "FS", spec->constants, spec->count,
                                       fs_stage->spec_constants, fs_stage->spec_constant_count))
     {
       return (hina_pipeline){HINA_INVALID_HANDLE};
@@ -16271,24 +16141,10 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   stages_ci[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
   stages_ci[stage_count].module = vs_module;
   stages_ci[stage_count].pName = "main";
-  if (desc->vs_specialization_count > 0 && desc->vs_specializations)
+  if (stage_specs[HINA_SPEC_STAGE_VERTEX])
   {
-    uint32_t count = desc->vs_specialization_count;
-    if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-    uint32_t data_offset = 0;
-    for (uint32_t i = 0; i < count; ++i)
-    {
-      vs_spec_entries[i].constantID = desc->vs_specializations[i].constant_id;
-      vs_spec_entries[i].offset = data_offset;
-      vs_spec_entries[i].size = desc->vs_specializations[i].size;
-      memcpy(vs_spec_data + data_offset, &desc->vs_specializations[i].value, desc->vs_specializations[i].size);
-      data_offset += desc->vs_specializations[i].size;
-    }
-    vs_spec_info.mapEntryCount = count;
-    vs_spec_info.pMapEntries = vs_spec_entries;
-    vs_spec_info.dataSize = data_offset;
-    vs_spec_info.pData = vs_spec_data;
-    stages_ci[stage_count].pSpecializationInfo = &vs_spec_info;
+    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_VERTEX], vs_spec_entries, vs_spec_data, &vs_spec_info);
+    if (vs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &vs_spec_info;
   }
   stage_count++;
   if (has_tcs)
@@ -16297,24 +16153,11 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
     stages_ci[stage_count].module = tcs_module;
     stages_ci[stage_count].pName = "main";
-    if (desc->tcs_specialization_count > 0 && desc->tcs_specializations)
+    if (stage_specs[HINA_SPEC_STAGE_TESS_CONTROL])
     {
-      uint32_t count = desc->tcs_specialization_count;
-      if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-      uint32_t data_offset = 0;
-      for (uint32_t i = 0; i < count; ++i)
-      {
-        tcs_spec_entries[i].constantID = desc->tcs_specializations[i].constant_id;
-        tcs_spec_entries[i].offset = data_offset;
-        tcs_spec_entries[i].size = desc->tcs_specializations[i].size;
-        memcpy(tcs_spec_data + data_offset, &desc->tcs_specializations[i].value, desc->tcs_specializations[i].size);
-        data_offset += desc->tcs_specializations[i].size;
-      }
-      tcs_spec_info.mapEntryCount = count;
-      tcs_spec_info.pMapEntries = tcs_spec_entries;
-      tcs_spec_info.dataSize = data_offset;
-      tcs_spec_info.pData = tcs_spec_data;
-      stages_ci[stage_count].pSpecializationInfo = &tcs_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_CONTROL], tcs_spec_entries, tcs_spec_data,
+                                      &tcs_spec_info);
+      if (tcs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tcs_spec_info;
     }
     stage_count++;
   }
@@ -16324,24 +16167,11 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     stages_ci[stage_count].module = tes_module;
     stages_ci[stage_count].pName = "main";
-    if (desc->tes_specialization_count > 0 && desc->tes_specializations)
+    if (stage_specs[HINA_SPEC_STAGE_TESS_EVAL])
     {
-      uint32_t count = desc->tes_specialization_count;
-      if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-      uint32_t data_offset = 0;
-      for (uint32_t i = 0; i < count; ++i)
-      {
-        tes_spec_entries[i].constantID = desc->tes_specializations[i].constant_id;
-        tes_spec_entries[i].offset = data_offset;
-        tes_spec_entries[i].size = desc->tes_specializations[i].size;
-        memcpy(tes_spec_data + data_offset, &desc->tes_specializations[i].value, desc->tes_specializations[i].size);
-        data_offset += desc->tes_specializations[i].size;
-      }
-      tes_spec_info.mapEntryCount = count;
-      tes_spec_info.pMapEntries = tes_spec_entries;
-      tes_spec_info.dataSize = data_offset;
-      tes_spec_info.pData = tes_spec_data;
-      stages_ci[stage_count].pSpecializationInfo = &tes_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_EVAL], tes_spec_entries, tes_spec_data,
+                                      &tes_spec_info);
+      if (tes_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tes_spec_info;
     }
     stage_count++;
   }
@@ -16351,24 +16181,11 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     stages_ci[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
     stages_ci[stage_count].module = gs_module;
     stages_ci[stage_count].pName = "main";
-    if (desc->gs_specialization_count > 0 && desc->gs_specializations)
+    if (stage_specs[HINA_SPEC_STAGE_GEOMETRY])
     {
-      uint32_t count = desc->gs_specialization_count;
-      if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-      uint32_t data_offset = 0;
-      for (uint32_t i = 0; i < count; ++i)
-      {
-        gs_spec_entries[i].constantID = desc->gs_specializations[i].constant_id;
-        gs_spec_entries[i].offset = data_offset;
-        gs_spec_entries[i].size = desc->gs_specializations[i].size;
-        memcpy(gs_spec_data + data_offset, &desc->gs_specializations[i].value, desc->gs_specializations[i].size);
-        data_offset += desc->gs_specializations[i].size;
-      }
-      gs_spec_info.mapEntryCount = count;
-      gs_spec_info.pMapEntries = gs_spec_entries;
-      gs_spec_info.dataSize = data_offset;
-      gs_spec_info.pData = gs_spec_data;
-      stages_ci[stage_count].pSpecializationInfo = &gs_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_GEOMETRY], gs_spec_entries, gs_spec_data,
+                                      &gs_spec_info);
+      if (gs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &gs_spec_info;
     }
     stage_count++;
   }
@@ -16378,24 +16195,11 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     stages_ci[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages_ci[stage_count].module = fs_module;
     stages_ci[stage_count].pName = "main";
-    if (desc->fs_specialization_count > 0 && desc->fs_specializations)
+    if (stage_specs[HINA_SPEC_STAGE_FRAGMENT])
     {
-      uint32_t count = desc->fs_specialization_count;
-      if (count > HINA_MAX_SPECIALIZATION_CONSTANTS) count = HINA_MAX_SPECIALIZATION_CONSTANTS;
-      uint32_t data_offset = 0;
-      for (uint32_t i = 0; i < count; ++i)
-      {
-        fs_spec_entries[i].constantID = desc->fs_specializations[i].constant_id;
-        fs_spec_entries[i].offset = data_offset;
-        fs_spec_entries[i].size = desc->fs_specializations[i].size;
-        memcpy(fs_spec_data + data_offset, &desc->fs_specializations[i].value, desc->fs_specializations[i].size);
-        data_offset += desc->fs_specializations[i].size;
-      }
-      fs_spec_info.mapEntryCount = count;
-      fs_spec_info.pMapEntries = fs_spec_entries;
-      fs_spec_info.dataSize = data_offset;
-      fs_spec_info.pData = fs_spec_data;
-      stages_ci[stage_count].pSpecializationInfo = &fs_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_FRAGMENT], fs_spec_entries, fs_spec_data,
+                                      &fs_spec_info);
+      if (fs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &fs_spec_info;
     }
     stage_count++;
   }
@@ -16815,10 +16619,20 @@ static hina_pipeline hina_make_compute_pipeline_internal(hina_context* ctx, cons
     hina_pipeline_slot_free(idx);
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
-  const VkPipelineShaderStageCreateInfo stage = {
+  VkPipelineShaderStageCreateInfo stage = {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
     .module = cs_module, .pName = "main"
   };
+  const hina_stage_specialization* cs_spec = hina_find_stage_specialization(
+    desc->specializations, desc->specialization_count, HINA_SHADER_STAGE_COMPUTE);
+  VkSpecializationMapEntry cs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
+  uint8_t cs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
+  VkSpecializationInfo cs_spec_info = {0};
+  if (cs_spec)
+  {
+    hina_apply_stage_specialization(cs_spec, cs_spec_entries, cs_spec_data, &cs_spec_info);
+    if (cs_spec_info.mapEntryCount > 0) stage.pSpecializationInfo = &cs_spec_info;
+  }
   VkComputePipelineCreateInfo ci = {
     .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = stage, .layout = layout
   };
@@ -20381,6 +20195,47 @@ void hina_cmd_draw_indexed(hina_cmd* cmd, uint32_t idx_count, uint32_t instance_
   HINA_ZONE_END();
 }
 
+void hina_cmd_draw_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t offset, uint32_t draw_count,
+                            uint32_t stride)
+{
+  HINA_ZONE_N("draw_indirect");
+  HINA_ASSERT(cmd);
+  // Vulkan spec: commandBuffer must be in recording state
+  HINA_ASSERT(cmd->recording && "hina_cmd_draw_indirect: command buffer must be recording");
+  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_draw_indirect: vk_cmd is NULL");
+  HINA_ASSERTF(cmd->is_rendering, "hina_cmd_draw_indirect: not inside a render pass - call hina_cmd_begin_pass first");
+  HINA_ASSERTF(cmd->current_pipeline.id != HINA_INVALID_HANDLE, "hina_cmd_draw_indirect: no pipeline bound");
+  HINA_ASSERTF(cmd->bound_pipeline_kind == HINA_PIPELINE_KIND_GRAPHICS,
+               "hina_cmd_draw_indirect: bound pipeline is not graphics");
+  // Validate and get buffer in one operation (avoids double index extraction)
+  hina_buffer_slot* buf_slot = hina_buffer_slot_get_valid(indirect_buf);
+  HINA_ASSERT(buf_slot);
+  uint16_t buf_idx = hina_id_index(indirect_buf.id);
+  hina_buffer_hot* bhot = HINA_BUF_HOT(buf_idx);
+  // Fast-path: skip atomic check if already marked ready in hot struct
+  if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
+  {
+    if (!hina_buffer_upload_ready(cmd->ctx, buf_idx))
+    {
+      HINA_LOGW(cmd->ctx, "hina_cmd_draw_indirect: indirect buffer upload pending (slot %u)", buf_idx);
+      return;
+    }
+  }
+  // Assert queue ownership (exclusive sharing mode)
+  // Also allow pending acquire (deferred ownership update for multi-threaded recording)
+  HINA_ASSERTF(
+    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed) == cmd->family_idx || hina_debug_has_pending_acquire(cmd,
+      buf_idx),
+    "hina_cmd_draw_indirect: indirect buffer owned by queue family %u but used on queue family %u - use hina_cmd_acquire_buffer",
+    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed), cmd->family_idx);
+  hina_validate_bindings(cmd, "hina_cmd_draw_indirect");
+  hina_flush_bindings(cmd);
+  vkCmdDrawIndirect(cmd->vk_cmd, buf_slot->vk.buffer, offset, draw_count, stride);
+  // Stats (vertex count unknown for indirect - only count draw calls)
+  cmd->ctx->stats.draw_calls += draw_count;
+  HINA_ZONE_END();
+}
+
 void hina_cmd_draw_indexed_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t offset, uint32_t draw_count,
                                     uint32_t stride)
 {
@@ -23410,6 +23265,13 @@ void* hina_get_vk_buffer(hina_buffer buf)
   return HINA_BUF_HOT(hina_id_index(buf.id))->vk.buffer;
 }
 
+size_t hina_get_buffer_size(hina_buffer buf)
+{
+  hina_buffer_slot* slot = hina_buffer_slot_get_valid(buf);
+  if (!slot) return 0;
+  return slot->size;
+}
+
 void hina_get_texture_size(hina_texture tex, uint32_t* width, uint32_t* height)
 {
   if (!hina_texture_slot_valid(tex))
@@ -23872,7 +23734,7 @@ void hslc_shutdown(void)
     hslc_state_unlock();
     return;
   }
-  // Clears only the calling thread's lint buffer; other threads free theirs at thread exit.
+  // Release calling-thread SPIR-V lint buffer allocations.
   hina_spirv_lint_cleanup();
   if (g_shader_state.glslang_initialized)
   {
@@ -28241,6 +28103,8 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
       SHADER_LOGW("SPIR-V lint warnings:\n%s", lint_warnings);
     }
   }
+  // Keep lint scratch memory deterministic for debug leak detectors.
+  hina_spirv_lint_cleanup();
 
   *out_words = out;
   *out_word_count = words;

@@ -240,8 +240,12 @@ static hina_pipeline create_specialized_pipeline(
     pip_desc.depth_format = HINA_FORMAT_D32_SFLOAT;
 
     // Set specialization constants for fragment shader
-    pip_desc.fs_specializations = fs_specs;
-    pip_desc.fs_specialization_count = 2;
+    hina_stage_specialization stage_specs[1];
+    stage_specs[0].stage = HINA_SHADER_STAGE_FRAGMENT;
+    stage_specs[0].constants = fs_specs;
+    stage_specs[0].count = 2;
+    pip_desc.specializations = stage_specs;
+    pip_desc.specialization_count = 1;
 
     hina_pipeline pipeline = hina_make_pipeline_from_module(module, &pip_desc, NULL);
     hslc_hsl_module_free(module);
