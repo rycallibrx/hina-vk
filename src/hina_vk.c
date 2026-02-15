@@ -15761,6 +15761,33 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     HINA_LOGW(ctx, "Creating vertex-only pipeline (no fragment shader). "
               "This is valid for depth pre-pass but may be unintentional.");
   }
+  // Explicit descriptor ranges win. If absent, use module reflection so stage flags
+  // match actual SPIR-V usage instead of defaulting to all stages.
+  const hina_push_constant_range* resolved_push_constant_ranges = desc->push_constant_ranges;
+  uint32_t resolved_push_constant_range_count = desc->push_constant_range_count;
+  hina_push_constant_range resolved_push_constant_ranges_stack[8];
+  if ((!resolved_push_constant_ranges || resolved_push_constant_range_count == 0) &&
+      module->push_constants && module->push_constant_count > 0)
+  {
+    hina_push_constant_range* reflected_ranges = resolved_push_constant_ranges_stack;
+    uint32_t reflected_range_count = module->push_constant_count;
+    if (reflected_range_count > HINA_ARRAY_SIZE(resolved_push_constant_ranges_stack))
+    {
+      reflected_ranges = (hina_push_constant_range*)hina_frame_temp_alloc(
+        ctx, (size_t)reflected_range_count * sizeof(hina_push_constant_range), _Alignof(hina_push_constant_range));
+    }
+    for (uint32_t i = 0; i < reflected_range_count; ++i)
+    {
+      const hina_reflected_push_constant* src = &module->push_constants[i];
+      HINA_ASSERT(src->offset <= UINT16_MAX);
+      HINA_ASSERT(src->size <= UINT16_MAX);
+      reflected_ranges[i].offset = (uint16_t)src->offset;
+      reflected_ranges[i].size = (uint16_t)src->size;
+      reflected_ranges[i].stage_flags = (uint8_t)hina_vk_stage_flags_to_hina(src->stage_flags);
+    }
+    resolved_push_constant_ranges = reflected_ranges;
+    resolved_push_constant_range_count = reflected_range_count;
+  }
   if (has_cs)
   {
     const hina_stage_specialization* cs_spec = stage_specs[HINA_SPEC_STAGE_COMPUTE];
@@ -15801,7 +15828,8 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     {
       // Production path: Use explicit bind group layouts
       layout = hina_build_layout_from_explicit_bind_groups(ctx, desc->bind_group_layouts, explicit_layout_count,
-                                                           desc->push_constant_ranges, desc->push_constant_range_count,
+                                                           resolved_push_constant_ranges,
+                                                           resolved_push_constant_range_count,
                                                            &e->push_constant_stages, &e->push_constant_size,
                                                            explicit_vk_layouts);
       e->set_layout_count = explicit_layout_count;
@@ -15809,8 +15837,8 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     else
     {
       // Demo path: Auto-generate layouts from shader reflection
-      layout = hina_build_layout_from_reflection(ctx, e->reflection, desc->push_constant_ranges,
-                                                 desc->push_constant_range_count, &e->push_constant_stages,
+      layout = hina_build_layout_from_reflection(ctx, e->reflection, resolved_push_constant_ranges,
+                                                 resolved_push_constant_range_count, &e->push_constant_stages,
                                                  &e->push_constant_size);
       e->set_layout_count = e->reflection->set_count;
     }
@@ -16002,7 +16030,8 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   {
     // Production path: Use explicit bind group layouts
     layout = hina_build_layout_from_explicit_bind_groups(ctx, desc->bind_group_layouts, explicit_layout_count,
-                                                         desc->push_constant_ranges, desc->push_constant_range_count,
+                                                         resolved_push_constant_ranges,
+                                                         resolved_push_constant_range_count,
                                                          &e->push_constant_stages, &e->push_constant_size,
                                                          explicit_vk_layouts);
     e->set_layout_count = explicit_layout_count;
@@ -16010,8 +16039,8 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   else
   {
     // Demo path: Auto-generate layouts from shader reflection
-    layout = hina_build_layout_from_reflection(ctx, e->reflection, desc->push_constant_ranges,
-                                               desc->push_constant_range_count, &e->push_constant_stages,
+    layout = hina_build_layout_from_reflection(ctx, e->reflection, resolved_push_constant_ranges,
+                                               resolved_push_constant_range_count, &e->push_constant_stages,
                                                &e->push_constant_size);
     e->set_layout_count = e->reflection->set_count;
   }
