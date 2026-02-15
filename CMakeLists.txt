@@ -260,8 +260,9 @@ if(HINA_VK_ENABLE_SHADER_COMPILER)
         )
     endif()
     # In embedded mode, parent project must ensure glslang headers are in the include path
-    # Note: SPIRV-Tools-lint depends on SPIRV-Tools-opt which is pulled in transitively
-    target_link_libraries(hina-vk PRIVATE glslang glslang-default-resource-limits SPIRV-Tools-lint)
+    # SPIRV-Tools-opt: used directly for post-glslang optimization (hslc_optimize_spirv)
+    # SPIRV-Tools-lint: divergent derivative analysis (hina_spirv_lint in hina_vk_impl.cpp)
+    target_link_libraries(hina-vk PRIVATE glslang glslang-default-resource-limits SPIRV-Tools-opt SPIRV-Tools-lint)
 else()
     # Define HINA_NO_SHADER_COMPILER to disable shader compilation in headers/source
     target_compile_definitions(hina-vk PUBLIC HINA_NO_SHADER_COMPILER)

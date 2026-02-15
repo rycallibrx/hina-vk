@@ -23634,6 +23634,7 @@ double hina_timestamp_to_ns(uint64_t timestamp_delta)
 #include "spirv_reflect.h"
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
+#include <spirv-tools/libspirv.h>
 #include <ctype.h>
 #include <stdbool.h>
 
@@ -27827,147 +27828,122 @@ static glslang_stage_t hslc_hina_to_glslang_stage(hina_shader_stage stage)
   return GLSLANG_STAGE_VERTEX;
 }
 
-// GLSL Compilation
-// Compiles GLSL source code into SPIR-V.
-bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stage, const char* entry_point,
-                       uint32_t** out_words, size_t* out_word_count)
+// SPIRV-Tools Optimizer Post-Pass
+// Runs the -Os preset via the C API while preserving entry-point interfaces.
+// The caller must hold g_shader_state_lock (guaranteed by hslc_compile_glsl_to_spirv).
+// On success, *words / *word_count are replaced with the optimized binary (shader_alloc'd).
+// On failure, the original buffer is left unchanged and diagnostics go to *out_log.
+
+// Static sink for the spv_message_consumer callback.
+// Safe: only written under g_shader_state_lock; callback is synchronous.
+static hsl_string_builder* s_opt_diag_sb = NULL;
+
+static void hslc_opt_message_cb(spv_message_level_t level, const char* source,
+                                const spv_position_t* pos, const char* message)
 {
-  if (!source || !out_words || !out_word_count) return false;
-  hslc_state_lock();
-  // Auto-initialize shader module if not already done
-  if (!g_shader_state.initialized)
+  (void)source;
+  if (!s_opt_diag_sb) return;
+  const char* lvl = "INFO";
+  switch (level)
   {
-    if (!hslc_init(NULL))
+  case SPV_MSG_FATAL:          lvl = "FATAL"; break;
+  case SPV_MSG_INTERNAL_ERROR: lvl = "INTERNAL"; break;
+  case SPV_MSG_ERROR:          lvl = "ERROR"; break;
+  case SPV_MSG_WARNING:        lvl = "WARNING"; break;
+  case SPV_MSG_INFO:           lvl = "INFO"; break;
+  case SPV_MSG_DEBUG:          lvl = "DEBUG"; break;
+  }
+  if (s_opt_diag_sb->length > 0)
+    hslc_sb_append(s_opt_diag_sb, "\n");
+  hslc_sb_appendf(s_opt_diag_sb, "[OPT %s]", lvl);
+  if (pos)
+    hslc_sb_appendf(s_opt_diag_sb, " (index %u)", (unsigned)pos->index);
+  hslc_sb_appendf(s_opt_diag_sb, " %s", message ? message : "(null)");
+}
+
+static bool hslc_optimize_spirv(uint32_t** words, size_t* word_count, char** out_log)
+{
+  if (!words || !*words || !word_count || *word_count == 0) return false;
+
+  spv_optimizer_t* opt = spvOptimizerCreate(SPV_ENV_VULKAN_1_0);
+  if (!opt) return false;
+
+  // Capture diagnostics into a string builder.
+  hsl_string_builder diag;
+  hslc_sb_init(&diag);
+  s_opt_diag_sb = &diag;
+  spvOptimizerSetMessageConsumer(opt, hslc_opt_message_cb);
+
+  // Register size-reduction preset while keeping interface variables alive.
+  // This ensures descriptors, push constants, and I/O used by reflection survive.
+  const char* flags[] = {"-Os"};
+  if (!spvOptimizerRegisterPassesFromFlagsWhilePreservingTheInterface(opt, flags, 1))
+  {
+    SHADER_LOGE("Failed to register SPIRV-Tools optimizer passes");
+    s_opt_diag_sb = NULL;
+    hslc_sb_free(&diag);
+    spvOptimizerDestroy(opt);
+    return false;
+  }
+
+  // Belt-and-suspenders: also preserve bindings and spec constants at the options level.
+  spv_optimizer_options opts = spvOptimizerOptionsCreate();
+  if (opts)
+  {
+    spvOptimizerOptionsSetRunValidator(opts, false); // We validate via glslang + lint already
+    spvOptimizerOptionsSetPreserveBindings(opts, true);
+    spvOptimizerOptionsSetPreserveSpecConstants(opts, true);
+  }
+
+  spv_binary optimized = NULL;
+  spv_result_t result = spvOptimizerRun(opt, *words, *word_count, &optimized, opts);
+
+  if (opts) spvOptimizerOptionsDestroy(opts);
+  spvOptimizerDestroy(opt);
+  s_opt_diag_sb = NULL;
+
+  if (result != SPV_SUCCESS)
+  {
+    if (out_log && diag.data && diag.length > 0)
     {
-      hslc_state_unlock();
+      *out_log = hslc_sb_to_string(&diag);
+    }
+    else
+    {
+      hslc_sb_free(&diag);
+    }
+    if (optimized) spvBinaryDestroy(optimized);
+    return false;
+  }
+
+  hslc_sb_free(&diag);
+
+  // Replace caller's buffer with the optimized binary.
+  if (optimized && optimized->code && optimized->wordCount > 0)
+  {
+    uint32_t* new_buf = (uint32_t*)shader_alloc(sizeof(uint32_t) * optimized->wordCount);
+    if (!new_buf)
+    {
+      spvBinaryDestroy(optimized);
       return false;
     }
+    memcpy(new_buf, optimized->code, sizeof(uint32_t) * optimized->wordCount);
+    shader_free(*words);
+    *words = new_buf;
+    *word_count = optimized->wordCount;
   }
-  char* code = shader_alloc(length + 1);
-  if (!code)
-  {
-    hslc_state_unlock();
-    return false;
-  }
-  memcpy(code, source, length);
-  code[length] = '\0';
-  glslang_stage_t gstage = hslc_hina_to_glslang_stage(stage);
-  // Vulkan 1.0 client environment + SPIR-V 1.0 (strict Vulkan 1.0 output).
-  const glslang_input_t input = {
-    .language = GLSLANG_SOURCE_GLSL, .stage = gstage, .client = GLSLANG_CLIENT_VULKAN,
-    .client_version = GLSLANG_TARGET_VULKAN_1_0, .target_language = GLSLANG_TARGET_SPV,
-    .target_language_version = GLSLANG_TARGET_SPV_1_0, .code = code, .default_version = 450,
-    .default_profile = GLSLANG_NO_PROFILE, .resource = glslang_default_resource(),
-  };
-  (void)entry_point;
-  glslang_shader_t* shader = glslang_shader_create(&input);
-  if (!shader)
-  {
-    shader_free(code);
-    hslc_state_unlock();
-    return false;
-  }
-  if (!glslang_shader_preprocess(shader, &input))
-  {
-    glslang_shader_delete(shader);
-    shader_free(code);
-    hslc_state_unlock();
-    return false;
-  }
-  if (!glslang_shader_parse(shader, &input))
-  {
-    glslang_shader_delete(shader);
-    shader_free(code);
-    hslc_state_unlock();
-    return false;
-  }
-  glslang_program_t* program = glslang_program_create();
-  if (!program)
-  {
-    glslang_shader_delete(shader);
-    shader_free(code);
-    hslc_state_unlock();
-    return false;
-  }
-  glslang_program_add_shader(program, shader);
-  if (!glslang_program_link(program, GLSLANG_MSG_DEFAULT_BIT))
-  {
-    glslang_program_delete(program);
-    glslang_shader_delete(shader);
-    shader_free(code);
-    hslc_state_unlock();
-    return false;
-  }
-  // Generate SPIR-V with validation and optimization enabled
-  glslang_spv_options_t spv_opts = {0};
-  spv_opts.validate = true;           // Run spirv-val
-  spv_opts.disable_optimizer = false; // Run spirv-opt
-  glslang_program_SPIRV_generate_with_options(program, gstage, &spv_opts);
-  size_t words = glslang_program_SPIRV_get_size(program);
-  if (words == 0)
-  {
-    glslang_program_delete(program);
-    glslang_shader_delete(shader);
-    shader_free(code);
-    hslc_state_unlock();
-    return false;
-  }
-  uint32_t* out = shader_alloc(sizeof(uint32_t) * words);
-  if (!out)
-  {
-    glslang_program_delete(program);
-    glslang_shader_delete(shader);
-    shader_free(code);
-    hslc_state_unlock();
-    return false;
-  }
-  glslang_program_SPIRV_get(program, out);
-  *out_words = out;
-  *out_word_count = words;
-  glslang_program_delete(program);
-  glslang_shader_delete(shader);
-  shader_free(code);
-  hslc_state_unlock();
+
+  if (optimized) spvBinaryDestroy(optimized);
   return true;
 }
 
-void hslc_free_spirv_words(uint32_t* words)
-{
-  shader_free(words);
-}
-
-// New Shader Compilation API (with preprocessing and HSL injection)
-// Internal: Load source from file
-static char* hslc_load_shader_file(const char* filename)
-{
-  if (!filename) return NULL;
-  FILE* f = fopen(filename, "rb");
-  if (!f) return NULL;
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (size < 0)
-  {
-    fclose(f);
-    return NULL;
-  }
-  char* content = shader_alloc((size_t)size + 1);
-  if (!content)
-  {
-    fclose(f);
-    return NULL;
-  }
-  size_t read = fread(content, 1, (size_t)size, f);
-  fclose(f);
-  content[read] = '\0';
-  return content;
-}
-
-// Internal: Compile preprocessed GLSL to SPIR-V with error log
-static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage stage, uint32_t** out_words,
-                                           size_t* out_word_count, char** out_log)
+// Internal GLSL->SPIR-V compilation path used by both public and HSL flows.
+static bool hslc_compile_glsl_to_spirv(const char* source, size_t length, hina_shader_stage stage,
+                                       uint32_t** out_words, size_t* out_word_count, char** out_log,
+                                       bool run_spirv_lint)
 {
   if (!source || !out_words || !out_word_count) return false;
+  if (out_log) *out_log = NULL;
   hslc_state_lock();
   // Auto-initialize shader module if not already done
   if (!g_shader_state.initialized)
@@ -27983,14 +27959,16 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
       return false;
     }
   }
-  size_t length = strlen(source);
+
   char* code = shader_alloc(length + 1);
   if (!code)
   {
     hslc_state_unlock();
     return false;
   }
-  memcpy(code, source, length + 1);
+  memcpy(code, source, length);
+  code[length] = '\0';
+
   glslang_stage_t gstage = hslc_hina_to_glslang_stage(stage);
   const glslang_input_t input = {
     .language = GLSLANG_SOURCE_GLSL, .stage = gstage, .client = GLSLANG_CLIENT_VULKAN,
@@ -28000,6 +27978,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     .messages = GLSLANG_MSG_DEFAULT_BIT, .resource = glslang_default_resource(), .callbacks = {0},
     .callbacks_ctx = NULL,
   };
+
   glslang_shader_t* shader = glslang_shader_create(&input);
   if (!shader)
   {
@@ -28012,6 +27991,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     hslc_state_unlock();
     return false;
   }
+
   // Preprocess
   if (!glslang_shader_preprocess(shader, &input))
   {
@@ -28030,6 +28010,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     hslc_state_unlock();
     return false;
   }
+
   // Parse
   if (!glslang_shader_parse(shader, &input))
   {
@@ -28048,6 +28029,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     hslc_state_unlock();
     return false;
   }
+
   // Link
   glslang_program_t* program = glslang_program_create();
   if (!program)
@@ -28081,17 +28063,20 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     hslc_state_unlock();
     return false;
   }
-  // Generate SPIR-V with validation and optimization enabled
+
+  // Generate raw SPIR-V — optimization is handled by our own SPIRV-Tools pass.
   glslang_spv_options_t spv_opts = {0};
-  spv_opts.validate = true;           // Run spirv-val
-  spv_opts.disable_optimizer = false; // Run spirv-opt
+  spv_opts.validate = true;           // Run spirv-val on glslang output
+  spv_opts.disable_optimizer = true;  // Skip glslang's internal spirv-opt
+  spv_opts.optimize_size = false;
   glslang_program_SPIRV_generate_with_options(program, gstage, &spv_opts);
+
   size_t words = glslang_program_SPIRV_get_size(program);
   if (words == 0)
   {
     if (out_log)
     {
-      // Check for SPIR-V validation/optimization messages
+      // Check for SPIR-V validation/optimization messages.
       const char* spv_msg = glslang_program_SPIRV_get_messages(program);
       if (spv_msg && spv_msg[0])
       {
@@ -28111,6 +28096,7 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
     hslc_state_unlock();
     return false;
   }
+
   uint32_t* out = shader_alloc(sizeof(uint32_t) * words);
   if (!out)
   {
@@ -28122,18 +28108,55 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
   }
   glslang_program_SPIRV_get(program, out);
 
-  // Run SPIRV-Tools linter to catch issues like derivatives in divergent control flow
-  // These are valid SPIR-V but may cause undefined behavior at runtime
-  if (!hina_spirv_lint(out, words))
+  // Run SPIRV-Tools optimizer (-Os) before lint/reflection.
+  // Preserves interface variables so descriptor/push-constant reflection stays valid.
   {
-    const char* lint_warnings = hina_spirv_lint_get_warnings();
-    if (lint_warnings)
+    char* opt_log = NULL;
+    if (!hslc_optimize_spirv(&out, &words, out_log ? &opt_log : NULL))
     {
-      SHADER_LOGW("SPIR-V lint warnings:\n%s", lint_warnings);
+      if (out_log && opt_log)
+      {
+        *out_log = opt_log;
+      }
+      else if (opt_log)
+      {
+        SHADER_LOGE("SPIR-V optimization failed:\n%s", opt_log);
+        shader_free(opt_log);
+      }
+      else
+      {
+        SHADER_LOGE("SPIR-V optimization failed");
+        if (out_log)
+        {
+          *out_log = (char*)shader_alloc(64);
+          if (*out_log) strcpy(*out_log, "SPIR-V optimization failed");
+        }
+      }
+      shader_free(out);
+      glslang_program_delete(program);
+      glslang_shader_delete(shader);
+      shader_free(code);
+      hslc_state_unlock();
+      return false;
     }
+    if (opt_log) shader_free(opt_log); // Success path — discard any info/warning diagnostics
   }
-  // Keep lint scratch memory deterministic for debug leak detectors.
-  hina_spirv_lint_cleanup();
+
+  if (run_spirv_lint)
+  {
+    // Run SPIRV-Tools linter to catch issues like derivatives in divergent control flow.
+    // These are valid SPIR-V but may cause undefined behavior at runtime.
+    if (!hina_spirv_lint(out, words))
+    {
+      const char* lint_warnings = hina_spirv_lint_get_warnings();
+      if (lint_warnings)
+      {
+        SHADER_LOGW("SPIR-V lint warnings:\n%s", lint_warnings);
+      }
+    }
+    // Keep lint scratch memory deterministic for debug leak detectors.
+    hina_spirv_lint_cleanup();
+  }
 
   *out_words = out;
   *out_word_count = words;
@@ -28142,6 +28165,47 @@ static bool hslc_compile_preprocessed_glsl(const char* source, hina_shader_stage
   shader_free(code);
   hslc_state_unlock();
   return true;
+}
+
+// GLSL Compilation
+// Compiles GLSL source code into SPIR-V.
+bool hslc_compile_glsl(const char* source, size_t length, hina_shader_stage stage, const char* entry_point,
+                       uint32_t** out_words, size_t* out_word_count)
+{
+  (void)entry_point;
+  return hslc_compile_glsl_to_spirv(source, length, stage, out_words, out_word_count, NULL, false);
+}
+
+void hslc_free_spirv_words(uint32_t* words)
+{
+  shader_free(words);
+}
+
+// New Shader Compilation API (with preprocessing and HSL injection)
+// Internal: Load source from file
+static char* hslc_load_shader_file(const char* filename)
+{
+  if (!filename) return NULL;
+  FILE* f = fopen(filename, "rb");
+  if (!f) return NULL;
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (size < 0)
+  {
+    fclose(f);
+    return NULL;
+  }
+  char* content = shader_alloc((size_t)size + 1);
+  if (!content)
+  {
+    fclose(f);
+    return NULL;
+  }
+  size_t read = fread(content, 1, (size_t)size, f);
+  fclose(f);
+  content[read] = '\0';
+  return content;
 }
 
 // Stage name for logging
@@ -28361,8 +28425,8 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
   uint32_t* spirv_words = NULL;
   size_t spirv_word_count = 0;
   char* raw_log = NULL;
-  bool ok = hslc_compile_preprocessed_glsl(final_source, desc->stage, &spirv_words, &spirv_word_count,
-                                           out_log ? &raw_log : NULL);
+  bool ok = hslc_compile_glsl_to_spirv(final_source, strlen(final_source), desc->stage, &spirv_words, &spirv_word_count,
+                                       out_log ? &raw_log : NULL, true);
   shader_free(final_source);
   if (!ok)
   {
