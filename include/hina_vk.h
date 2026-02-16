@@ -2326,6 +2326,8 @@ typedef struct hslc_hsl_module_desc
 {
   const char* source;                   // HSL source code (required)
   const char* source_name;              // Optional name for diagnostics (e.g., "shader.hina_sl"); NULL => "<inline>"
+  const hslc_compile_define* defines;   // Array of compile-time defines (optional, may be NULL)
+  uint32_t define_count;                // Number of defines
   hslc_load_include_fn load_include_fn; // Custom include loader, or NULL for default file loading
   void* user_data;                      // User data passed to load_include_fn
 } hslc_hsl_module_desc;

@@ -23643,6 +23643,133 @@ double hina_timestamp_to_ns(uint64_t timestamp_delta)
 extern bool hina_spirv_lint(const uint32_t* spirv_words, size_t word_count);
 extern const char* hina_spirv_lint_get_warnings(void);
 extern void hina_spirv_lint_cleanup(void);
+// StrView: non-owning string slice (pointer + length, not null-terminated)
+typedef struct hslc_str_view
+{
+  const char* data;
+  uint32_t len;
+} hslc_str_view;
+
+static inline hslc_str_view hslc_sv(const char* data, uint32_t len)
+{
+  hslc_str_view sv;
+  sv.data = data;
+  sv.len = len;
+  return sv;
+}
+
+static inline hslc_str_view hslc_sv_cstr(const char* str)
+{
+  hslc_str_view sv;
+  sv.data = str;
+  sv.len = str ? (uint32_t)strlen(str) : 0;
+  return sv;
+}
+
+static inline bool hslc_sv_eq(hslc_str_view a, hslc_str_view b)
+{
+  return a.len == b.len && (a.len == 0 || memcmp(a.data, b.data, a.len) == 0);
+}
+
+static inline bool hslc_sv_eq_cstr(hslc_str_view sv, const char* lit)
+{
+  uint32_t lit_len = (uint32_t)strlen(lit);
+  return sv.len == lit_len && memcmp(sv.data, lit, lit_len) == 0;
+}
+
+// Arena: per-compilation bump allocator
+// All temporaries live for the duration of one hslc_compile call.
+// Released in a single hslc_arena_release at function exit.
+#define HSLC_ARENA_BLOCK_SIZE (64u * 1024u)
+
+typedef struct hslc_arena_block
+{
+  struct hslc_arena_block* next;
+  uint32_t size;
+  uint32_t offset;
+  uint8_t data[];
+} hslc_arena_block;
+
+typedef struct hslc_arena
+{
+  hslc_arena_block* head;
+  hslc_arena_block* current;
+} hslc_arena;
+
+static void* hslc_arena_alloc(hslc_arena* a, size_t size, uint32_t align)
+{
+  uint32_t need = (uint32_t)size;
+  uint32_t mask = align ? (align - 1u) : 0u;
+  // Try existing blocks starting from current
+  hslc_arena_block* block = a->current ? a->current : a->head;
+  while (block)
+  {
+    uint32_t off = (block->offset + mask) & ~mask;
+    if (off + need <= block->size)
+    {
+      block->offset = off + need;
+      a->current = block;
+      return block->data + off;
+    }
+    if (!block->next) break;
+    block = block->next;
+  }
+  // Allocate new block
+  uint32_t block_size = HSLC_ARENA_BLOCK_SIZE;
+  uint32_t align_pad = mask;
+  if (need + align_pad > block_size)
+  {
+    block_size = need + align_pad;
+  }
+  size_t alloc_size = sizeof(hslc_arena_block) + block_size;
+  hslc_arena_block* new_block = (hslc_arena_block*)malloc(alloc_size);
+  if (!new_block) return NULL;
+  new_block->next = NULL;
+  new_block->size = block_size;
+  new_block->offset = 0;
+  if (block)
+  {
+    block->next = new_block;
+  }
+  else
+  {
+    a->head = new_block;
+  }
+  a->current = new_block;
+  uint32_t off = (new_block->offset + mask) & ~mask;
+  new_block->offset = off + need;
+  return new_block->data + off;
+}
+
+static void hslc_arena_release(hslc_arena* a)
+{
+  hslc_arena_block* block = a->head;
+  while (block)
+  {
+    hslc_arena_block* next = block->next;
+    free(block);
+    block = next;
+  }
+  a->head = NULL;
+  a->current = NULL;
+}
+
+static char* hslc_arena_strdup(hslc_arena* a, const char* str)
+{
+  if (!str) return NULL;
+  size_t len = strlen(str) + 1;
+  char* copy = (char*)hslc_arena_alloc(a, len, 1);
+  if (copy) memcpy(copy, str, len);
+  return copy;
+}
+
+static void* hslc_arena_calloc(hslc_arena* a, size_t size)
+{
+  void* p = hslc_arena_alloc(a, size, 8);
+  if (p) memset(p, 0, size);
+  return p;
+}
+
 HINA_STATIC_ASSERT(HINA_STAGE_VERTEX == 0x00000001u, hina_stage_vertex_bit);
 HINA_STATIC_ASSERT(HINA_STAGE_TESS_CONTROL == 0x00000002u, hina_stage_tess_control_bit);
 HINA_STATIC_ASSERT(HINA_STAGE_TESS_EVAL == 0x00000004u, hina_stage_tess_eval_bit);
@@ -23798,6 +23925,7 @@ typedef struct hsl_string_builder
   size_t length;
   size_t capacity;
   bool oom;
+  hslc_arena* arena; // NULL = shader_alloc, non-NULL = arena-backed
 } hsl_string_builder;
 
 // Include stack entry for cycle detection
@@ -23828,10 +23956,11 @@ typedef struct hsl_include_context
   uint32_t stack_capacity;
   hslc_load_include_fn load_fn;
   void* user_data;
-  char* error_msg;
+  char* error_msg; // Always shader_alloc'd (may transfer to *out_log)
   hsl_source_map source_map; // Maps source IDs to filenames
   char* pragma_once_files[HINA_MAX_SOURCE_FILES]; // Resolved paths with #pragma once
   uint32_t pragma_once_count;
+  hslc_arena* arena; // NULL = shader_alloc, non-NULL = arena-backed
 } hsl_include_context;
 
 // Forward Declarations
@@ -23840,7 +23969,18 @@ static char* hslc_strdup(const char* str);
 // String Builder Implementation
 static void hslc_sb_init(hsl_string_builder* sb)
 {
+  sb->arena = NULL;
   sb->data = (char*)shader_alloc(HINA_SB_INITIAL_CAPACITY);
+  sb->length = 0;
+  sb->capacity = sb->data ? HINA_SB_INITIAL_CAPACITY : 0;
+  sb->oom = sb->data == NULL;
+  if (sb->data) sb->data[0] = '\0';
+}
+
+static void hslc_sb_init_arena(hsl_string_builder* sb, hslc_arena* arena)
+{
+  sb->arena = arena;
+  sb->data = (char*)hslc_arena_alloc(arena, HINA_SB_INITIAL_CAPACITY, 1);
   sb->length = 0;
   sb->capacity = sb->data ? HINA_SB_INITIAL_CAPACITY : 0;
   sb->oom = sb->data == NULL;
@@ -23849,6 +23989,15 @@ static void hslc_sb_init(hsl_string_builder* sb)
 
 static void hslc_sb_free(hsl_string_builder* sb)
 {
+  if (sb->arena)
+  {
+    // Arena-backed: no-op, arena owns the memory
+    sb->data = NULL;
+    sb->length = 0;
+    sb->capacity = 0;
+    sb->oom = false;
+    return;
+  }
   if (sb->data)
   {
     shader_free(sb->data);
@@ -23879,7 +24028,15 @@ static bool hslc_sb_ensure_capacity(hsl_string_builder* sb, size_t additional)
     }
     new_capacity *= 2;
   }
-  char* new_data = (char*)shader_alloc(new_capacity);
+  char* new_data;
+  if (sb->arena)
+  {
+    new_data = (char*)hslc_arena_alloc(sb->arena, new_capacity, 1);
+  }
+  else
+  {
+    new_data = (char*)shader_alloc(new_capacity);
+  }
   if (!new_data)
   {
     sb->oom = true;
@@ -23888,7 +24045,7 @@ static bool hslc_sb_ensure_capacity(hsl_string_builder* sb, size_t additional)
   if (sb->data)
   {
     memcpy(new_data, sb->data, sb->length + 1);
-    shader_free(sb->data);
+    if (!sb->arena) shader_free(sb->data); // Arena: old buffer is abandoned (reclaimed on release)
   }
   else
   {
@@ -23936,7 +24093,7 @@ static char* hslc_sb_to_string(hsl_string_builder* sb)
 {
   if (!sb || sb->oom)
   {
-    if (sb && sb->data) shader_free(sb->data);
+    if (sb && sb->data && !sb->arena) shader_free(sb->data);
     if (sb)
     {
       sb->data = NULL;
@@ -23949,11 +24106,11 @@ static char* hslc_sb_to_string(hsl_string_builder* sb)
   sb->data = NULL;
   sb->length = 0;
   sb->capacity = 0;
-  return result;
+  return result; // Arena-backed: caller must not free (arena owns it)
 }
 
 // Source Map Implementation
-static uint32_t hslc_source_map_register(hsl_source_map* map, const char* filename)
+static uint32_t hslc_source_map_register(hsl_source_map* map, const char* filename, hslc_arena* arena)
 {
   // Check if already registered
   for (uint32_t i = 0; i < map->file_count; i++)
@@ -23969,17 +24126,30 @@ static uint32_t hslc_source_map_register(hsl_source_map* map, const char* filena
     return 0; // Fall back to first file
   }
   uint32_t id = map->file_count++;
-  size_t len = strlen(filename);
-  map->files[id].filename = (char*)shader_alloc(len + 1);
-  if (map->files[id].filename)
+  if (arena)
   {
-    memcpy(map->files[id].filename, filename, len + 1);
+    map->files[id].filename = hslc_arena_strdup(arena, filename);
+  }
+  else
+  {
+    size_t len = strlen(filename);
+    map->files[id].filename = (char*)shader_alloc(len + 1);
+    if (map->files[id].filename)
+    {
+      memcpy(map->files[id].filename, filename, len + 1);
+    }
   }
   return id;
 }
 
-static void hslc_source_map_free(hsl_source_map* map)
+static void hslc_source_map_free(hsl_source_map* map, hslc_arena* arena)
 {
+  if (arena)
+  {
+    // Arena-backed: filenames are arena-owned, just reset count
+    map->file_count = 0;
+    return;
+  }
   for (uint32_t i = 0; i < map->file_count; i++)
   {
     if (map->files[i].filename)
@@ -23992,9 +24162,18 @@ static void hslc_source_map_free(hsl_source_map* map)
 }
 
 // Include Context Implementation
-static void hslc_include_ctx_init(hsl_include_context* ctx, hslc_load_include_fn load_fn, void* user_data)
+static void hslc_include_ctx_init(hsl_include_context* ctx, hslc_load_include_fn load_fn, void* user_data,
+                                  hslc_arena* arena)
 {
-  ctx->stack = (hsl_include_entry*)shader_alloc(sizeof(hsl_include_entry) * HINA_MAX_INCLUDE_DEPTH);
+  ctx->arena = arena;
+  if (arena)
+  {
+    ctx->stack = (hsl_include_entry*)hslc_arena_alloc(arena, sizeof(hsl_include_entry) * HINA_MAX_INCLUDE_DEPTH, 8);
+  }
+  else
+  {
+    ctx->stack = (hsl_include_entry*)shader_alloc(sizeof(hsl_include_entry) * HINA_MAX_INCLUDE_DEPTH);
+  }
   ctx->stack_depth = 0;
   ctx->stack_capacity = ctx->stack ? HINA_MAX_INCLUDE_DEPTH : 0;
   ctx->load_fn = load_fn;
@@ -24007,17 +24186,26 @@ static void hslc_include_ctx_init(hsl_include_context* ctx, hslc_load_include_fn
 
 static void hslc_include_ctx_free(hsl_include_context* ctx)
 {
-  if (ctx->stack)
-  {
-    shader_free(ctx->stack);
-    ctx->stack = NULL;
-  }
+  // error_msg is always shader_alloc'd (may be transferred to *out_log)
   if (ctx->error_msg)
   {
     shader_free(ctx->error_msg);
     ctx->error_msg = NULL;
   }
-  hslc_source_map_free(&ctx->source_map);
+  if (ctx->arena)
+  {
+    // Arena-backed: stack, source map filenames, pragma_once paths all arena-owned
+    ctx->stack = NULL;
+    hslc_source_map_free(&ctx->source_map, ctx->arena);
+    ctx->pragma_once_count = 0;
+    return;
+  }
+  if (ctx->stack)
+  {
+    shader_free(ctx->stack);
+    ctx->stack = NULL;
+  }
+  hslc_source_map_free(&ctx->source_map, NULL);
   for (uint32_t i = 0; i < ctx->pragma_once_count; i++)
   {
     shader_free(ctx->pragma_once_files[i]);
@@ -24124,8 +24312,7 @@ typedef enum hsl_token_kind
 typedef struct hsl_token
 {
   hsl_token_kind kind;
-  const char* lexeme; // Pointer into source (not null-terminated)
-  uint32_t lexeme_len;
+  hslc_str_view lexeme; // Non-owning slice into source (not null-terminated)
   uint32_t line;
   uint32_t col;
 
@@ -24265,18 +24452,17 @@ static hsl_token hslc_make_token(hsl_token_kind kind, const char* start, uint32_
 {
   hsl_token tok = {0};
   tok.kind = kind;
-  tok.lexeme = start;
-  tok.lexeme_len = len;
+  tok.lexeme = hslc_sv(start, len);
   tok.line = start_line;
   tok.col = start_col;
   return tok;
 }
 
-static hsl_token_kind hslc_check_keyword(const char* start, uint32_t len)
+static hsl_token_kind hslc_check_keyword(hslc_str_view sv)
 {
   // Check keywords in order of likelihood
 #define HSL_KEYWORD(str, tok) \
-    if (len == sizeof(str) - 1 && memcmp(start, str, len) == 0) return tok
+    if (hslc_sv_eq_cstr(sv, str)) return tok
   HSL_KEYWORD("group", HSL_TOK_KW_GROUP);
   HSL_KEYWORD("bindings", HSL_TOK_KW_BINDINGS);
   HSL_KEYWORD("binding", HSL_TOK_KW_BINDING);
@@ -24344,7 +24530,7 @@ static hsl_token hslc_scan_token(hsl_lexer* lex)
       hslc_advance(lex);
     }
     uint32_t len = (uint32_t)(lex->current - start);
-    hsl_token_kind kind = hslc_check_keyword(start, len);
+    hsl_token_kind kind = hslc_check_keyword(hslc_sv(start, len));
     return hslc_make_token(kind, start, len, start_line, start_col);
   }
   // Number (integer or float)
@@ -24593,6 +24779,9 @@ typedef struct hsl_module_ir
   uint32_t snippet_count;
   // Stages
   hsl_stage stages[HSL_STAGE_COUNT];
+  // Header line offset (line number of #hina directive in the expanded source,
+  // so snippet lines in the full source = header_line_offset + snippet->line)
+  uint32_t header_line_offset;
   // Error info
   char error_msg[512];
   uint32_t error_line;
@@ -24606,6 +24795,7 @@ typedef struct hsl_parser
   hsl_token current;
   hsl_token previous;
   hsl_module_ir* ir;
+  hslc_arena* arena; // NULL = malloc/free, non-NULL = arena-backed
   bool had_error;
   bool panic_mode; // Suppress cascade errors
 } hsl_parser;
@@ -24673,11 +24863,11 @@ static void hslc_parser_consume(hsl_parser* p, hsl_token_kind kind, const char* 
 }
 
 // Copy token lexeme to buffer (null-terminated)
-static void hslc_copy_lexeme(char* dst, size_t dst_size, const hsl_token* tok)
+static void hslc_copy_lexeme(char* dst, size_t dst_size, hslc_str_view sv)
 {
-  size_t len = tok->lexeme_len;
+  size_t len = sv.len;
   if (len >= dst_size) len = dst_size - 1;
-  memcpy(dst, tok->lexeme, len);
+  memcpy(dst, sv.data, len);
   dst[len] = '\0';
 }
 
@@ -24725,7 +24915,7 @@ static void hslc_parse_group(hsl_parser* p)
     return;
   }
   hsl_group* g = &p->ir->groups[p->ir->group_count];
-  hslc_copy_lexeme(g->name, sizeof(g->name), &p->current);
+  hslc_copy_lexeme(g->name, sizeof(g->name), p->current.lexeme);
   g->line = p->current.line;
   hslc_parser_advance(p);
   hslc_parser_consume(p, HSL_TOK_EQUALS, "Expected '=' after group name");
@@ -24793,7 +24983,7 @@ static void hslc_parse_layout_qualifier(hsl_parser* p, char* out, size_t out_siz
   else if (hslc_parser_check(p, HSL_TOK_IDENT))
   {
     // Custom layout (e.g., format for images)
-    hslc_copy_lexeme(out, out_size, &p->current);
+    hslc_copy_lexeme(out, out_size, p->current.lexeme);
     hslc_parser_advance(p);
   }
   hslc_parser_consume(p, HSL_TOK_RPAREN, "Expected ')' after layout qualifier");
@@ -25009,7 +25199,7 @@ static void hslc_parse_block_body(hsl_parser* p, char* out, size_t out_size)
   out[0] = '\0';
   if (!hslc_parser_check(p, HSL_TOK_LBRACE)) return;
   // Find matching brace in raw source
-  const char* start = p->current.lexeme;
+  const char* start = p->current.lexeme.data;
   const char* ptr = hslc_find_matching_brace(start);
   if (!ptr)
   {
@@ -25048,7 +25238,7 @@ static void hslc_parse_shared_decl(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected type name after 'shared'");
     return;
   }
-  hslc_copy_lexeme(decl->type_name, sizeof(decl->type_name), &p->current);
+  hslc_copy_lexeme(decl->type_name, sizeof(decl->type_name), p->current.lexeme);
   hslc_parser_advance(p);
   size_t elem_size = 0;
   size_t elem_align = 0;
@@ -25063,7 +25253,7 @@ static void hslc_parse_shared_decl(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected shared variable name");
     return;
   }
-  hslc_copy_lexeme(decl->name, sizeof(decl->name), &p->current);
+  hslc_copy_lexeme(decl->name, sizeof(decl->name), p->current.lexeme);
   hslc_parser_advance(p);
   size_t current_size = elem_size;
   while (hslc_parser_match(p, HSL_TOK_LBRACKET))
@@ -25140,7 +25330,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected block name after 'uniform'");
       return;
     }
-    hslc_copy_lexeme(res->type_name, sizeof(res->type_name), &p->current);
+    hslc_copy_lexeme(res->type_name, sizeof(res->type_name), p->current.lexeme);
     hslc_parser_advance(p);
     // Block body
     hslc_parse_block_body(p, res->block_body, sizeof(res->block_body));
@@ -25150,7 +25340,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected instance name after block body");
       return;
     }
-    hslc_copy_lexeme(res->name, sizeof(res->name), &p->current);
+    hslc_copy_lexeme(res->name, sizeof(res->name), p->current.lexeme);
     hslc_parser_advance(p);
   }
   else if (hslc_parser_match(p, HSL_TOK_KW_BUFFER))
@@ -25166,7 +25356,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected block name after 'buffer'");
       return;
     }
-    hslc_copy_lexeme(res->type_name, sizeof(res->type_name), &p->current);
+    hslc_copy_lexeme(res->type_name, sizeof(res->type_name), p->current.lexeme);
     hslc_parser_advance(p);
     // Block body
     hslc_parse_block_body(p, res->block_body, sizeof(res->block_body));
@@ -25176,7 +25366,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected instance name after block body");
       return;
     }
-    hslc_copy_lexeme(res->name, sizeof(res->name), &p->current);
+    hslc_copy_lexeme(res->name, sizeof(res->name), p->current.lexeme);
     hslc_parser_advance(p);
   }
   else if (hslc_parser_match(p, HSL_TOK_KW_TEXTURE))
@@ -25188,7 +25378,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected sampler type after 'texture'");
       return;
     }
-    hslc_copy_lexeme(res->type_name, sizeof(res->type_name), &p->current);
+    hslc_copy_lexeme(res->type_name, sizeof(res->type_name), p->current.lexeme);
     hslc_parser_advance(p);
     // Instance name
     if (!hslc_parser_check(p, HSL_TOK_IDENT))
@@ -25196,7 +25386,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected texture name");
       return;
     }
-    hslc_copy_lexeme(res->name, sizeof(res->name), &p->current);
+    hslc_copy_lexeme(res->name, sizeof(res->name), p->current.lexeme);
     hslc_parser_advance(p);
   }
   else if (hslc_parser_match(p, HSL_TOK_KW_SAMPLER))
@@ -25209,7 +25399,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected sampler name");
       return;
     }
-    hslc_copy_lexeme(res->name, sizeof(res->name), &p->current);
+    hslc_copy_lexeme(res->name, sizeof(res->name), p->current.lexeme);
     hslc_parser_advance(p);
   }
   else if (hslc_parser_match(p, HSL_TOK_KW_IMAGE))
@@ -25222,7 +25412,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected image type after 'image'");
       return;
     }
-    hslc_copy_lexeme(res->type_name, sizeof(res->type_name), &p->current);
+    hslc_copy_lexeme(res->type_name, sizeof(res->type_name), p->current.lexeme);
     hslc_parser_advance(p);
     // Instance name
     if (!hslc_parser_check(p, HSL_TOK_IDENT))
@@ -25230,7 +25420,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected image name");
       return;
     }
-    hslc_copy_lexeme(res->name, sizeof(res->name), &p->current);
+    hslc_copy_lexeme(res->name, sizeof(res->name), p->current.lexeme);
     hslc_parser_advance(p);
   }
   else if (hslc_parser_match(p, HSL_TOK_KW_TILE_INPUT))
@@ -25259,7 +25449,7 @@ static void hslc_parse_resource(hsl_parser* p, uint32_t set_index, uint32_t* nex
       hslc_parser_error_at_current(p, "Expected tile input name");
       return;
     }
-    hslc_copy_lexeme(res->name, sizeof(res->name), &p->current);
+    hslc_copy_lexeme(res->name, sizeof(res->name), p->current.lexeme);
     hslc_parser_advance(p);
   }
   else
@@ -25310,7 +25500,7 @@ static void hslc_parse_bindings_block(hsl_parser* p)
     return;
   }
   char group_name[HSL_MAX_IDENT_LEN];
-  hslc_copy_lexeme(group_name, sizeof(group_name), &p->current);
+  hslc_copy_lexeme(group_name, sizeof(group_name), p->current.lexeme);
   hslc_parser_advance(p);
   hsl_group* group = hslc_find_group(p->ir, group_name);
   if (!group)
@@ -25366,7 +25556,7 @@ static void hslc_parse_explicit_binding(hsl_parser* p)
     return;
   }
   char group_name[HSL_MAX_IDENT_LEN];
-  hslc_copy_lexeme(group_name, sizeof(group_name), &p->current);
+  hslc_copy_lexeme(group_name, sizeof(group_name), p->current.lexeme);
   hslc_parser_advance(p);
   hsl_group* group = hslc_find_group(p->ir, group_name);
   if (!group)
@@ -25437,7 +25627,7 @@ static void hslc_parse_struct_field(hsl_parser* p, hsl_struct* s)
       return;
     }
     char attr_name[32];
-    hslc_copy_lexeme(attr_name, sizeof(attr_name), &p->current);
+    hslc_copy_lexeme(attr_name, sizeof(attr_name), p->current.lexeme);
     hslc_parser_advance(p);
     if (strcmp(attr_name, "flat") == 0)
     {
@@ -25483,7 +25673,7 @@ static void hslc_parse_struct_field(hsl_parser* p, hsl_struct* s)
         hslc_parser_error_at_current(p, "Expected semantic name");
         return;
       }
-      hslc_copy_lexeme(f->semantic, sizeof(f->semantic), &p->current);
+      hslc_copy_lexeme(f->semantic, sizeof(f->semantic), p->current.lexeme);
       hslc_parser_advance(p);
       hslc_parser_consume(p, HSL_TOK_RPAREN, "Expected ')' after semantic name");
     }
@@ -25494,7 +25684,7 @@ static void hslc_parse_struct_field(hsl_parser* p, hsl_struct* s)
     hslc_parser_error_at_current(p, "Expected type name");
     return;
   }
-  hslc_copy_lexeme(f->type_name, sizeof(f->type_name), &p->current);
+  hslc_copy_lexeme(f->type_name, sizeof(f->type_name), p->current.lexeme);
   hslc_parser_advance(p);
   // Field name
   if (!hslc_parser_check(p, HSL_TOK_IDENT))
@@ -25502,7 +25692,7 @@ static void hslc_parse_struct_field(hsl_parser* p, hsl_struct* s)
     hslc_parser_error_at_current(p, "Expected field name");
     return;
   }
-  hslc_copy_lexeme(f->name, sizeof(f->name), &p->current);
+  hslc_copy_lexeme(f->name, sizeof(f->name), p->current.lexeme);
   hslc_parser_advance(p);
   if (p->current.kind == HSL_TOK_COLON)
   {
@@ -25545,7 +25735,7 @@ static void hslc_parse_struct(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected struct name");
     return;
   }
-  hslc_copy_lexeme(s->name, sizeof(s->name), &p->current);
+  hslc_copy_lexeme(s->name, sizeof(s->name), p->current.lexeme);
   hslc_parser_advance(p);
   // Check for duplicate struct names
   for (uint32_t i = 0; i < p->ir->struct_count; i++)
@@ -25622,7 +25812,7 @@ static void hslc_parse_push_constant(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected block name after 'push_constant'");
     return;
   }
-  hslc_copy_lexeme(pc->block_name, sizeof(pc->block_name), &p->current);
+  hslc_copy_lexeme(pc->block_name, sizeof(pc->block_name), p->current.lexeme);
   hslc_parser_advance(p);
   // Block body
   hslc_parse_block_body(p, pc->block_body, sizeof(pc->block_body));
@@ -25632,7 +25822,7 @@ static void hslc_parse_push_constant(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected variable name after block body");
     return;
   }
-  hslc_copy_lexeme(pc->var_name, sizeof(pc->var_name), &p->current);
+  hslc_copy_lexeme(pc->var_name, sizeof(pc->var_name), p->current.lexeme);
   hslc_parser_advance(p);
   hslc_parser_consume(p, HSL_TOK_SEMICOLON, "Expected ';' after push_constant");
 }
@@ -25664,7 +25854,7 @@ static void hina_parse_spec_const(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected type after spec_const(N)");
     return;
   }
-  hslc_copy_lexeme(sc->type_name, sizeof(sc->type_name), &p->current);
+  hslc_copy_lexeme(sc->type_name, sizeof(sc->type_name), p->current.lexeme);
   hslc_parser_advance(p);
   // Name
   if (!hslc_parser_check(p, HSL_TOK_IDENT))
@@ -25672,18 +25862,18 @@ static void hina_parse_spec_const(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected name after type");
     return;
   }
-  hslc_copy_lexeme(sc->name, sizeof(sc->name), &p->current);
+  hslc_copy_lexeme(sc->name, sizeof(sc->name), p->current.lexeme);
   hslc_parser_advance(p);
   // Optional default value: = value
   if (hslc_parser_match(p, HSL_TOK_EQUALS))
   {
-    const char* start = p->current.lexeme;
+    const char* start = p->current.lexeme.data;
     // Collect until semicolon
     while (!hslc_parser_check(p, HSL_TOK_SEMICOLON) && !hslc_parser_check(p, HSL_TOK_EOF))
     {
       hslc_parser_advance(p);
     }
-    size_t len = (size_t)(p->current.lexeme - start);
+    size_t len = (size_t)(p->current.lexeme.data - start);
     if (len >= sizeof(sc->default_val)) len = sizeof(sc->default_val) - 1;
     memcpy(sc->default_val, start, len);
     sc->default_val[len] = '\0';
@@ -25710,7 +25900,7 @@ static void hslc_parse_snippet(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected snippet name");
     return;
   }
-  hslc_copy_lexeme(sn->name, sizeof(sn->name), &p->current);
+  hslc_copy_lexeme(sn->name, sizeof(sn->name), p->current.lexeme);
   hslc_parser_advance(p);
   // Find the body in raw source
   if (!hslc_parser_check(p, HSL_TOK_LBRACE))
@@ -25718,7 +25908,7 @@ static void hslc_parse_snippet(hsl_parser* p)
     hslc_parser_error_at_current(p, "Expected '{' after snippet name");
     return;
   }
-  const char* block_start = p->current.lexeme;
+  const char* block_start = p->current.lexeme.data;
   const char* block_end = hslc_find_matching_brace(block_start);
   if (!block_end)
   {
@@ -25727,7 +25917,14 @@ static void hslc_parse_snippet(hsl_parser* p)
   }
   // Body is between block_start+1 and block_end-1
   size_t body_len = (size_t)(block_end - block_start - 1);
-  sn->body = (char*)malloc(body_len + 1);
+  if (p->arena)
+  {
+    sn->body = (char*)hslc_arena_alloc(p->arena, body_len + 1, 1);
+  }
+  else
+  {
+    sn->body = (char*)malloc(body_len + 1);
+  }
   if (!sn->body)
   {
     hslc_parser_error(p, "Out of memory");
@@ -25990,33 +26187,28 @@ static bool hslc_parse_stage_header(const char* line_start, const char* line_end
   // Parse stage kind
   const char* kind_start = line;
   while (line < end && *line != ' ' && *line != '\t' && *line != '\n') line++;
-  size_t kind_len = (size_t)(line - kind_start);
-  if (kind_len == 6 && strncmp(kind_start, "vertex", 6) == 0)
+  hslc_str_view kind = hslc_sv(kind_start, (uint32_t)(line - kind_start));
+  if (hslc_sv_eq_cstr(kind, "vertex"))
   {
     info->kind = HSL_STAGE_VERTEX;
   }
-  else if ((kind_len == 12 && strncmp(kind_start, "tess_control", 12) == 0) || (kind_len == 4 && strncmp(
-    kind_start, "tesc", 4) == 0))
+  else if (hslc_sv_eq_cstr(kind, "tess_control") || hslc_sv_eq_cstr(kind, "tesc"))
   {
     info->kind = HSL_STAGE_TESS_CONTROL;
   }
-  else if ((kind_len == 9 && strncmp(kind_start, "tess_eval", 9) == 0) || (kind_len == 4 && strncmp(
-    kind_start, "tese", 4) == 0))
+  else if (hslc_sv_eq_cstr(kind, "tess_eval") || hslc_sv_eq_cstr(kind, "tese"))
   {
     info->kind = HSL_STAGE_TESS_EVAL;
   }
-  else if ((kind_len == 8 && strncmp(kind_start, "geometry", 8) == 0) || (kind_len == 4 && strncmp(
-    kind_start, "geom", 4) == 0))
+  else if (hslc_sv_eq_cstr(kind, "geometry") || hslc_sv_eq_cstr(kind, "geom"))
   {
     info->kind = HSL_STAGE_GEOMETRY;
   }
-  else if ((kind_len == 8 && strncmp(kind_start, "fragment", 8) == 0) || (kind_len == 4 && strncmp(
-    kind_start, "frag", 4) == 0))
+  else if (hslc_sv_eq_cstr(kind, "fragment") || hslc_sv_eq_cstr(kind, "frag"))
   {
     info->kind = HSL_STAGE_FRAGMENT;
   }
-  else if ((kind_len == 7 && strncmp(kind_start, "compute", 7) == 0) || (kind_len == 4 && strncmp(kind_start, "comp", 4)
-    == 0))
+  else if (hslc_sv_eq_cstr(kind, "compute") || hslc_sv_eq_cstr(kind, "comp"))
   {
     info->kind = HSL_STAGE_COMPUTE;
   }
@@ -26387,11 +26579,18 @@ static hsl_snippet* hslc_find_snippet(hsl_module_ir* ir, const char* name)
 }
 
 // Transform 'in'/'out' keywords to '_in'/'_out' to avoid GLSL reserved word conflicts
-static char* hslc_transform_reserved_keywords(const char* body)
+static char* hslc_transform_reserved_keywords(const char* body, hslc_arena* arena)
 {
   if (!body) return NULL;
   hsl_string_builder sb = {0};
-  hslc_sb_init(&sb);
+  if (arena)
+  {
+    hslc_sb_init_arena(&sb, arena);
+  }
+  else
+  {
+    hslc_sb_init(&sb);
+  }
   const char* p = body;
   while (*p)
   {
@@ -26479,10 +26678,17 @@ static void hslc_build_buffer_qual(char* out, size_t out_size, uint32_t quals)
 }
 
 // Generate GLSL for a stage
-static char* hslc_generate_glsl(hsl_module_ir* ir, hsl_stage* stage, const char* stage_body)
+static char* hslc_generate_glsl(hsl_module_ir* ir, hsl_stage* stage, const char* stage_body, uint32_t main_source_id, hslc_arena* arena)
 {
   hsl_string_builder sb = {0};
-  hslc_sb_init(&sb);
+  if (arena)
+  {
+    hslc_sb_init_arena(&sb, arena);
+  }
+  else
+  {
+    hslc_sb_init(&sb);
+  }
   // Check if scalar layout is used by any uniform
   bool needs_scalar_ext = false;
   for (uint32_t i = 0; i < ir->resource_count; i++)
@@ -26875,7 +27081,7 @@ static char* hslc_generate_glsl(hsl_module_ir* ir, hsl_stage* stage, const char*
       hsl_snippet* sn = &ir->snippets[i];
       if (sn->body)
       {
-        hslc_sb_appendf(&sb, "// snippet %s\n", sn->name);
+        hslc_sb_appendf(&sb, "#line %u %u\n", ir->header_line_offset + sn->line + 1, main_source_id);
         hslc_sb_append(&sb, sn->body);
         hslc_sb_append(&sb, "\n\n");
       }
@@ -26888,7 +27094,7 @@ static char* hslc_generate_glsl(hsl_module_ir* ir, hsl_stage* stage, const char*
       hsl_snippet* sn = hslc_find_snippet(ir, stage->used_snippets[i]);
       if (sn && sn->body)
       {
-        hslc_sb_appendf(&sb, "// snippet %s\n", sn->name);
+        hslc_sb_appendf(&sb, "#line %u %u\n", ir->header_line_offset + sn->line + 1, main_source_id);
         hslc_sb_append(&sb, sn->body);
         hslc_sb_append(&sb, "\n\n");
       }
@@ -26897,17 +27103,19 @@ static char* hslc_generate_glsl(hsl_module_ir* ir, hsl_stage* stage, const char*
   // Emit user's stage body (with reserved keyword transformation)
   if (stage_body)
   {
-    char* transformed = hslc_transform_reserved_keywords(stage_body);
+    char* transformed = hslc_transform_reserved_keywords(stage_body, arena);
     if (!transformed)
     {
       hslc_sb_free(&sb);
       return NULL;
     }
-    hslc_sb_append(&sb, "// --- User code ---\n");
+    hslc_sb_appendf(&sb, "#line %u %u\n", stage->line + 1, main_source_id);
     hslc_sb_append(&sb, transformed);
     hslc_sb_append(&sb, "\n\n");
-    shader_free(transformed);
+    if (!arena) shader_free(transformed);
   }
+  // Reset #line so errors in generated main() don't map to HSL source
+  hslc_sb_appendf(&sb, "#line %u %u\n", 50000, main_source_id);
   // Generate main() that calls entry function
   hslc_sb_append(&sb, "void main() {\n");
   if (stage->kind == HSL_STAGE_VERTEX)
@@ -26972,9 +27180,10 @@ static char* hslc_generate_glsl(hsl_module_ir* ir, hsl_stage* stage, const char*
 }
 
 // HSL Module Free
-static void hslc_module_ir_free(hsl_module_ir* ir)
+static void hslc_module_ir_free(hsl_module_ir* ir, hslc_arena* arena)
 {
   if (!ir) return;
+  if (arena) return; // Arena-backed: all IR memory freed by hslc_arena_release
   // Free snippets body
   for (uint32_t i = 0; i < ir->snippet_count; i++)
   {
@@ -27111,27 +27320,34 @@ static bool hslc_check_syntax(const char* source)
 }
 
 // Parse HSL source into module IR
-static hsl_module_ir* hslc_parse_source(const char* source, const char* source_name)
+static hsl_module_ir* hslc_parse_source(const char* source, const char* source_name, hslc_arena* arena)
 {
   // Step 1: Scan for blocks
   hsl_scan_result scan = hina_scan_blocks(source);
   if (scan.had_error)
   {
-    hsl_module_ir* ir = (hsl_module_ir*)calloc(1, sizeof(hsl_module_ir));
+    hsl_module_ir* ir = arena
+      ? (hsl_module_ir*)hslc_arena_calloc(arena, sizeof(hsl_module_ir))
+      : (hsl_module_ir*)calloc(1, sizeof(hsl_module_ir));
     ir->had_error = true;
     snprintf(ir->error_msg, sizeof(ir->error_msg), "Line %u: %s", scan.error_line, scan.error_msg);
     ir->error_line = scan.error_line;
     return ir;
   }
   // Step 2: Allocate IR
-  hsl_module_ir* ir = (hsl_module_ir*)calloc(1, sizeof(hsl_module_ir));
+  hsl_module_ir* ir = arena
+    ? (hsl_module_ir*)hslc_arena_calloc(arena, sizeof(hsl_module_ir))
+    : (hsl_module_ir*)calloc(1, sizeof(hsl_module_ir));
   if (source_name)
   {
-    ir->source_name = hslc_strdup(source_name);
+    ir->source_name = arena ? hslc_arena_strdup(arena, source_name) : hslc_strdup(source_name);
   }
-  // Step 3: Extract header text
+  ir->header_line_offset = scan.header.start_line;
+  // Step 3: Extract header text (mutable scratch — use arena if available)
   size_t header_len = (size_t)(scan.header.end - scan.header.start);
-  char* header_text = (char*)malloc(header_len + 1);
+  char* header_text = arena
+    ? (char*)hslc_arena_alloc(arena, header_len + 1, 1)
+    : (char*)malloc(header_len + 1);
   memcpy(header_text, scan.header.start, header_len);
   header_text[header_len] = '\0';
   // Strip #line directives from header (include expansion adds them but HSL parser doesn't understand them)
@@ -27160,8 +27376,9 @@ static hsl_module_ir* hslc_parse_source(const char* source, const char* source_n
   hsl_parser parser = {0};
   hslc_lexer_init(&parser.lexer, header_text);
   parser.ir = ir;
+  parser.arena = arena;
   hslc_parse_header(&parser);
-  free(header_text);
+  if (!arena) free(header_text);
   if (parser.had_error)
   {
     return ir; // Error already set in ir
@@ -27190,7 +27407,14 @@ static hsl_module_ir* hslc_parse_source(const char* source, const char* source_n
     }
     // Copy body
     size_t body_len = (size_t)(sbi->body_end - sbi->body_start);
-    stage->body = (char*)malloc(body_len + 1);
+    if (arena)
+    {
+      stage->body = (char*)hslc_arena_alloc(arena, body_len + 1, 1);
+    }
+    else
+    {
+      stage->body = (char*)malloc(body_len + 1);
+    }
     memcpy(stage->body, sbi->body_start, body_len);
     stage->body[body_len] = '\0';
     stage->body_len = (uint32_t)body_len;
@@ -27208,7 +27432,7 @@ static hsl_module_ir* hslc_parse_source(const char* source, const char* source_n
 
 // Path Utilities
 // Get directory part of a path
-static char* hslc_path_dirname(const char* path)
+static char* hslc_path_dirname(const char* path, hslc_arena* arena)
 {
   if (!path) return NULL;
   size_t len = strlen(path);
@@ -27224,7 +27448,7 @@ static char* hslc_path_dirname(const char* path)
   if (!last_sep)
   {
     // No directory part, return "."
-    char* result = shader_alloc(2);
+    char* result = arena ? (char*)hslc_arena_alloc(arena, 2, 1) : (char*)shader_alloc(2);
     if (result)
     {
       result[0] = '.';
@@ -27233,7 +27457,7 @@ static char* hslc_path_dirname(const char* path)
     return result;
   }
   size_t dir_len = (size_t)(last_sep - path);
-  char* result = shader_alloc(dir_len + 1);
+  char* result = arena ? (char*)hslc_arena_alloc(arena, dir_len + 1, 1) : (char*)shader_alloc(dir_len + 1);
   if (result)
   {
     memcpy(result, path, dir_len);
@@ -27243,7 +27467,7 @@ static char* hslc_path_dirname(const char* path)
 }
 
 // Join directory and filename
-static char* hslc_path_join(const char* dir, const char* filename)
+static char* hslc_path_join(const char* dir, const char* filename, hslc_arena* arena)
 {
   if (!dir || !filename) return NULL;
   size_t dir_len = strlen(dir);
@@ -27251,7 +27475,7 @@ static char* hslc_path_join(const char* dir, const char* filename)
   // Check if dir already ends with separator
   bool has_sep = dir_len > 0 && (dir[dir_len - 1] == '/' || dir[dir_len - 1] == '\\');
   size_t total = dir_len + file_len + (has_sep ? 1 : 2);
-  char* result = shader_alloc(total);
+  char* result = arena ? (char*)hslc_arena_alloc(arena, total, 1) : (char*)shader_alloc(total);
   if (result)
   {
     memcpy(result, dir, dir_len);
@@ -27269,9 +27493,9 @@ static char* hslc_path_join(const char* dir, const char* filename)
 static char* hslc_default_load_include(const char* path, const char* including_file, void* user_data)
 {
   (void)user_data;
-  // Resolve relative path
-  char* dir = hslc_path_dirname(including_file);
-  char* full_path = hslc_path_join(dir, path);
+  // Resolve relative path (default loader always uses shader_alloc)
+  char* dir = hslc_path_dirname(including_file, NULL);
+  char* full_path = hslc_path_join(dir, path, NULL);
   shader_free(dir);
   if (!full_path) return NULL;
   FILE* f = fopen(full_path, "rb");
@@ -27368,7 +27592,14 @@ static bool hslc_is_pragma_once_file(hsl_include_context* ctx, const char* path)
 static void hslc_mark_pragma_once(hsl_include_context* ctx, const char* path)
 {
   if (ctx->pragma_once_count >= HINA_MAX_SOURCE_FILES) return; // Silent fallback
-  ctx->pragma_once_files[ctx->pragma_once_count++] = hslc_strdup(path);
+  if (ctx->arena)
+  {
+    ctx->pragma_once_files[ctx->pragma_once_count++] = hslc_arena_strdup(ctx->arena, path);
+  }
+  else
+  {
+    ctx->pragma_once_files[ctx->pragma_once_count++] = hslc_strdup(path);
+  }
 }
 
 // Recursively expand includes
@@ -27393,7 +27624,7 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
     return false;
   }
   // Register this file in source map
-  uint32_t source_id = hslc_source_map_register(&ctx->source_map, filename);
+  uint32_t source_id = hslc_source_map_register(&ctx->source_map, filename, ctx->arena);
   // Push to include stack
   ctx->stack[ctx->stack_depth].filename = filename;
   ctx->stack[ctx->stack_depth].line = 1;
@@ -27435,10 +27666,10 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
         return false;
       }
       // Resolve full path for nested includes
-      char* dir = hslc_path_dirname(filename);
-      char* full_include_path = hslc_path_join(dir, include_path);
-      shader_free(dir);
-      shader_free(include_path);
+      char* dir = hslc_path_dirname(filename, ctx->arena);
+      char* full_include_path = hslc_path_join(dir, include_path, ctx->arena);
+      if (!ctx->arena) shader_free(dir);
+      shader_free(include_path); // Always shader_alloc'd by hslc_parse_include_directive
       const char* include_text = included_source;
       if ((unsigned char)include_text[0] == 0xEF && (unsigned char)include_text[1] == 0xBB &&
           (unsigned char)include_text[2] == 0xBF)
@@ -27448,8 +27679,8 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
       // #pragma once: skip if this file was already included with #pragma once
       if (hslc_is_pragma_once_file(ctx, full_include_path))
       {
-        shader_free(included_source);
-        shader_free(full_include_path);
+        shader_free(included_source); // Always shader_alloc'd by load_fn
+        if (!ctx->arena) shader_free(full_include_path);
         goto next_line;
       }
       // Track #pragma once for this file
@@ -27458,13 +27689,13 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
         hslc_mark_pragma_once(ctx, full_include_path);
       }
       // Register included file and get its source ID
-      uint32_t include_source_id = hslc_source_map_register(&ctx->source_map, full_include_path);
+      uint32_t include_source_id = hslc_source_map_register(&ctx->source_map, full_include_path, ctx->arena);
       // Emit #line for included file (using numeric source ID)
       hslc_sb_appendf(sb, "#line 1 %u\n", include_source_id);
       // Recursively expand
       bool ok = hslc_expand_includes_impl(ctx, sb, full_include_path, include_text);
-      shader_free(included_source);
-      shader_free(full_include_path);
+      shader_free(included_source); // Always shader_alloc'd by load_fn
+      if (!ctx->arena) shader_free(full_include_path);
       if (!ok)
       {
         ctx->stack_depth--;
@@ -27480,7 +27711,10 @@ static bool hslc_expand_includes_impl(hsl_include_context* ctx, hsl_string_build
       while (trimmed < line_end && (*trimmed == ' ' || *trimmed == '\t')) trimmed++;
       if (line_end - trimmed >= 11 && strncmp(trimmed, "#hina_stage", 11) == 0)
       {
-        for (uint32_t i = 0; i < ctx->pragma_once_count; i++) shader_free(ctx->pragma_once_files[i]);
+        if (!ctx->arena)
+        {
+          for (uint32_t i = 0; i < ctx->pragma_once_count; i++) shader_free(ctx->pragma_once_files[i]);
+        }
         ctx->pragma_once_count = 0;
       }
       // Emit #line directive at start of file (using numeric source ID)
@@ -27524,7 +27758,14 @@ next_line:
 static char* hslc_expand_includes(hsl_include_context* ctx, const char* filename, const char* source)
 {
   hsl_string_builder sb;
-  hslc_sb_init(&sb);
+  if (ctx->arena)
+  {
+    hslc_sb_init_arena(&sb, ctx->arena);
+  }
+  else
+  {
+    hslc_sb_init(&sb);
+  }
   if (sb.oom)
   {
     hslc_set_error(ctx, "Out of memory");
@@ -27604,14 +27845,21 @@ typedef enum hsl_module_kind
 //   - Only user defines need to be injected (if any)
 static char* hslc_assemble_shader_source(hina_shader_stage stage, const hslc_compile_define* defines,
                                          uint32_t define_count, const char* expanded_user_source,
-                                         hsl_source_map* source_map, bool hina_complete)
+                                         hsl_source_map* source_map, bool hina_complete, hslc_arena* arena)
 {
   hsl_string_builder sb;
-  hslc_sb_init(&sb);
+  if (arena)
+  {
+    hslc_sb_init_arena(&sb, arena);
+  }
+  else
+  {
+    hslc_sb_init(&sb);
+  }
   // Register injected sources in source map (source ID 0 = <preamble>)
   if (source_map && source_map->file_count == 0)
   {
-    hslc_source_map_register(source_map, "<preamble>");
+    hslc_source_map_register(source_map, "<preamble>", arena);
   }
   // For complete HSL source, it already has #version and all needed code
   if (hina_complete)
@@ -28238,6 +28486,9 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
   out_shader->spirv_data = NULL;
   out_shader->spirv_size = 0;
   if (out_log) *out_log = NULL;
+  // Per-compilation arena: all temporaries (expanded source, IR, generated GLSL, etc.)
+  // live here and are freed in one shot at function exit.
+  hslc_arena arena = {0};
   const char* stage_name_str = hslc_hina_stage_name(desc->stage);
   const char* source_name = desc->filename ? desc->filename : "<inline>";
   SHADER_LOGI("Compiling %s shader: %s", stage_name_str, source_name);
@@ -28278,7 +28529,7 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
   }
   // Set up include context (holds source map for error remapping)
   hsl_include_context inc_ctx;
-  hslc_include_ctx_init(&inc_ctx, desc->load_include_fn, desc->user_data);
+  hslc_include_ctx_init(&inc_ctx, desc->load_include_fn, desc->user_data, &arena);
   // Expand includes (registers files in source map)
   const char* main_filename = desc->filename ? desc->filename : "main.glsl";
   char* expanded = hslc_expand_includes(&inc_ctx, main_filename, source);
@@ -28289,15 +28540,40 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
     if (out_log && inc_ctx.error_msg)
     {
       *out_log = inc_ctx.error_msg;
-      inc_ctx.error_msg = NULL; // Transfer ownership
+      inc_ctx.error_msg = NULL; // Transfer ownership (shader_alloc'd)
     }
     hslc_include_ctx_free(&inc_ctx);
+    hslc_arena_release(&arena);
     return false;
   }
   // Log source map (included files)
   if (inc_ctx.source_map.file_count > 1)
   {
     SHADER_LOGI("  Include expansion: %u source(s) registered", inc_ctx.source_map.file_count);
+  }
+  // Strip #line directives from expanded source. Include expansion inserts
+  // them but the HSL scanner/parser don't understand them. After stripping,
+  // line numbers in stage->line and snippet->line index directly into expanded.
+  {
+    char* r = expanded;
+    char* w = expanded;
+    while (*r)
+    {
+      if (r[0] == '#' && strncmp(r, "#line ", 6) == 0)
+      {
+        while (*r && *r != '\n') r++;
+        if (*r == '\n') r++;
+        continue;
+      }
+      const char* eol = r;
+      while (*eol && *eol != '\n') eol++;
+      if (*eol == '\n') eol++;
+      size_t len = (size_t)(eol - r);
+      if (w != r) memmove(w, r, len);
+      w += len;
+      r = (char*)eol;
+    }
+    *w = '\0';
   }
   // Check for HSL syntax (#hina ... #hina_end)
   if (!hslc_check_syntax(expanded))
@@ -28311,15 +28587,15 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
         snprintf(*out_log, 128, "HSL syntax required. Use #hina/#hina_end blocks.");
       }
     }
-    shader_free(expanded);
     hslc_include_ctx_free(&inc_ctx);
+    hslc_arena_release(&arena);
     return false;
   }
   char* stage_source = NULL;
   {
     SHADER_LOGI("  HSL syntax detected, parsing...");
     // Parse HSL source
-    hsl_module_ir* ir = hslc_parse_source(expanded, main_filename);
+    hsl_module_ir* ir = hslc_parse_source(expanded, main_filename, &arena);
     if (ir->had_error)
     {
       SHADER_LOGE("  HSL parsing failed: %s", ir->error_msg);
@@ -28332,9 +28608,8 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
           snprintf(*out_log, len, "HSL error: %s", ir->error_msg);
         }
       }
-      hslc_module_ir_free(ir);
-      shader_free(expanded);
       hslc_include_ctx_free(&inc_ctx);
+      hslc_arena_release(&arena);
       return false;
     }
     // Map hina_shader_stage to hsl_stage_kind
@@ -28362,9 +28637,8 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
           snprintf(*out_log, 128, "HSL does not support stage: %s", hslc_hina_stage_name(desc->stage));
         }
       }
-      hslc_module_ir_free(ir);
-      shader_free(expanded);
       hslc_include_ctx_free(&inc_ctx);
+      hslc_arena_release(&arena);
       return false;
     }
     // Check if stage is defined
@@ -28381,16 +28655,13 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
                    hina_stage_kind_names[stage_kind], hina_stage_kind_names[stage_kind]);
         }
       }
-      hslc_module_ir_free(ir);
-      shader_free(expanded);
       hslc_include_ctx_free(&inc_ctx);
+      hslc_arena_release(&arena);
       return false;
     }
-    // Generate GLSL
-    stage_source = hslc_generate_glsl(ir, stage, stage->body);
-    hslc_module_ir_free(ir);
-    shader_free(expanded);
-    expanded = NULL;
+    // Generate GLSL (source_id 0 = main file, always registered first by include expansion)
+    stage_source = hslc_generate_glsl(ir, stage, stage->body, 0, &arena);
+    // IR and expanded are arena-owned, no manual free needed
     if (!stage_source)
     {
       SHADER_LOGE("  Failed to generate GLSL from HSL");
@@ -28400,6 +28671,7 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
         if (*out_log) strcpy(*out_log, "Failed to generate GLSL from HSL");
       }
       hslc_include_ctx_free(&inc_ctx);
+      hslc_arena_release(&arena);
       return false;
     }
     SHADER_LOGI("  Generated GLSL for %s stage (%zu bytes)", hina_stage_kind_names[stage_kind], strlen(stage_source));
@@ -28407,9 +28679,9 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
   // Assemble final source (adds preamble, defines with source IDs)
   // HSL generated source is already stage-specific, so skip stage macro
   char* final_source = hslc_assemble_shader_source(desc->stage, desc->defines, desc->define_count, stage_source,
-                                                   &inc_ctx.source_map, true // HSL source is already stage-specific
-  );
-  shader_free(stage_source);
+                                                   &inc_ctx.source_map, true, // HSL source is already stage-specific
+                                                   &arena);
+  // stage_source is arena-owned, no manual free needed
   if (!final_source)
   {
     SHADER_LOGE("  Failed to assemble shader source");
@@ -28419,6 +28691,7 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
       if (*out_log) strcpy(*out_log, "Failed to assemble shader source");
     }
     hslc_include_ctx_free(&inc_ctx);
+    hslc_arena_release(&arena);
     return false;
   }
   // Compile to SPIR-V
@@ -28427,20 +28700,128 @@ bool hslc_compile(const hslc_compile_desc* desc, hslc_shader_desc* out_shader, c
   char* raw_log = NULL;
   bool ok = hslc_compile_glsl_to_spirv(final_source, strlen(final_source), desc->stage, &spirv_words, &spirv_word_count,
                                        out_log ? &raw_log : NULL, true);
-  shader_free(final_source);
+  // final_source is arena-owned, no manual free needed
   if (!ok)
   {
     SHADER_LOGE("  GLSL compilation failed");
-    // Map error sources from numeric IDs to filenames
+    // Parse the first error line number and message from raw glslang output.
+    // Format: "ERROR: <source_id>:<line>: <message>"
+    // With #line directives, the line number maps directly into expanded (HSL source).
+    int error_line = -1;
+    char error_message[256] = {0};
+    if (raw_log)
+    {
+      const char* p = raw_log;
+      while (*p)
+      {
+        if (strncmp(p, "ERROR: ", 7) == 0)
+        {
+          const char* after = p + 7;
+          while (*after >= '0' && *after <= '9') after++;
+          if (*after == ':')
+          {
+            after++;
+            error_line = 0;
+            while (*after >= '0' && *after <= '9')
+            {
+              error_line = error_line * 10 + (*after - '0');
+              after++;
+            }
+            if (*after == ':') after++;
+            while (*after == ' ' || *after == '\t') after++;
+            const char* msg_end = after;
+            while (*msg_end && *msg_end != '\n' && *msg_end != '\r') msg_end++;
+            size_t msg_len = (size_t)(msg_end - after);
+            if (msg_len >= sizeof(error_message)) msg_len = sizeof(error_message) - 1;
+            memcpy(error_message, after, msg_len);
+            error_message[msg_len] = '\0';
+          }
+          break;
+        }
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+      }
+    }
+    // Map error sources from numeric IDs to filenames (fallback output)
     if (out_log && raw_log)
     {
       *out_log = hslc_map_error_sources(raw_log, &inc_ctx.source_map);
       shader_free(raw_log);
     }
+    // Show HSL source context around the error line.
+    // #line directives in the generated GLSL make error_line a direct index
+    // into expanded (the original HSL source). No string searching needed.
+    if (out_log && *out_log && expanded && error_line > 0 && error_line < 50000 && error_message[0])
+    {
+      // Count lines in expanded and find the error line
+      int hsl_line_count = 1;
+      for (const char* c = expanded; *c; c++)
+        if (*c == '\n') hsl_line_count++;
+      // error_line is 1-based; convert to 0-based index
+      int match = error_line - 1;
+      if (match < hsl_line_count)
+      {
+        // Build line spans for context window only
+        typedef struct { const char* start; int len; } line_span;
+        int win_start = match - 2;
+        if (win_start < 0) win_start = 0;
+        int win_end = match + 3;
+        if (win_end > hsl_line_count) win_end = hsl_line_count;
+        // Walk to win_start
+        const char* ls = expanded;
+        int cur = 0;
+        while (cur < win_start && *ls)
+        {
+          if (*ls == '\n') cur++;
+          ls++;
+        }
+        // Build spans for the context window
+        int win_count = win_end - win_start;
+        line_span spans[5]; // max window is 5 lines (match-2 to match+2)
+        for (int i = 0; i < win_count && i < 5; i++)
+        {
+          spans[i].start = ls;
+          const char* eol = ls;
+          while (*eol && *eol != '\n') eol++;
+          spans[i].len = (int)(eol - ls);
+          if (spans[i].len > 0 && ls[spans[i].len - 1] == '\r') spans[i].len--;
+          ls = (*eol == '\n') ? eol + 1 : eol;
+        }
+        // Build output: replace mapped raw log with clean HSL context
+        size_t name_len = strlen(source_name);
+        size_t msg_len = strlen(error_message);
+        size_t ctx_size = 64 + name_len + msg_len;
+        for (int i = 0; i < win_count && i < 5; i++)
+          ctx_size += (size_t)spans[i].len + 16;
+        ctx_size += msg_len + 16;
+        char* ctx = (char*)shader_alloc(ctx_size);
+        if (ctx)
+        {
+          char* wp = ctx;
+          wp += sprintf(wp, "error in %s:\n", source_name);
+          for (int i = 0; i < win_count && i < 5; i++)
+          {
+            if (win_start + i == match)
+            {
+              wp += sprintf(wp, "  >>> %.*s\n", spans[i].len, spans[i].start);
+              wp += sprintf(wp, "      %s\n", error_message);
+            }
+            else
+            {
+              wp += sprintf(wp, "      %.*s\n", spans[i].len, spans[i].start);
+            }
+          }
+          shader_free(*out_log);
+          *out_log = ctx;
+        }
+      }
+    }
     hslc_include_ctx_free(&inc_ctx);
+    hslc_arena_release(&arena);
     return false;
   }
   hslc_include_ctx_free(&inc_ctx);
+  hslc_arena_release(&arena); // All temporaries freed here
   out_shader->spirv_data = spirv_words;
   out_shader->spirv_size = spirv_word_count * sizeof(uint32_t);
   out_shader->spec_constants = NULL;
@@ -28590,6 +28971,7 @@ static void hslc_free_stage_data(hina_shader_stage_data* stage)
 
 // Helper: Compile a single stage and populate stage data with reflection
 static bool hslc_compile_stage_ex(const char* source, const char* filename, hina_shader_stage stage,
+                                  const hslc_compile_define* defines, uint32_t define_count,
                                   hslc_load_include_fn load_fn, void* user_data,
                                   hina_shader_stage_data* out_stage, char** out_error)
 {
@@ -28598,6 +28980,8 @@ static bool hslc_compile_stage_ex(const char* source, const char* filename, hina
     .filename = filename,
     .source = source,
     .stage = stage,
+    .defines = defines,
+    .define_count = define_count,
     .load_include_fn = load_fn,
     .user_data = user_data,
   };
@@ -28894,11 +29278,13 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
   const char* source = desc->source;
   const char* source_name = desc->source_name;
   const char* parse_name = source_name ? source_name : "<inline>";
+  const hslc_compile_define* defines = desc->defines;
+  uint32_t define_count = desc->define_count;
   hslc_load_include_fn load_fn = desc->load_include_fn;
   void* user_data = desc->user_data;
   // Expand includes before HSL parsing (enables #include in #hina blocks)
   hsl_include_context inc_ctx;
-  hslc_include_ctx_init(&inc_ctx, load_fn, user_data);
+  hslc_include_ctx_init(&inc_ctx, load_fn, user_data, NULL);
   char* expanded = hslc_expand_includes(&inc_ctx, parse_name, source);
   if (!expanded)
   {
@@ -28945,14 +29331,14 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
     return NULL;
   }
   // Parse HSL to validate syntax and determine module type
-  hsl_module_ir* ir = hslc_parse_source(expanded, parse_name);
+  hsl_module_ir* ir = hslc_parse_source(expanded, parse_name, NULL);
   if (ir->had_error)
   {
     if (out_error)
     {
       *out_error = hslc_strdup(ir->error_msg);
     }
-    hslc_module_ir_free(ir);
+    hslc_module_ir_free(ir, NULL);
     shader_free(expanded);
     return NULL;
   }
@@ -28974,7 +29360,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
       {
         *out_error = hslc_strdup("Cannot mix compute stage with graphics stages");
       }
-      hslc_module_ir_free(ir);
+      hslc_module_ir_free(ir, NULL);
       shader_free(expanded);
       return NULL;
     }
@@ -28988,7 +29374,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
       {
         *out_error = hslc_strdup("Graphics module requires at least a vertex stage");
       }
-      hslc_module_ir_free(ir);
+      hslc_module_ir_free(ir, NULL);
       shader_free(expanded);
       return NULL;
     }
@@ -29004,7 +29390,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
   bool has_tcs = ir->stages[HSL_STAGE_TESS_CONTROL].defined;
   bool has_tes = ir->stages[HSL_STAGE_TESS_EVAL].defined;
   bool has_gs = ir->stages[HSL_STAGE_GEOMETRY].defined;
-  hslc_module_ir_free(ir);
+  hslc_module_ir_free(ir, NULL);
   hina_hsl_module* module = shader_alloc(sizeof(hina_hsl_module));
   if (!module)
   {
@@ -29020,7 +29406,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
   hsl_module_kind module_kind = module_type == HSL_MODULE_COMPUTE ? HINA_HSL_MODULE_COMPUTE : HINA_HSL_MODULE_GRAPHICS;
   if (module_kind == HINA_HSL_MODULE_COMPUTE)
   {
-    if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_COMPUTE, load_fn, user_data, &module->cs,
+    if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_COMPUTE, defines, define_count, load_fn, user_data, &module->cs,
                                out_error))
     {
       shader_free(expanded);
@@ -29030,7 +29416,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
   }
   else
   {
-    if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_VERTEX, load_fn, user_data, &module->vs,
+    if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_VERTEX, defines, define_count, load_fn, user_data, &module->vs,
                                out_error))
     {
       shader_free(expanded);
@@ -29039,7 +29425,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
     }
     if (has_tcs)
     {
-      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_TESS_CONTROL, load_fn, user_data, &module->tcs,
+      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_TESS_CONTROL, defines, define_count, load_fn, user_data, &module->tcs,
                                  out_error))
       {
         shader_free(expanded);
@@ -29049,7 +29435,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
     }
     if (has_tes)
     {
-      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_TESS_EVAL, load_fn, user_data, &module->tes,
+      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_TESS_EVAL, defines, define_count, load_fn, user_data, &module->tes,
                                  out_error))
       {
         shader_free(expanded);
@@ -29059,7 +29445,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
     }
     if (has_gs)
     {
-      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_GEOMETRY, load_fn, user_data, &module->gs,
+      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_GEOMETRY, defines, define_count, load_fn, user_data, &module->gs,
                                  out_error))
       {
         shader_free(expanded);
@@ -29070,7 +29456,7 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
     // Fragment shader (optional for vertex-only pipelines like depth pre-pass)
     if (has_fragment)
     {
-      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_FRAGMENT, load_fn, user_data, &module->fs,
+      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_FRAGMENT, defines, define_count, load_fn, user_data, &module->fs,
                                  out_error))
       {
         shader_free(expanded);
