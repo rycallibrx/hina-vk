@@ -22,16 +22,12 @@ Reading guide:
 ## 1. 5-Minute Tutorial
 
 If you are new to HSL, follow this order:
-1. Start a single `#hina ... #hina_end` header block.
-2. Declare bind groups (`group`) and resources (`bindings` or `binding`).
-3. Declare the IO structs with the exact names `VertexIn`, `Varyings`, `FragOut`.
-4. Optionally add custom structs or `snippet` blocks for helper functions.
-5. Add one or more `#hina_stage ... #hina_end` blocks with your GLSL code.
-6. Compile and fix GLSL errors (stage bodies are regular GLSL).
+1. Write declarations at the top of the file (groups, bindings, IO structs, snippets).
+2. Add one or more `#hina_stage ... #hina_end` blocks with your GLSL code.
+3. Compile and fix GLSL errors (stage bodies are regular GLSL).
 
 Minimal template:
 ```glsl
-#hina
 group Scene = 0;
 bindings(Scene, start=0) {
   uniform(std140) UBO { mat4 mvp; } ubo;
@@ -42,7 +38,6 @@ struct FragOut  { vec4 color; };
 snippet Common {
   vec2 pack_uv(vec3 p) { return p.xy; }
 }
-#hina_end
 
 #hina_stage vertex entry VSMain use Common
 Varyings VSMain(VertexIn in) {
@@ -63,7 +58,7 @@ FragOut FSMain(Varyings in) {
 ```
 
 Checklist:
-- Graphics modules require both vertex and fragment stages.
+- Graphics modules require at least a vertex stage. Fragment is optional (vertex-only modules compile with a warning; useful for depth pre-pass).
 - Compute modules must not include graphics stages.
 - `VertexIn`, `Varyings`, `FragOut` names are fixed.
 
@@ -72,15 +67,17 @@ Checklist:
 ## 2. Mental Model
 
 An HSL file is:
-- One header region with declarations — either an explicit `#hina ... #hina_end` block, or an **implicit header** (everything before the first `#hina_stage`).
+- A header region with declarations — everything before the first `#hina_stage`. (An explicit `#hina ... #hina_end` block is also supported but not required.)
 - One or more stage blocks (`#hina_stage ... #hina_end`) with GLSL bodies.
 
 Compiler responsibilities:
 - Assign IO locations based on struct field order.
 - Assign bindings in `bindings(...)` blocks.
 - Generate interface variables and `main()` wrappers.
-- Expand `#include` and inject `#line` for error mapping.
+- Expand `#include` and inject `#line` directives so errors map back to HSL source lines.
+- On GLSL compilation failure, display a focused context window around the error in the **original HSL source** with `>>>` marking the offending line.
 - Rewrite entry parameter names (`in`/`out`) and `tile_load(...)` calls.
+- Inject user-provided `#define` macros before compilation.
 
 Author responsibilities:
 - Declare IO structs, resources, and entry signatures correctly.
@@ -95,12 +92,12 @@ Author responsibilities:
 - Directives are recognized only at the start of a line (after whitespace).
 - Directives are ignored inside comments or string/char literals.
 - Only the first `#hina` header is recognized; later headers are ignored.
-- **Implicit header mode**: if no `#hina` block is present but `#hina_stage` blocks exist, everything from the start of the file to the first `#hina_stage` line is treated as the header. This allows `#include` directives at the top of the file (the natural position for includes).
+- Everything before the first `#hina_stage` line is the header region. An explicit `#hina ... #hina_end` block is also recognized but not required — all HSL declarations (groups, bindings, structs, snippets, etc.) work in either form.
 - Stage blocks are delimited by `#hina_stage` and `#hina_end`; nested stages are not recognized.
 
 ### 3.2 Include Expansion
 
-`#include "path"` is expanded in both the `#hina` header block and stage bodies. Header-block includes are expanded before HSL parsing (enabling shared struct, group, binding, and snippet definitions across files). Stage-body includes are expanded during per-stage GLSL compilation.
+`#include "path"` is expanded in both the header region and stage bodies. Header includes are expanded before HSL parsing (enabling shared struct, group, binding, and snippet definitions across files). Stage-body includes are expanded during per-stage GLSL compilation.
 
 Details (as implemented by the compiler):
 - Only the quoted form is recognized (`#include "path"`).
@@ -113,9 +110,9 @@ Details (as implemented by the compiler):
 
 #### When to use includes
 
-Includes are for **shared declarations across separate `.hina_sl` files** — things like common UBO layouts, utility functions, or shared constants. With implicit header mode, `#include` can go at the top of the file (the natural position), and the included content can contain HSL declarations (groups, bindings, structs, snippets).
+Includes are for **shared declarations across separate `.hina_sl` files** — things like common UBO layouts, utility functions, or shared constants. `#include` can go at the top of the file (the natural position), and the included content can contain HSL declarations (groups, bindings, structs, snippets).
 
-Implicit header example — `#include` at the top, no `#hina` block needed:
+Example — `#include` at the top:
 ```glsl
 // shaders/simple.hina_sl
 #include "shared_types.glsl"
@@ -168,11 +165,9 @@ layout(set = 0, binding = 0) uniform SceneUBO {
 
 ```glsl
 // shaders/lit.hina_sl
-#hina
 struct VertexIn { vec3 a_pos; vec3 a_normal; };
 struct Varyings { vec3 normal; };
 struct FragOut  { vec4 color; };
-#hina_end
 
 #hina_stage vertex entry VSMain
 #include "common/scene_ubo.glsl"
@@ -207,7 +202,7 @@ Note that the same file is included in both stages. Each stage is compiled indep
 
 ---
 
-## 4. Header Block Reference (`#hina ... #hina_end` or implicit)
+## 4. Header Declarations Reference
 
 ### 4.1 Bind Groups (Descriptor Sets)
 
@@ -401,6 +396,27 @@ spec_const(1) bool ENABLE_SHADOWS = true;
 
 Max count: 16
 
+### 4.6.1 User Defines (Compile-Time Macros)
+
+The `hslc_hsl_module_desc` accepts an array of compile-time `#define` macros via the `defines` and `define_count` fields:
+
+```c
+hslc_compile_define defs[] = {
+    { "ENABLE_FOG",  "1" },
+    { "MAX_LIGHTS", "32" },
+};
+hslc_hsl_module_desc desc = {
+    .source       = hsl_source,
+    .source_name  = "my_shader.hina_sl",
+    .defines      = defs,
+    .define_count = 2,
+};
+```
+
+- Defines are injected as `#define NAME VALUE` after the `#version` preamble and before generated GLSL.
+- If `value` is `NULL`, the define is emitted as `#define NAME` (no value).
+- Defines apply to all stages in the module.
+
 ### 4.7 Snippets (Shared Code)
 
 ```glsl
@@ -419,7 +435,7 @@ Notes:
 
 #### When to use snippets
 
-Snippets are for **GLSL helper functions selectively injected into stages via `use`**. Snippets live in the `#hina` header block and each stage only pays for the code it actually uses. Snippet definitions can be shared across files via `#include` in the `#hina` block (see §3.2).
+Snippets are for **GLSL helper functions selectively injected into stages via `use`**. Snippets are declared in the header region and each stage only pays for the code it actually uses. Snippet definitions can be shared across files via `#include` (see §3.2).
 
 Common patterns:
 - Math utilities (remap, saturate, pack/unpack) used by both VS and FS in the same file
@@ -429,7 +445,6 @@ Common patterns:
 Worked example — layered snippets with dependencies:
 
 ```glsl
-#hina
 group Scene = 0;
 bindings(Scene, start=0) {
   uniform(std140) UBO { vec4 lightDir; vec4 cameraPos; } ubo;
@@ -452,7 +467,6 @@ snippet Lighting {
     return vec3(diff + spec);
   }
 }
-#hina_end
 
 #hina_stage vertex entry VSMain
 Varyings VSMain(VertexIn in) {
@@ -487,14 +501,14 @@ Key points in this example:
 | | Snippets | Includes |
 |---|---|---|
 | **Scope** | Selective per-stage injection | Cross-file text sharing |
-| **Where declared** | Inside the `#hina` header block | External `.glsl` files |
-| **Where expanded** | Into stages that list them via `use` | Into `#hina` blocks or stage bodies via `#include` |
+| **Where declared** | In the header region | External `.glsl` files |
+| **Where expanded** | Into stages that list them via `use` | Into header or stage bodies via `#include` |
 | **Selective injection** | Yes — only stages with `use` get the code | No — every `#include` always expands |
 | **Can reference HSL resources** | Yes — snippets see `ubo`, `pc`, etc. | In header: must use HSL syntax. In stage bodies: raw GLSL |
 | **Include guards needed** | No | Yes (`#pragma once` or `#ifndef`) if included multiple times |
 | **Use case** | Helper functions for specific stages | Shared UBO layouts, engine-wide utilities, cross-file snippet libraries |
 
-Snippets and includes **compose**: you can `#include` a file containing snippet definitions inside the `#hina` block, then `use` those snippets in individual stages. This enables cross-file snippet libraries:
+Snippets and includes **compose**: you can `#include` a file containing snippet definitions in the header, then `use` those snippets in individual stages. This enables cross-file snippet libraries:
 
 ```glsl
 // lighting_lib.glsl
@@ -508,12 +522,10 @@ snippet Lighting {
 
 ```glsl
 // my_shader.hina_sl
-#hina
 #include "lighting_lib.glsl"
 struct VertexIn { vec3 a_position; vec3 a_normal; };
 struct Varyings { vec3 normal; };
 struct FragOut { vec4 color; };
-#hina_end
 
 #hina_stage fragment entry FSMain use Lighting
 FragOut FSMain(Varyings in) {
@@ -624,13 +636,11 @@ FragOut FSMain() {
 HSL supports vertex-only modules for depth pre-pass and similar use cases where no fragment shader is needed:
 
 ```glsl
-#hina
 group Scene = 0;
 bindings(Scene, start=0) {
   uniform(std140) UBO { mat4 mvp; } ubo;
 }
 struct VertexIn { vec3 a_position; };
-#hina_end
 
 #hina_stage vertex entry VSMain
 void VSMain(VertexIn in) {
@@ -750,7 +760,7 @@ void GSMain() {
 #hina_end
 ```
 
-**Important:** When using tessellation or geometry stages, you **must** define your own input/output interface variables using raw GLSL `layout(location = N) in/out` declarations. Do not declare `VertexIn`, `Varyings`, or `FragOut` structs in the `#hina` header — the codegen emits non-arrayed output variables, but GLSL requires TCS per-vertex outputs to be unsized arrays (e.g., `out vec3 pos[]`). Using struct-based IO with tessellation stages will cause a GLSL compile error.
+**Important:** When using tessellation or geometry stages, you **must** define your own input/output interface variables using raw GLSL `layout(location = N) in/out` declarations. Do not declare `VertexIn`, `Varyings`, or `FragOut` structs in the header — the codegen emits non-arrayed output variables, but GLSL requires TCS per-vertex outputs to be unsized arrays (e.g., `out vec3 pos[]`). Using struct-based IO with tessellation stages will cause a GLSL compile error.
 
 ### 5.3 Fragment Qualifiers
 
@@ -796,7 +806,7 @@ Varyings VSMain(VertexIn in) {
 ## 6. Validation Rules and Limits
 
 Stage composition rules:
-- Graphics modules require both vertex and fragment stages.
+- Graphics modules require at least a vertex stage. Fragment is optional (vertex-only modules compile with a warning).
 - Cannot mix compute with graphics stages.
 - Stage blocks cannot be nested.
 
@@ -804,12 +814,14 @@ Resource limits (Vulkan 1.0 minimum):
 - Max groups (sets): 4
 - Max bindings per group: 32
 - Max total bindings: 128
+- Max push constant size: 128 bytes
+- Max location slots: 16
+
+Per-stage resource limits (Vulkan 1.0 minimums — **not enforced by the HSL compiler**, violations fail at Vulkan runtime):
 - Max UBOs per stage: 12
 - Max SSBOs per stage: 4
 - Max sampled images per stage: 16
 - Max storage images per stage: 4
-- Max push constant size: 128 bytes
-- Max location slots: 16
 
 Compiler limits (HSL parser):
 - Max structs per file: 8 (includes IO and custom structs)
@@ -860,12 +872,32 @@ The `_<col>` suffix appears for matrix types (one variable per column).
 
 ## 8. Troubleshooting and Gotchas
 
+### Error output format
+
+When a GLSL compilation error occurs in a stage body, the compiler maps the error back to the original HSL source using `#line` directives and displays a focused context window:
+
+```
+error in my_shader.hina_sl:
+      Varyings out;
+      out.color = in.a_color;
+  >>> gl_Position = vp.projection * vp.view * model.model *a vec4(in.a_position, 1.0);
+      'a' : undeclared identifier
+      return out;
+  }
+```
+
+The raw glslang `ERROR: source:line: message` output is consumed and replaced with this clean display. The `>>>` marker indicates the offending line, followed by the error message. Up to 5 lines of surrounding HSL source are shown for context.
+
+For errors in generated code (the `main()` wrapper), the fallback output shows the raw mapped error with source filenames.
+
+### Common issues
+
 - Directives must start at the beginning of a line (after whitespace).
-- `#hina`/`#hina_end` is optional. If omitted, everything before the first `#hina_stage` is treated as the header (implicit header mode). Explicit `#hina` blocks remain fully supported.
-- `#include` works in header blocks (explicit or implicit) and stage bodies. Included files used in the header must contain valid HSL declarations (structs, groups, bindings, snippets) — not raw GLSL `layout(...)` qualifiers.
+- `#hina`/`#hina_end` is optional. Everything before the first `#hina_stage` is the header. Explicit `#hina` blocks are supported but not required.
+- `#include` works in the header region and in stage bodies. Included files used in the header must contain valid HSL declarations (structs, groups, bindings, snippets) — not raw GLSL `layout(...)` qualifiers.
 - `#include` expansion does not track comments or strings; avoid commenting out includes by prefixing with `//` on the same line.
 - Use `#pragma once` or `#ifndef` include guards to prevent double-inclusion errors.
-- Stage bodies and resource block bodies are copied as raw GLSL; GLSL errors come from those bodies, not the HSL parser.
+- Stage bodies and resource block bodies are copied as raw GLSL; the HSL parser does not analyze them. GLSL errors in those bodies are mapped back to HSL source lines via `#line` directives.
 - IO struct type names are not validated beyond slot counting; invalid types will fail during GLSL compilation.
 - `use` must appear after any stage qualifiers. `use *` includes all snippets; it cannot be combined with named snippets.
 - Shared declarations require a compute stage.
@@ -877,7 +909,9 @@ The `_<col>` suffix appears for matrix types (one variable per column).
 ## 9. Quick Reference
 
 ```glsl
-#hina
+// Header region (everything before the first #hina_stage)
+// Explicit #hina ... #hina_end is also supported but not required.
+
 // Groups
 group <Name> = <set>;
 
@@ -910,7 +944,6 @@ spec_const(<id>) <type> NAME = default;
 
 // Snippets
 snippet <Name> { ... }
-#hina_end
 
 // Stages
 #hina_stage <kind> entry <Name> [early_fragment_tests] [depth_*] [use <Snippets>]
