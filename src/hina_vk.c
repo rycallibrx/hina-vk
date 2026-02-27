@@ -1311,7 +1311,8 @@ typedef struct HINA_ALIGN(64) hina_pipeline_slot
   uint8_t slot_bindings_allowed; // 1
   uint8_t required_set_mask; // 1 - bitmask of descriptor sets that must be bound (bits 0-3)
   uint8_t bind_point; // 1 - VkPipelineBindPoint (cached to avoid function call)
-  uint8_t pad_[11]; // 11 (maintain 64B alignment)
+  uint8_t depth_bias_enable; // 1 - depth bias enable from pipeline desc
+  uint8_t pad_[10]; // 10 (maintain 64B alignment)
   // Kind-specific data (8B)
   union
   {
@@ -2405,7 +2406,8 @@ typedef struct hina_pipeline_entry
   uint8_t slot_bindings_allowed; // 1
   uint8_t required_set_mask; // 1 - bitmask of descriptor sets that must be bound (bits 0-3)
   uint8_t bind_point; // 1 - VkPipelineBindPoint (cached to avoid function call)
-  uint8_t pad_[11]; // 11 (maintain 64B alignment)
+  uint8_t depth_bias_enable; // 1 - depth bias enable from pipeline desc
+  uint8_t pad_[10]; // 10 (maintain 64B alignment)
   union
   {
     struct
@@ -3051,13 +3053,14 @@ struct hina_cmd
   uint8_t family_idx; // 1B: Queue family index
   bool needs_present; // 1B: Auto PRESENT_SRC transition needed
   uint8_t cross_queue_wait_count; // 1B: Number of pending cross-queue waits
-  // Tile pass state (4B)
+  // Tile pass state (5B)
   struct
   {
     bool active;
     uint8_t current_subpass;
     uint8_t subpass_count;
     bool uses_dynamic; // True = dynamic local read, false = legacy subpass
+    bool has_label; // True = debug label pushed in hina_begin_tile_pass
   } tile;
 
   // Bound groups (16B) - accessed during flush_bindings
@@ -6801,6 +6804,109 @@ static uint32_t hina_build_tile_subpass_dependencies(VkSubpassDependency* deps, 
   return dep_count;
 }
 
+// ── Shared tile render pass builder ──────────────────────────────────────────
+// Both hina_legacy_make_tile_render_pass and hina_legacy_make_tile_template_render_pass
+// collect attachments from different sources, then need identical subpass description
+// building, dependency construction, and vkCreateRenderPass. This helper does the shared
+// part, eliminating the documented "must match exactly" hazard.
+
+typedef struct hina_tile_subpass_meta {
+  uint32_t color_indices[HINA_MAX_COLOR_ATTACHMENTS];
+  uint32_t resolve_indices[HINA_MAX_COLOR_ATTACHMENTS];
+  uint32_t color_count;
+  bool     has_resolve;
+  uint32_t input_count;
+  const hina_tile_input* tile_inputs;
+  bool     has_depth;
+  bool     depth_read_only;
+  bool     depth_input;
+} hina_tile_subpass_meta;
+
+static VkRenderPass hina_build_tile_render_pass(hina_context* ctx,
+                                                const VkAttachmentDescription* attachments, uint32_t att_count,
+                                                uint32_t subpass_count, const hina_tile_subpass_meta* metas,
+                                                int32_t depth_att_idx)
+{
+  VkSubpassDescription subpasses[HINA_MAX_TILE_SUBPASSES];
+  VkAttachmentReference color_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
+  VkAttachmentReference resolve_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
+  VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS + 1]; // +1 for depth input
+  VkAttachmentReference depth_refs[HINA_MAX_TILE_SUBPASSES];
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
+  {
+    const hina_tile_subpass_meta* m = &metas[sp];
+    // Color attachment references
+    for (uint32_t c = 0; c < m->color_count; c++)
+    {
+      color_refs[sp][c] = (VkAttachmentReference){
+        .attachment = m->color_indices[c], .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+      };
+      resolve_refs[sp][c] = (VkAttachmentReference){
+        .attachment = m->resolve_indices[c], .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+      };
+    }
+    // Input attachment references (previous subpass outputs)
+    uint32_t input_count = 0;
+    for (uint32_t ti = 0; ti < m->input_count; ti++)
+    {
+      const hina_tile_input* input = &m->tile_inputs[ti];
+#ifdef HINA_DEBUG
+      HINA_ASSERTF(input->subpass_output_index < sp, "tile_input[%u][%u] references future subpass", sp, ti);
+#endif
+      uint32_t src_sp = input->subpass_output_index;
+      uint32_t src_att = input->attachment_index;
+#ifdef HINA_DEBUG
+      HINA_ASSERTF(src_att < metas[src_sp].color_count, "tile_input[%u][%u] attachment out of range", sp, ti);
+#endif
+      input_refs[sp][input_count++] = (VkAttachmentReference){
+        .attachment = metas[src_sp].color_indices[src_att], .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+      };
+    }
+    // Depth input attachment reference
+    if (m->depth_input && depth_att_idx >= 0)
+    {
+      input_refs[sp][input_count++] = (VkAttachmentReference){
+        .attachment = (uint32_t)depth_att_idx, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+      };
+    }
+    // Depth attachment reference
+    if (m->has_depth && depth_att_idx >= 0)
+    {
+      depth_refs[sp] = (VkAttachmentReference){
+        .attachment = (uint32_t)depth_att_idx,
+        .layout = m->depth_read_only
+                    ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                    : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+      };
+    }
+    subpasses[sp] = (VkSubpassDescription){
+      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = input_count,
+      .pInputAttachments = input_count > 0 ? input_refs[sp] : NULL, .colorAttachmentCount = m->color_count,
+      .pColorAttachments = m->color_count > 0 ? color_refs[sp] : NULL,
+      .pResolveAttachments = m->has_resolve ? resolve_refs[sp] : NULL,
+      .pDepthStencilAttachment = (m->has_depth && depth_att_idx >= 0) ? &depth_refs[sp] : NULL,
+      .preserveAttachmentCount = 0, .pPreserveAttachments = NULL
+    };
+  }
+  // Build subpass dependencies
+  VkSubpassDependency dependencies[HINA_MAX_TILE_SUBPASSES + 2];
+  uint8_t dep_flags[HINA_MAX_TILE_SUBPASSES];
+  for (uint32_t sp = 0; sp < subpass_count; sp++)
+    dep_flags[sp] = (metas[sp].has_depth ? HINA_TILEDEP_HAS_DEPTH : 0)
+                   | (metas[sp].depth_input ? HINA_TILEDEP_DEPTH_INPUT : 0)
+                   | (metas[sp].depth_read_only ? HINA_TILEDEP_DEPTH_RDONLY : 0);
+  uint32_t dep_count = hina_build_tile_subpass_dependencies(dependencies, subpass_count, dep_flags);
+  const VkRenderPassCreateInfo rp_info = {
+    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = att_count, .pAttachments = attachments,
+    .subpassCount = subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
+    .pDependencies = dependencies
+  };
+  VkRenderPass render_pass = VK_NULL_HANDLE;
+  HINA_VK_CHECK_RET(ctx, vkCreateRenderPass(ctx->core.device->core.device, &rp_info, NULL, &render_pass),
+                    VK_NULL_HANDLE);
+  return render_pass;
+}
+
 // Create a multi-subpass render pass for tile-based deferred rendering
 // Attachments from subpass 0 can be used as input attachments in later subpasses
 static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const hina_tile_pass_desc* desc)
@@ -6905,84 +7011,20 @@ static VkRenderPass hina_legacy_make_tile_render_pass(hina_context* ctx, const h
     HINA_LOGE(ctx, "hina_legacy_make_tile_render_pass: no attachments found");
     return VK_NULL_HANDLE;
   }
-  // Build subpass descriptions
-  VkSubpassDescription subpasses[HINA_MAX_TILE_SUBPASSES];
-  VkAttachmentReference color_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
-  VkAttachmentReference resolve_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
-  VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS + 1]; // +1 for depth input
-  VkAttachmentReference depth_refs[HINA_MAX_TILE_SUBPASSES];
+  // Fill per-subpass metadata for shared builder
+  hina_tile_subpass_meta metas[HINA_MAX_TILE_SUBPASSES];
   for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
-    const hina_tile_subpass* sp_desc = &desc->subpasses[sp];
-    // Color attachment references
-    for (uint32_t c = 0; c < sp_desc->color_count; c++)
-    {
-      color_refs[sp][c] = (VkAttachmentReference){
-        .attachment = subpass_color_indices[sp][c], .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-      };
-      resolve_refs[sp][c] = (VkAttachmentReference){
-        .attachment = subpass_resolve_indices[sp][c], .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-      };
-    }
-    // Input attachment references (for subpass 1+)
-    uint32_t input_count = 0;
-    for (uint32_t ti = 0; ti < sp_desc->tile_input_count; ti++)
-    {
-      const hina_tile_input* input = &sp_desc->tile_inputs[ti];
-#ifdef HINA_DEBUG
-      HINA_ASSERTF(input->subpass_output_index < sp, "tile_input[%u][%u] references future subpass", sp, ti);
-#endif
-      uint32_t src_sp = input->subpass_output_index;
-      uint32_t src_att = input->attachment_index;
-#ifdef HINA_DEBUG
-      HINA_ASSERTF(src_att < subpass_color_counts[src_sp], "tile_input[%u][%u] attachment out of range", sp, ti);
-#endif
-      input_refs[sp][input_count++] = (VkAttachmentReference){
-        .attachment = subpass_color_indices[src_sp][src_att], .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-      };
-    }
-    // Depth input attachment reference
-    if (sp_desc->depth_input && depth_att_idx >= 0)
-    {
-      input_refs[sp][input_count++] = (VkAttachmentReference){
-        .attachment = (uint32_t)depth_att_idx, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-      };
-    }
-    // Depth attachment reference
-    if (sp_desc->has_depth && depth_att_idx >= 0)
-    {
-      depth_refs[sp] = (VkAttachmentReference){
-        .attachment = (uint32_t)depth_att_idx,
-        .layout = sp_desc->depth_read_only
-                    ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                    : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-      };
-    }
-    subpasses[sp] = (VkSubpassDescription){
-      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = input_count,
-      .pInputAttachments = input_count > 0 ? input_refs[sp] : NULL, .colorAttachmentCount = sp_desc->color_count,
-      .pColorAttachments = sp_desc->color_count > 0 ? color_refs[sp] : NULL,
-      .pResolveAttachments = subpass_has_resolve[sp] ? resolve_refs[sp] : NULL,
-      .pDepthStencilAttachment = (sp_desc->has_depth && depth_att_idx >= 0) ? &depth_refs[sp] : NULL,
-      .preserveAttachmentCount = 0, .pPreserveAttachments = NULL
+    const hina_tile_subpass* s = &desc->subpasses[sp];
+    metas[sp] = (hina_tile_subpass_meta){
+      .color_count = s->color_count, .has_resolve = subpass_has_resolve[sp],
+      .input_count = s->tile_input_count, .tile_inputs = s->tile_inputs,
+      .has_depth = s->has_depth, .depth_read_only = s->depth_read_only, .depth_input = s->depth_input,
     };
+    memcpy(metas[sp].color_indices, subpass_color_indices[sp], sizeof(metas[sp].color_indices));
+    memcpy(metas[sp].resolve_indices, subpass_resolve_indices[sp], sizeof(metas[sp].resolve_indices));
   }
-  // Build subpass dependencies
-  VkSubpassDependency dependencies[HINA_MAX_TILE_SUBPASSES + 2];
-  uint8_t dep_flags[HINA_MAX_TILE_SUBPASSES];
-  for (uint32_t sp = 0; sp < subpass_count; sp++)
-    dep_flags[sp] = (desc->subpasses[sp].has_depth ? HINA_TILEDEP_HAS_DEPTH : 0)
-                   | (desc->subpasses[sp].depth_input ? HINA_TILEDEP_DEPTH_INPUT : 0)
-                   | (desc->subpasses[sp].depth_read_only ? HINA_TILEDEP_DEPTH_RDONLY : 0);
-  uint32_t dep_count = hina_build_tile_subpass_dependencies(dependencies, subpass_count, dep_flags);
-  const VkRenderPassCreateInfo rp_info = {
-    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = att_count, .pAttachments = attachments,
-    .subpassCount = subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
-    .pDependencies = dependencies
-  };
-  VkRenderPass render_pass = VK_NULL_HANDLE;
-  HINA_VK_CHECK_RET(ctx, vkCreateRenderPass(ctx->core.device->core.device, &rp_info, NULL, &render_pass),
-                    VK_NULL_HANDLE);
+  VkRenderPass render_pass = hina_build_tile_render_pass(ctx, attachments, att_count, subpass_count, metas, depth_att_idx);
   if (render_pass != VK_NULL_HANDLE)
   {
     hina_set_object_namef(ctx, (uint64_t)render_pass, VK_OBJECT_TYPE_RENDER_PASS,
@@ -7090,96 +7132,24 @@ static VkRenderPass hina_legacy_make_tile_template_render_pass(hina_context* ctx
     HINA_LOGE(ctx, "hina_legacy_make_tile_template_render_pass: no attachments found");
     return VK_NULL_HANDLE;
   }
-  // Build subpass descriptions
-  VkSubpassDescription subpasses[HINA_MAX_TILE_SUBPASSES];
-  VkAttachmentReference color_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
-  VkAttachmentReference resolve_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_COLOR_ATTACHMENTS];
-  VkAttachmentReference input_refs[HINA_MAX_TILE_SUBPASSES][HINA_MAX_TILE_INPUTS + 1]; // +1 for depth input
-  VkAttachmentReference depth_refs[HINA_MAX_TILE_SUBPASSES];
-  uint32_t input_counts[HINA_MAX_TILE_SUBPASSES] = {0};
+  // Fill per-subpass metadata for shared builder
+  hina_tile_subpass_meta metas[HINA_MAX_TILE_SUBPASSES];
   for (uint32_t sp = 0; sp < subpass_count; sp++)
   {
     const hina_tile_subpass_layout* sub = &layout->subpasses[sp];
-    // Determine counts for this subpass - use override if provided for this subpass
     const bool use_override = override && sp == override->subpass_index;
     const uint32_t sp_color_count = use_override ? override->color_count : sub->color_count;
     const VkFormat sp_depth_fmt = use_override ? override->depth_format : hina_format_to_vk(sub->depth_format);
-    // Color attachment references
-    for (uint32_t c = 0; c < sp_color_count; c++)
-    {
-      color_refs[sp][c] = (VkAttachmentReference){
-        .attachment = subpass_color_indices[sp][c], .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-      };
-      resolve_refs[sp][c] = (VkAttachmentReference){
-        .attachment = subpass_resolve_indices[sp][c], .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-      };
-    }
-    // Input attachment references - reference previous subpass outputs
-    uint32_t input_count = 0;
-    for (uint32_t ti = 0; ti < sub->input_count; ti++)
-    {
-      const hina_tile_input* input = &sub->tile_inputs[ti];
-#ifdef HINA_DEBUG
-      HINA_ASSERTF(input->subpass_output_index < sp, "tile_layout_input[%u][%u] references future subpass", sp, ti);
-#endif
-      uint32_t src_sp = input->subpass_output_index;
-      uint32_t src_att = input->attachment_index;
-      (void)src_sp; // Used only in debug validation below
-#ifdef HINA_DEBUG
-      // Check against override color_count if source subpass is the override subpass
-      const uint32_t src_color_count = (override && src_sp == override->subpass_index)
-                                         ? override->color_count
-                                         : layout->subpasses[src_sp].color_count;
-      HINA_ASSERTF(src_att < src_color_count, "tile_layout_input[%u][%u] attachment out of range", sp, ti);
-#endif
-      input_refs[sp][input_count++] = (VkAttachmentReference){
-        .attachment = subpass_color_indices[src_sp][src_att], .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-      };
-    }
-    // Depth input attachment reference
-    if (sub->depth_input && depth_att_idx >= 0)
-    {
-      input_refs[sp][input_count++] = (VkAttachmentReference){
-        .attachment = (uint32_t)depth_att_idx, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-      };
-    }
-    input_counts[sp] = input_count;
-    // Depth attachment reference - must match hina_legacy_make_tile_render_pass for compatibility
-    if (sp_depth_fmt != VK_FORMAT_UNDEFINED && depth_att_idx >= 0)
-    {
-      depth_refs[sp] = (VkAttachmentReference){
-        .attachment = (uint32_t)depth_att_idx,
-        .layout = sub->depth_read_only
-                    ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                    : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-      };
-    }
-    subpasses[sp] = (VkSubpassDescription){
-      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = input_count,
-      .pInputAttachments = input_count > 0 ? input_refs[sp] : NULL, .colorAttachmentCount = sp_color_count,
-      .pColorAttachments = sp_color_count > 0 ? color_refs[sp] : NULL,
-      .pResolveAttachments = subpass_has_resolve[sp] ? resolve_refs[sp] : NULL,
-      .pDepthStencilAttachment = (sp_depth_fmt != VK_FORMAT_UNDEFINED && depth_att_idx >= 0) ? &depth_refs[sp] : NULL,
-      .preserveAttachmentCount = 0, .pPreserveAttachments = NULL
+    metas[sp] = (hina_tile_subpass_meta){
+      .color_count = sp_color_count, .has_resolve = subpass_has_resolve[sp],
+      .input_count = sub->input_count, .tile_inputs = sub->tile_inputs,
+      .has_depth = sp_depth_fmt != VK_FORMAT_UNDEFINED,
+      .depth_read_only = sub->depth_read_only, .depth_input = sub->depth_input,
     };
+    memcpy(metas[sp].color_indices, subpass_color_indices[sp], sizeof(metas[sp].color_indices));
+    memcpy(metas[sp].resolve_indices, subpass_resolve_indices[sp], sizeof(metas[sp].resolve_indices));
   }
-  // Build subpass dependencies
-  // Must match hina_legacy_make_tile_render_pass() exactly for render pass compatibility
-  VkSubpassDependency dependencies[HINA_MAX_TILE_SUBPASSES + 2];
-  uint8_t dep_flags[HINA_MAX_TILE_SUBPASSES];
-  for (uint32_t sp = 0; sp < subpass_count; sp++)
-    dep_flags[sp] = (layout->subpasses[sp].depth_format != HINA_FORMAT_UNDEFINED ? HINA_TILEDEP_HAS_DEPTH : 0)
-                   | (layout->subpasses[sp].depth_input ? HINA_TILEDEP_DEPTH_INPUT : 0)
-                   | (layout->subpasses[sp].depth_read_only ? HINA_TILEDEP_DEPTH_RDONLY : 0);
-  uint32_t dep_count = hina_build_tile_subpass_dependencies(dependencies, subpass_count, dep_flags);
-  const VkRenderPassCreateInfo rp_info = {
-    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = att_count, .pAttachments = attachments,
-    .subpassCount = subpass_count, .pSubpasses = subpasses, .dependencyCount = dep_count,
-    .pDependencies = dependencies
-  };
-  VkRenderPass render_pass = VK_NULL_HANDLE;
-  HINA_VK_CHECK_RET(ctx, vkCreateRenderPass(ctx->core.device->core.device, &rp_info, NULL, &render_pass),
-                    VK_NULL_HANDLE);
+  VkRenderPass render_pass = hina_build_tile_render_pass(ctx, attachments, att_count, subpass_count, metas, depth_att_idx);
   if (render_pass != VK_NULL_HANDLE)
   {
     hina_set_object_namef(ctx, (uint64_t)render_pass, VK_OBJECT_TYPE_RENDER_PASS,
@@ -9259,7 +9229,6 @@ bool hina_init(const hina_desc* desc)
   HINA_VK_CHECK_MSG_RET(ctx, vmaCreateAllocator(&vma_info, &dev->allocator.vma), false,
                         "creating VMA allocator (api=%u)", dev->core.caps.version.api_version);
   if (!hina_init_pipeline_cache(ctx, desc)) return false;
-  (void)desc->staging_buffer_size; // Reserved for future staging buffer configuration
   if (!hina_init_descriptor_pool(ctx)) return false;
   // Initialize synchronization primitives
   // Timeline semaphores (preferred) vs frame fences (legacy fallback)
@@ -9325,7 +9294,7 @@ bool hina_init(const hina_desc* desc)
   // Initialize the global staging page pool
   memset(&dev->page_pool, 0, sizeof(dev->page_pool));
   mtx_init(&dev->page_pool.lock, mtx_plain);
-  dev->page_pool.page_size = HINA_STAGING_PAGE_SIZE;
+  dev->page_pool.page_size = desc->staging_buffer_size ? (uint32_t)desc->staging_buffer_size : HINA_STAGING_PAGE_SIZE;
   if (!hina_init_context_resources(ctx)) return false;
   // Initialize Tracy GPU profiling context (when enabled)
 #ifdef TRACY_ENABLE
@@ -12925,6 +12894,46 @@ static void* hina_staging_ensure_download_buffer(hina_context* ctx, size_t requi
   return sc->download_staging_mapped;
 }
 
+// Shared helper: staging buffer acquire → barrier → copy → barrier → flush → memcpy.
+// Callers validate dimensions and compute subresource/offset/extent.
+static void hina_download_texture_region(hina_context* ctx, const hina_texture_hot* hot,
+                                         VkImageSubresourceLayers subresource, VkOffset3D offset, VkExtent3D extent,
+                                         size_t required_size, void* dst)
+{
+  VkImage vk_image = hot->vk.image;
+  VkImageLayout current_layout = hot->state.layout;
+  VkAccessFlags current_access = hot->state.access;
+  VkPipelineStageFlags current_stages = hot->state.stages;
+  void* staging_mapped = hina_staging_ensure_download_buffer(ctx, required_size);
+  HINA_ASSERTF(staging_mapped, "hina_download_texture_region: failed to allocate staging buffer");
+  VkBuffer staging_buf = ctx->staging.download_staging_buf;
+  VkCommandBuffer cmd = hina_staging_ctx_acquire_owner_cmd(ctx, (uint32_t)hot->owning_family);
+  HINA_ASSERTF(cmd, "hina_download_texture_region: failed to acquire staging command buffer");
+  VkImageSubresourceRange range = {
+    subresource.aspectMask, subresource.mipLevel, 1, subresource.baseArrayLayer, subresource.layerCount
+  };
+  HINA_IMAGE_BARRIER(cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
+                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
+  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  hina_copy_image_to_buffer(cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
+                            subresource, offset, extent);
+  HINA_IMAGE_BARRIER(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                     VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
+                     vk_image, range);
+  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  hina_ticket ticket = hina_staging_ctx_flush(ctx);
+  HINA_ASSERTF(ticket, "hina_download_texture_region: staging flush failed");
+  hina_ctx_wait_ticket(ctx, ticket);
+  if (!ctx->staging.download_staging_coherent)
+  {
+    vmaInvalidateAllocation(ctx->core.device->allocator.vma, (VmaAllocation)ctx->staging.download_staging_mem, 0,
+                            required_size);
+  }
+  memcpy(dst, staging_mapped, required_size);
+}
+
 void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t layer, void* dst,
                                size_t dst_size)
 {
@@ -12937,7 +12946,6 @@ void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip
                "hina_ctx_download_texture: use hina_ctx_download_texture_3d for 3D textures");
   HINA_ASSERTF(mip < hot->mip_levels, "hina_ctx_download_texture: mip %u out of bounds (max %u)", mip, hot->mip_levels);
   HINA_ASSERTF(layer < hot->layers, "hina_ctx_download_texture: layer %u out of bounds (max %u)", layer, hot->layers);
-  // Calculate required size
   hina_format hfmt = hina_vk_format_to_hina(hot->dims.format);
   uint32_t pixel_size = hina_format_size(hfmt);
   HINA_ASSERTF(pixel_size > 0, "hina_ctx_download_texture: unsupported format for download");
@@ -12946,46 +12954,10 @@ void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip
   size_t required_size = (size_t)mip_width * mip_height * pixel_size;
   HINA_ASSERTF(dst_size >= required_size, "hina_ctx_download_texture: dst_size (%zu) < required (%zu)", dst_size,
                required_size);
-  // Store texture info we need
-  VkImage vk_image = hot->vk.image;
-  VkFormat vk_format = hot->dims.format;
-  VkImageLayout current_layout = hot->state.layout;
-  VkAccessFlags current_access = hot->state.access;
-  VkPipelineStageFlags current_stages = hot->state.stages;
-  // Ensure persistent staging buffer is ready
-  void* staging_mapped = hina_staging_ensure_download_buffer(ctx, required_size);
-  HINA_ASSERTF(staging_mapped, "hina_ctx_download_texture: failed to allocate staging buffer");
-  VkBuffer staging_buf = ctx->staging.download_staging_buf;
-  uint32_t owner_family = (uint32_t)hot->owning_family;
-  VkCommandBuffer cmd = hina_staging_ctx_acquire_owner_cmd(ctx, owner_family);
-  HINA_ASSERTF(cmd, "hina_ctx_download_texture: failed to acquire staging command buffer");
-  const VkImageAspectFlags aspect = hina_aspect_from_format(vk_format);
-  VkImageSubresourceRange range = {aspect, mip, 1, layer, 1};
-  HINA_IMAGE_BARRIER(cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
-  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  // Copy image to buffer
-  hina_copy_image_to_buffer(cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
-                            (VkImageSubresourceLayers){aspect, mip, layer, 1}, (VkOffset3D){0, 0, 0},
-                            (VkExtent3D){mip_width, mip_height, 1});
-  HINA_IMAGE_BARRIER(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                     current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                     VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
-                     vk_image, range);
-  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  // Flush staging and wait synchronously
-  hina_ticket ticket = hina_staging_ctx_flush(ctx);
-  HINA_ASSERTF(ticket, "hina_ctx_download_texture: staging flush failed");
-  hina_ctx_wait_ticket(ctx, ticket);
-  // Invalidate staging buffer before CPU read (skip if coherent)
-  if (!ctx->staging.download_staging_coherent)
-  {
-    vmaInvalidateAllocation(ctx->core.device->allocator.vma, (VmaAllocation)ctx->staging.download_staging_mem, 0,
-                            required_size);
-  }
-  // Copy from staging buffer to user destination
-  memcpy(dst, staging_mapped, required_size);
+  VkImageAspectFlags aspect = hina_aspect_from_format(hot->dims.format);
+  hina_download_texture_region(ctx, hot, (VkImageSubresourceLayers){aspect, mip, layer, 1},
+                               (VkOffset3D){0, 0, 0}, (VkExtent3D){mip_width, mip_height, 1},
+                               required_size, dst);
 }
 
 void hina_download_texture(hina_texture src, uint32_t mip, uint32_t layer, void* dst, size_t dst_size)
@@ -13016,44 +12988,10 @@ void hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t 
   size_t required_size = (size_t)mip_width * mip_height * depth * pixel_size;
   HINA_ASSERTF(dst_size >= required_size, "hina_ctx_download_texture_3d: dst_size (%zu) < required (%zu)", dst_size,
                required_size);
-  VkImage vk_image = hot->vk.image;
-  VkFormat vk_format = hot->dims.format;
-  VkImageLayout current_layout = hot->state.layout;
-  VkAccessFlags current_access = hot->state.access;
-  VkPipelineStageFlags current_stages = hot->state.stages;
-  // Ensure persistent staging buffer is ready
-  void* staging_mapped = hina_staging_ensure_download_buffer(ctx, required_size);
-  HINA_ASSERTF(staging_mapped, "hina_ctx_download_texture_3d: failed to allocate staging buffer");
-  VkBuffer staging_buf = ctx->staging.download_staging_buf;
-  uint32_t owner_family = (uint32_t)hot->owning_family;
-  VkCommandBuffer cmd = hina_staging_ctx_acquire_owner_cmd(ctx, owner_family);
-  HINA_ASSERTF(cmd, "hina_ctx_download_texture_3d: failed to acquire staging command buffer");
-  const VkImageAspectFlags aspect = hina_aspect_from_format(vk_format);
-  VkImageSubresourceRange range = {aspect, mip, 1, 0, 1};
-  HINA_IMAGE_BARRIER(cmd, current_stages ? current_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT, current_access, VK_ACCESS_TRANSFER_READ_BIT, current_layout,
-                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk_image, range);
-  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  // Copy image to buffer
-  hina_copy_image_to_buffer(cmd, vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging_buf, 0,
-                            (VkImageSubresourceLayers){aspect, mip, 0, 1}, (VkOffset3D){0, 0, (int32_t)z_offset},
-                            (VkExtent3D){mip_width, mip_height, depth});
-  HINA_IMAGE_BARRIER(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                     current_stages ? current_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                     VK_ACCESS_TRANSFER_READ_BIT, current_access, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, current_layout,
-                     vk_image, range);
-  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
-  hina_ticket ticket = hina_staging_ctx_flush(ctx);
-  HINA_ASSERTF(ticket, "hina_ctx_download_texture_3d: staging flush failed");
-  hina_ctx_wait_ticket(ctx, ticket);
-  // Invalidate staging buffer before CPU read (skip if coherent)
-  if (!ctx->staging.download_staging_coherent)
-  {
-    vmaInvalidateAllocation(ctx->core.device->allocator.vma, (VmaAllocation)ctx->staging.download_staging_mem, 0,
-                            required_size);
-  }
-  // Copy from staging buffer to user destination
-  memcpy(dst, staging_mapped, required_size);
+  VkImageAspectFlags aspect = hina_aspect_from_format(hot->dims.format);
+  hina_download_texture_region(ctx, hot, (VkImageSubresourceLayers){aspect, mip, 0, 1},
+                               (VkOffset3D){0, 0, (int32_t)z_offset}, (VkExtent3D){mip_width, mip_height, depth},
+                               required_size, dst);
 }
 
 void hina_download_texture_3d(hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth, void* dst,
@@ -14561,18 +14499,486 @@ static void hina_apply_stage_specialization(const hina_stage_specialization* spe
   out_info->pData = data;
 }
 
+// ─── Shared graphics pipeline builder ──────────────────────────────────────
+// Both hina_make_pipeline_internal (raw SPIR-V) and the graphics branch of
+// hina_make_pipeline_from_module_internal share ~400 lines of identical Vulkan
+// pipeline state construction.  This struct + helper de-duplicates that code.
+//
+// Callers do their unique preparation (shader validation, slot alloc, layout
+// building, module creation), then hand off to hina_build_graphics_pipeline.
+// The helper does NOT own cleanup of modules, layout, reflection, or the slot;
+// on failure it returns VK_NULL_HANDLE and the caller is responsible for
+// tearing down everything it allocated.
+
+typedef struct hina_gfx_pipeline_args
+{
+  hina_pipeline_slot* slot;
+  hina_pipeline handle;
+  uint16_t idx;
+  VkPipelineLayout layout;
+  VkShaderModule vs, tcs, tes, gs, fs; // VK_NULL_HANDLE if stage absent
+  const hina_vertex_layout* vertex_layout; // may point to auto-detected layout
+} hina_gfx_pipeline_args;
+
+// Verify that hina_hsl_pipeline_desc is layout-compatible with the tail of
+// hina_pipeline_desc (from 'layout' onward).  The raw SPIR-V path uses
+// memcpy(&state, &desc->layout, sizeof(state)) to convert.
+HINA_STATIC_ASSERT(
+  offsetof(hina_hsl_pipeline_desc, layout) == 0,
+  hsl_desc_layout_must_be_first_field);
+HINA_STATIC_ASSERT(
+  offsetof(hina_pipeline_desc, label) - offsetof(hina_pipeline_desc, layout) ==
+  offsetof(hina_hsl_pipeline_desc, label),
+  pipeline_desc_common_tail_label_offset_mismatch);
+HINA_STATIC_ASSERT(
+  sizeof(hina_pipeline_desc) - offsetof(hina_pipeline_desc, layout) ==
+  sizeof(hina_hsl_pipeline_desc),
+  pipeline_desc_common_tail_size_mismatch);
+
+// Build a VkPipeline from pre-resolved args + common pipeline state.
+// Returns VK_NULL_HANDLE on failure (caller handles cleanup).
+// On success, populates args->slot with pipeline/layout/kind/etc and returns
+// the VkPipeline handle.
+static VkPipeline hina_build_graphics_pipeline(hina_context* ctx,
+                                               const hina_gfx_pipeline_args* args,
+                                               const hina_hsl_pipeline_desc* state)
+{
+  HINA_ASSERT(ctx && args && state);
+  HINA_ASSERT(args->vs != VK_NULL_HANDLE); // VS is always required
+
+  hina_pipeline_slot* e = args->slot;
+  const uint16_t idx = args->idx;
+  const bool has_tcs = args->tcs != VK_NULL_HANDLE;
+  const bool has_tes = args->tes != VK_NULL_HANDLE;
+  const bool has_gs = args->gs != VK_NULL_HANDLE;
+  const bool has_fs = args->fs != VK_NULL_HANDLE;
+
+  const uint32_t tile_subpass_count = state->tile_layout
+    ? hina_count_tile_subpasses_layout(state->tile_layout) : 0;
+
+  // ── Specialization constants ──────────────────────────────────────────
+  const hina_stage_specialization* stage_specs[HINA_SPEC_STAGE_COUNT] = {0};
+  if (state->specializations && state->specialization_count > 0)
+  {
+    for (uint32_t i = 0; i < state->specialization_count; ++i)
+    {
+      uint32_t si = hina_specialization_stage_index(state->specializations[i].stage);
+      if (si < HINA_SPEC_STAGE_COUNT && !stage_specs[si])
+        stage_specs[si] = &state->specializations[i];
+    }
+  }
+
+  VkSpecializationMapEntry vs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
+  VkSpecializationMapEntry tcs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
+  VkSpecializationMapEntry tes_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
+  VkSpecializationMapEntry gs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
+  VkSpecializationMapEntry fs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
+  uint8_t vs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
+  uint8_t tcs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
+  uint8_t tes_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
+  uint8_t gs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
+  uint8_t fs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
+  VkSpecializationInfo vs_spec_info = {0}, tcs_spec_info = {0}, tes_spec_info = {0};
+  VkSpecializationInfo gs_spec_info = {0}, fs_spec_info = {0};
+
+  // ── Shader stages ─────────────────────────────────────────────────────
+  VkPipelineShaderStageCreateInfo stages_ci[5] = {0};
+  uint32_t stage_count = 0;
+
+  stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stages_ci[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  stages_ci[stage_count].module = args->vs;
+  stages_ci[stage_count].pName = "main";
+  if (stage_specs[HINA_SPEC_STAGE_VERTEX])
+  {
+    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_VERTEX], vs_spec_entries, vs_spec_data, &vs_spec_info);
+    if (vs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &vs_spec_info;
+  }
+  stage_count++;
+
+  if (has_tcs)
+  {
+    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+    stages_ci[stage_count].module = args->tcs;
+    stages_ci[stage_count].pName = "main";
+    if (stage_specs[HINA_SPEC_STAGE_TESS_CONTROL])
+    {
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_CONTROL], tcs_spec_entries, tcs_spec_data,
+                                      &tcs_spec_info);
+      if (tcs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tcs_spec_info;
+    }
+    stage_count++;
+  }
+
+  if (has_tes)
+  {
+    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+    stages_ci[stage_count].module = args->tes;
+    stages_ci[stage_count].pName = "main";
+    if (stage_specs[HINA_SPEC_STAGE_TESS_EVAL])
+    {
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_EVAL], tes_spec_entries, tes_spec_data,
+                                      &tes_spec_info);
+      if (tes_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tes_spec_info;
+    }
+    stage_count++;
+  }
+
+  if (has_gs)
+  {
+    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages_ci[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+    stages_ci[stage_count].module = args->gs;
+    stages_ci[stage_count].pName = "main";
+    if (stage_specs[HINA_SPEC_STAGE_GEOMETRY])
+    {
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_GEOMETRY], gs_spec_entries, gs_spec_data,
+                                      &gs_spec_info);
+      if (gs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &gs_spec_info;
+    }
+    stage_count++;
+  }
+
+  if (has_fs)
+  {
+    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages_ci[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages_ci[stage_count].module = args->fs;
+    stages_ci[stage_count].pName = "main";
+    if (stage_specs[HINA_SPEC_STAGE_FRAGMENT])
+    {
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_FRAGMENT], fs_spec_entries, fs_spec_data,
+                                      &fs_spec_info);
+      if (fs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &fs_spec_info;
+    }
+    stage_count++;
+  }
+
+  // ── Vertex input ──────────────────────────────────────────────────────
+  const hina_vertex_layout* vl = args->vertex_layout;
+  VkVertexInputBindingDescription bindings[HINA_MAX_VERTEX_BUFFERS];
+  VkVertexInputAttributeDescription attrs[HINA_MAX_VERTEX_ATTRS];
+  uint32_t binding_count = vl->buffer_count;
+  if (binding_count > HINA_MAX_VERTEX_BUFFERS) binding_count = HINA_MAX_VERTEX_BUFFERS;
+  for (uint32_t i = 0; i < binding_count; ++i)
+  {
+    bindings[i].binding = i;
+    bindings[i].stride = vl->buffer_strides[i];
+    bindings[i].inputRate = (VkVertexInputRate)vl->input_rates[i];
+  }
+  uint32_t attr_count = vl->attr_count;
+  if (attr_count > HINA_MAX_VERTEX_ATTRS) attr_count = HINA_MAX_VERTEX_ATTRS;
+  for (uint32_t i = 0; i < attr_count; ++i)
+  {
+    attrs[i].location = vl->attrs[i].location;
+    attrs[i].binding = vl->attrs[i].buffer_index;
+    attrs[i].format = hina_format_to_vk(vl->attrs[i].format);
+    attrs[i].offset = vl->attrs[i].offset;
+  }
+  const VkPipelineVertexInputStateCreateInfo vi = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = binding_count,
+    .pVertexBindingDescriptions = binding_count ? bindings : NULL, .vertexAttributeDescriptionCount = attr_count,
+    .pVertexAttributeDescriptions = attr_count ? attrs : NULL
+  };
+
+  // ── Input assembly / tessellation / viewport ──────────────────────────
+  const VkPipelineInputAssemblyStateCreateInfo ia = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+    .topology = hina_topology_to_vk(state->primitive_topology)
+  };
+  const VkPipelineTessellationStateCreateInfo tess = has_tcs
+    ? (VkPipelineTessellationStateCreateInfo){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+        .patchControlPoints = state->patch_control_points
+      }
+    : (VkPipelineTessellationStateCreateInfo){0};
+  const VkPipelineViewportStateCreateInfo vp = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1
+  };
+
+  // ── Rasterization ─────────────────────────────────────────────────────
+  // Depth bias enable: dynamic if vkCmdSetDepthBiasEnable available, else baked
+  const VkPipelineRasterizationStateCreateInfo rs = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+    .polygonMode = hina_polygon_mode_to_vk(state->polygon_mode),
+    .cullMode = hina_cull_mode_to_vk(state->cull_mode),
+    .frontFace = hina_front_face_to_vk(state->front_face), .lineWidth = 1.0f,
+    .depthBiasEnable = vkCmdSetDepthBiasEnable ? VK_FALSE : (state->depth_bias.enable ? VK_TRUE : VK_FALSE),
+    .depthBiasConstantFactor = state->depth_bias.constant,
+    .depthBiasSlopeFactor = state->depth_bias.slope,
+    .depthBiasClamp = state->depth_bias.clamp
+  };
+  const VkPipelineMultisampleStateCreateInfo ms = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+    .rasterizationSamples = hina_samples_to_vk(state->samples)
+  };
+
+  // ── Depth / stencil ───────────────────────────────────────────────────
+  // Unconditional form: Vulkan ignores stencil ops when stencilTestEnable=FALSE
+  const VkPipelineDepthStencilStateCreateInfo ds = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+    .depthTestEnable = state->depth.depth_test ? VK_TRUE : VK_FALSE,
+    .depthWriteEnable = state->depth.depth_write ? VK_TRUE : VK_FALSE,
+    .depthCompareOp = hina_compare_op_to_vk(state->depth.depth_compare),
+    .stencilTestEnable = state->depth.stencil_test ? VK_TRUE : VK_FALSE,
+    .front = {
+      .failOp = hina_stencil_op_to_vk((uint8_t)state->stencil_front.fail_op),
+      .passOp = hina_stencil_op_to_vk((uint8_t)state->stencil_front.pass_op),
+      .depthFailOp = hina_stencil_op_to_vk((uint8_t)state->stencil_front.depth_fail_op),
+      .compareOp = hina_compare_op_to_vk(state->stencil_front.compare_op),
+      .compareMask = state->stencil_front.compare_mask, .writeMask = state->stencil_front.write_mask,
+      .reference = state->stencil_front.reference
+    },
+    .back = {
+      .failOp = hina_stencil_op_to_vk((uint8_t)state->stencil_back.fail_op),
+      .passOp = hina_stencil_op_to_vk((uint8_t)state->stencil_back.pass_op),
+      .depthFailOp = hina_stencil_op_to_vk((uint8_t)state->stencil_back.depth_fail_op),
+      .compareOp = hina_compare_op_to_vk(state->stencil_back.compare_op),
+      .compareMask = state->stencil_back.compare_mask, .writeMask = state->stencil_back.write_mask,
+      .reference = state->stencil_back.reference
+    }
+  };
+
+  // ── Color blend ───────────────────────────────────────────────────────
+  uint32_t color_attachment_count = hina_count_color_attachments(state->color_formats);
+  VkPipelineColorBlendAttachmentState cb_atts[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
+  for (uint32_t i = 0; i < color_attachment_count; ++i)
+  {
+    uint32_t blend_idx = g_device_caps.has_independent_blend ? i : 0;
+    cb_atts[i].colorWriteMask = (VkColorComponentFlags)state->blend[blend_idx].color_write_mask;
+    if (cb_atts[i].colorWriteMask == 0)
+      cb_atts[i].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+        VK_COLOR_COMPONENT_A_BIT;
+    cb_atts[i].blendEnable = state->blend[blend_idx].enable ? VK_TRUE : VK_FALSE;
+    cb_atts[i].srcColorBlendFactor = hina_blend_factor_to_vk(state->blend[blend_idx].src_color);
+    cb_atts[i].dstColorBlendFactor = hina_blend_factor_to_vk(state->blend[blend_idx].dst_color);
+    cb_atts[i].colorBlendOp = hina_blend_op_to_vk(state->blend[blend_idx].color_op);
+    cb_atts[i].srcAlphaBlendFactor = hina_blend_factor_to_vk(state->blend[blend_idx].src_alpha);
+    cb_atts[i].dstAlphaBlendFactor = hina_blend_factor_to_vk(state->blend[blend_idx].dst_alpha);
+    cb_atts[i].alphaBlendOp = hina_blend_op_to_vk(state->blend[blend_idx].alpha_op);
+  }
+  VkPipelineColorBlendStateCreateInfo cb = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = color_attachment_count,
+    .pAttachments = cb_atts
+  };
+  memcpy(cb.blendConstants, state->blend[0].constants, sizeof(cb.blendConstants));
+
+  // ── Dynamic state ─────────────────────────────────────────────────────
+  VkDynamicState dyn_states[8];
+  uint32_t dyn_count = 0;
+  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_VIEWPORT;
+  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_SCISSOR;
+  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_LINE_WIDTH;
+  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
+  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
+  if (vkCmdSetDepthBiasEnable)
+    dyn_states[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE;
+  const VkPipelineDynamicStateCreateInfo dyn = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = dyn_count,
+    .pDynamicStates = dyn_states
+  };
+
+  // ── Color attachment formats ──────────────────────────────────────────
+  VkFormat color_formats[HINA_MAX_COLOR_ATTACHMENTS] = {VK_FORMAT_UNDEFINED};
+  for (uint32_t i = 0; i < color_attachment_count; ++i)
+    color_formats[i] = hina_format_to_vk(state->color_formats[i]);
+
+  VkFormat depth_fmt = hina_format_to_vk(state->depth_format);
+  VkFormat stencil_fmt = hina_format_to_vk(state->stencil_format);
+
+  // ── Dynamic local read (tile passes) ──────────────────────────────────
+  uint32_t dyn_local_read_locations[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
+  uint32_t dyn_local_read_input_indices[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
+  VkRenderingAttachmentLocationInfo dyn_att_location_info = {
+    .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO
+  };
+  VkRenderingInputAttachmentIndexInfo dyn_input_att_info = {
+    .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO
+  };
+  const bool use_dyn_local_read = tile_subpass_count > 0 &&
+    hina_tile_can_use_dynamic_local_read_layout(state->tile_layout);
+
+  VkFormat dyn_local_read_formats[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
+  uint32_t dyn_color_att_count = color_attachment_count;
+  if (use_dyn_local_read)
+  {
+    const hina_tile_pass_layout* tile_layout = state->tile_layout;
+    uint32_t total_attachments = hina_tile_count_total_attachments(tile_layout);
+    dyn_color_att_count = total_attachments;
+    for (uint32_t i = 0; i < total_attachments; i++) dyn_local_read_formats[i] = VK_FORMAT_UNDEFINED;
+    uint32_t start = 0;
+    for (uint32_t sp = 0; sp < state->subpass_index; sp++) start += tile_layout->subpasses[sp].color_count;
+    for (uint32_t c = 0; c < color_attachment_count; c++) dyn_local_read_formats[start + c] = color_formats[c];
+    for (uint32_t i = 0; i < total_attachments; i++) dyn_local_read_locations[i] = VK_ATTACHMENT_UNUSED;
+    for (uint32_t c = 0; c < color_attachment_count; c++) dyn_local_read_locations[start + c] = c;
+    dyn_att_location_info.colorAttachmentCount = total_attachments;
+    dyn_att_location_info.pColorAttachmentLocations = dyn_local_read_locations;
+    for (uint32_t i = 0; i < total_attachments; i++) dyn_local_read_input_indices[i] = VK_ATTACHMENT_UNUSED;
+    const hina_tile_subpass_layout* sp_layout = &tile_layout->subpasses[state->subpass_index];
+    for (uint32_t ti = 0; ti < sp_layout->input_count; ti++)
+    {
+      const hina_tile_input* input = &sp_layout->tile_inputs[ti];
+      uint32_t global_idx = 0;
+      for (uint32_t sp = 0; sp < input->subpass_output_index; sp++) global_idx += tile_layout->subpasses[sp].color_count;
+      global_idx += input->attachment_index;
+      dyn_local_read_input_indices[global_idx] = ti;
+    }
+    dyn_input_att_info.colorAttachmentCount = total_attachments;
+    dyn_input_att_info.pColorAttachmentInputIndices = dyn_local_read_input_indices;
+    uint32_t depth_input_idx = sp_layout->input_count;
+    dyn_input_att_info.pDepthInputAttachmentIndex = sp_layout->depth_input ? &depth_input_idx : NULL;
+    dyn_att_location_info.pNext = &dyn_input_att_info;
+    // Reset blend state for flattened attachment indices
+    for (uint32_t i = 0; i < total_attachments; i++)
+    {
+      cb_atts[i].blendEnable = VK_FALSE;
+      cb_atts[i].colorWriteMask = 0;
+      cb_atts[i].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+      cb_atts[i].dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+      cb_atts[i].colorBlendOp = VK_BLEND_OP_ADD;
+      cb_atts[i].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      cb_atts[i].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+      cb_atts[i].alphaBlendOp = VK_BLEND_OP_ADD;
+    }
+    for (uint32_t c = 0; c < color_attachment_count; c++)
+    {
+      uint32_t dst = start + c;
+      if (dst < total_attachments)
+      {
+        uint32_t blend_idx = g_device_caps.has_independent_blend ? c : 0;
+        cb_atts[dst].colorWriteMask = (VkColorComponentFlags)state->blend[blend_idx].color_write_mask;
+        if (cb_atts[dst].colorWriteMask == 0)
+          cb_atts[dst].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+            VK_COLOR_COMPONENT_A_BIT;
+        cb_atts[dst].blendEnable = state->blend[blend_idx].enable ? VK_TRUE : VK_FALSE;
+        cb_atts[dst].srcColorBlendFactor = hina_blend_factor_to_vk(state->blend[blend_idx].src_color);
+        cb_atts[dst].dstColorBlendFactor = hina_blend_factor_to_vk(state->blend[blend_idx].dst_color);
+        cb_atts[dst].colorBlendOp = hina_blend_op_to_vk(state->blend[blend_idx].color_op);
+        cb_atts[dst].srcAlphaBlendFactor = hina_blend_factor_to_vk(state->blend[blend_idx].src_alpha);
+        cb_atts[dst].dstAlphaBlendFactor = hina_blend_factor_to_vk(state->blend[blend_idx].dst_alpha);
+        cb_atts[dst].alphaBlendOp = hina_blend_op_to_vk(state->blend[blend_idx].alpha_op);
+      }
+    }
+    cb.attachmentCount = total_attachments;
+  }
+
+  // ── Dynamic rendering info ────────────────────────────────────────────
+  VkPipelineRenderingCreateInfo rendering = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+    .pNext = use_dyn_local_read ? &dyn_att_location_info : NULL, .colorAttachmentCount = dyn_color_att_count,
+    .pColorAttachmentFormats = use_dyn_local_read ? dyn_local_read_formats : color_formats,
+    .depthAttachmentFormat = depth_fmt, .stencilAttachmentFormat = stencil_fmt
+  };
+
+  // ── Pipeline create info ──────────────────────────────────────────────
+  VkGraphicsPipelineCreateInfo pi = {
+    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = vkCmdBeginRendering ? (void*)&rendering : NULL,
+    .stageCount = stage_count, .pStages = stages_ci, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+    .pTessellationState = has_tcs ? &tess : NULL, .pViewportState = &vp, .pRasterizationState = &rs,
+    .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dyn,
+    .layout = args->layout
+  };
+
+  // ── Legacy render pass ────────────────────────────────────────────────
+  const bool need_legacy_rp = !vkCmdBeginRendering || (tile_subpass_count > 0 &&
+    !hina_tile_can_use_dynamic_local_read_layout(state->tile_layout));
+  if (need_legacy_rp)
+  {
+    VkRenderPass rp = VK_NULL_HANDLE;
+    if (tile_subpass_count > 0)
+    {
+      hina_tile_template_override override = {
+        .subpass_index = state->subpass_index, .color_count = color_attachment_count, .depth_format = depth_fmt,
+        .samples = hina_samples_to_vk(state->samples)
+      };
+      for (uint32_t i = 0; i < color_attachment_count; i++) override.color_formats[i] = color_formats[i];
+      rp = hina_legacy_get_cached_tile_template_render_pass(ctx, state->tile_layout, &override);
+    }
+    else
+    {
+      VkFormat legacy_color_fmt = color_attachment_count ? color_formats[0] : VK_FORMAT_UNDEFINED;
+      VkSampleCountFlagBits vk_samples = hina_samples_to_vk(state->samples);
+      HINA_LOGI(ctx, "Creating pipeline render pass: color_fmt=%d, depth_fmt=%d, samples=%d", (int)legacy_color_fmt,
+                (int)depth_fmt, (int)vk_samples);
+      rp = hina_legacy_get_cached_render_pass(ctx, NULL, legacy_color_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                              VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_UNDEFINED,
+                                              depth_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                              VK_ATTACHMENT_STORE_OP_DONT_CARE);
+    }
+    if (!rp) return VK_NULL_HANDLE;
+    pi.renderPass = rp;
+    pi.subpass = state->subpass_index;
+  }
+
+  // ── Pipeline creation feedback ────────────────────────────────────────
+  VkPipelineCreationFeedback pipeline_feedback = {0};
+  VkPipelineCreationFeedback stage_feedbacks[5] = {0};
+  VkPipelineCreationFeedbackCreateInfo feedback_ci = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, .pNext = pi.pNext,
+    .pPipelineCreationFeedback = &pipeline_feedback, .pipelineStageCreationFeedbackCount = stage_count,
+    .pPipelineStageCreationFeedbacks = stage_feedbacks
+  };
+  if (g_debug_caps.has_pipeline_creation_feedback) pi.pNext = &feedback_ci;
+
+  // ── Create pipeline ───────────────────────────────────────────────────
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkResult result = vkCreateGraphicsPipelines(ctx->core.device->core.device,
+    ctx->core.device->cache.pipeline_cache, 1, &pi, NULL, &pipeline);
+  if (result != VK_SUCCESS)
+  {
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY)
+    {
+      HINA_LOGW(ctx, "vkCreateGraphicsPipelines failed: %s (resource pressure)", hina_vk_result_string(result));
+      return VK_NULL_HANDLE;
+    }
+    fprintf(stderr, "[hina][FATAL] vkCreateGraphicsPipelines failed: %s\n  %s:%d\n",
+            hina_vk_result_string(result), __FILE__, __LINE__);
+    fflush(stderr);
+    abort();
+  }
+
+  // ── Finalize slot ─────────────────────────────────────────────────────
+  hina_log_pipeline_creation_feedback(ctx, "Graphics", &pipeline_feedback, stage_feedbacks, stage_count);
+
+  if (state->label)
+    hina_set_object_name(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, state->label);
+  else
+    hina_set_object_namef(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, "hina_graphics_pipeline[%u]", idx);
+
+  e->pipeline = pipeline;
+  e->layout = args->layout;
+  e->kind = HINA_PIPELINE_KIND_GRAPHICS;
+  e->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  e->depth_bias_enable = state->depth_bias.enable ? 1 : 0;
+  e->required_set_mask = hina_compute_required_set_mask(e->reflection);
+  {
+    hina_format df = state->depth_format != HINA_FORMAT_UNDEFINED ? state->depth_format : state->stencil_format;
+    uint32_t samples = state->samples ? (uint32_t)state->samples : 1u;
+    e->kind_data.graphics.pass_layout = hina_pass_layout_make(state->color_formats, color_attachment_count, df, samples);
+  }
+#ifdef HINA_DEBUG
+  if (state->label) hina_debug_name_add(args->handle.id, VK_OBJECT_TYPE_PIPELINE, state->label);
+#endif
+  return pipeline;
+}
+
 // Internal implementation - used by deprecated wrappers and _ex function
 static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_pipeline_desc* desc)
 {
   HINA_ASSERT(desc);
-  const uint32_t tile_subpass_count = desc->tile_layout ? hina_count_tile_subpasses_layout(desc->tile_layout) : 0;
 #ifdef HINA_DEBUG
-  if (tile_subpass_count > 0)
   {
-    hina_validate_tile_pass_layout(desc->tile_layout);
-    HINA_ASSERTF(desc->subpass_index < tile_subpass_count,
-                 "pipeline subpass_index out of range: %u (subpass_count=%u)", desc->subpass_index,
-                 tile_subpass_count);
+    const uint32_t tile_subpass_count = desc->tile_layout ? hina_count_tile_subpasses_layout(desc->tile_layout) : 0;
+    if (tile_subpass_count > 0)
+    {
+      hina_validate_tile_pass_layout(desc->tile_layout);
+      HINA_ASSERTF(desc->subpass_index < tile_subpass_count,
+                   "pipeline subpass_index out of range: %u (subpass_count=%u)", desc->subpass_index,
+                   tile_subpass_count);
+    }
   }
 #endif
   // Validate required shaders (VS and FS must have valid SPIR-V)
@@ -14667,35 +15073,6 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     hina_pipeline_slot_free(idx);
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
-  VkPipelineShaderStageCreateInfo stages_ci[5] = {0};
-  uint32_t stage_count = 0;
-  VkSpecializationMapEntry vs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry tcs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry tes_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry gs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry fs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  uint8_t vs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t tcs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t tes_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t gs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t fs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  VkSpecializationInfo vs_spec_info = {0};
-  VkSpecializationInfo tcs_spec_info = {0};
-  VkSpecializationInfo tes_spec_info = {0};
-  VkSpecializationInfo gs_spec_info = {0};
-  VkSpecializationInfo fs_spec_info = {0};
-  const hina_stage_specialization* stage_specs[HINA_SPEC_STAGE_COUNT] = {0};
-  if (desc->specializations && desc->specialization_count > 0)
-  {
-    for (uint32_t i = 0; i < desc->specialization_count; ++i)
-    {
-      uint32_t spec_stage = hina_specialization_stage_index(desc->specializations[i].stage);
-      if (spec_stage < HINA_SPEC_STAGE_COUNT && !stage_specs[spec_stage])
-      {
-        stage_specs[spec_stage] = &desc->specializations[i];
-      }
-    }
-  }
   // Get or create shader modules (temp modules will be destroyed after pipeline creation)
   bool vs_temp = false, tcs_temp = false, tes_temp = false, gs_temp = false, fs_temp = false;
   VkShaderModule vs_module = hina_get_or_create_shader_module(ctx, &desc->vs, "vs", &vs_temp);
@@ -14722,413 +15099,35 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     hina_pipeline_slot_free(idx);
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
-  stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  stages_ci[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
-  stages_ci[stage_count].module = vs_module;
-  stages_ci[stage_count].pName = "main";
-  if (stage_specs[HINA_SPEC_STAGE_VERTEX])
+  // Convert raw desc to common state format, then delegate to shared builder
+  hina_hsl_pipeline_desc state;
+  memcpy(&state, &desc->layout, sizeof(state));
+  hina_gfx_pipeline_args args = {
+    .slot = e, .handle = handle, .idx = idx, .layout = layout,
+    .vs = vs_module, .tcs = tcs_module, .tes = tes_module,
+    .gs = gs_module, .fs = fs_module,
+    .vertex_layout = &state.layout,
+  };
+  VkPipeline pipeline = hina_build_graphics_pipeline(ctx, &args, &state);
+  if (!pipeline)
   {
-    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_VERTEX], vs_spec_entries, vs_spec_data, &vs_spec_info);
-    if (vs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &vs_spec_info;
-  }
-  stage_count++;
-  if (has_tcs)
-  {
-    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
-    stages_ci[stage_count].module = tcs_module;
-    stages_ci[stage_count].pName = "main";
-    if (stage_specs[HINA_SPEC_STAGE_TESS_CONTROL])
-    {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_CONTROL], tcs_spec_entries, tcs_spec_data,
-                                      &tcs_spec_info);
-      if (tcs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tcs_spec_info;
-    }
-    stage_count++;
-  }
-  if (has_tes)
-  {
-    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-    stages_ci[stage_count].module = tes_module;
-    stages_ci[stage_count].pName = "main";
-    if (stage_specs[HINA_SPEC_STAGE_TESS_EVAL])
-    {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_EVAL], tes_spec_entries, tes_spec_data,
-                                      &tes_spec_info);
-      if (tes_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tes_spec_info;
-    }
-    stage_count++;
-  }
-  if (has_gs)
-  {
-    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages_ci[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
-    stages_ci[stage_count].module = gs_module;
-    stages_ci[stage_count].pName = "main";
-    if (stage_specs[HINA_SPEC_STAGE_GEOMETRY])
-    {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_GEOMETRY], gs_spec_entries, gs_spec_data,
-                                      &gs_spec_info);
-      if (gs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &gs_spec_info;
-    }
-    stage_count++;
-  }
-  stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  stages_ci[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-  stages_ci[stage_count].module = fs_module;
-  stages_ci[stage_count].pName = "main";
-  if (stage_specs[HINA_SPEC_STAGE_FRAGMENT])
-  {
-    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_FRAGMENT], fs_spec_entries, fs_spec_data, &fs_spec_info);
-    if (fs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &fs_spec_info;
-  }
-  stage_count++;
-  VkVertexInputBindingDescription bindings[HINA_MAX_VERTEX_BUFFERS];
-  VkVertexInputAttributeDescription attrs[HINA_MAX_VERTEX_ATTRS];
-  uint32_t binding_count = desc->layout.buffer_count;
-  if (binding_count > HINA_MAX_VERTEX_BUFFERS) binding_count = HINA_MAX_VERTEX_BUFFERS;
-  for (uint32_t i = 0; i < binding_count; ++i)
-  {
-    bindings[i].binding = i;
-    bindings[i].stride = desc->layout.buffer_strides[i];
-    bindings[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-  }
-  uint32_t attr_count = desc->layout.attr_count;
-  if (attr_count > HINA_MAX_VERTEX_ATTRS) attr_count = HINA_MAX_VERTEX_ATTRS;
-  for (uint32_t i = 0; i < attr_count; ++i)
-  {
-    attrs[i].location = desc->layout.attrs[i].location;
-    attrs[i].binding = desc->layout.attrs[i].buffer_index;
-    attrs[i].format = hina_format_to_vk(desc->layout.attrs[i].format);
-    attrs[i].offset = desc->layout.attrs[i].offset;
-  }
-  const VkPipelineVertexInputStateCreateInfo vi = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = binding_count,
-    .pVertexBindingDescriptions = binding_count ? bindings : NULL, .vertexAttributeDescriptionCount = attr_count,
-    .pVertexAttributeDescriptions = attr_count ? attrs : NULL
-  };
-  const VkPipelineInputAssemblyStateCreateInfo ia = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-    .topology = hina_topology_to_vk(desc->primitive_topology)
-  };
-  const VkPipelineTessellationStateCreateInfo tess = has_tcs
-                                                       ? (VkPipelineTessellationStateCreateInfo){
-                                                         .sType =
-                                                         VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
-                                                         .patchControlPoints = desc->patch_control_points
-                                                       }
-                                                       : (VkPipelineTessellationStateCreateInfo){0};
-  const VkPipelineViewportStateCreateInfo vp = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1
-  };
-  // Depth bias enable handling:
-  // - Dynamic path (has_dynamic_state2): VK_FALSE here, set dynamically via vkCmdSetDepthBiasEnable
-  // - Legacy path: VK_TRUE baked in, values (0,0,0) effectively disable it
-  const VkPipelineRasterizationStateCreateInfo rs = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-    .polygonMode = hina_polygon_mode_to_vk(desc->polygon_mode), .cullMode = hina_cull_mode_to_vk(desc->cull_mode),
-    .frontFace = hina_front_face_to_vk(desc->front_face), .lineWidth = 1.0f,
-    .depthBiasEnable = vkCmdSetDepthBiasEnable ? VK_FALSE : VK_TRUE,
-    .depthBiasConstantFactor = desc->depth_bias.constant, .depthBiasSlopeFactor = desc->depth_bias.slope,
-    .depthBiasClamp = desc->depth_bias.clamp
-  };
-  const VkPipelineMultisampleStateCreateInfo ms = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-    .rasterizationSamples = hina_samples_to_vk(desc->samples)
-  };
-  const VkBool32 stencil_test = desc->depth.stencil_test ? VK_TRUE : VK_FALSE;
-  const VkPipelineDepthStencilStateCreateInfo ds = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-    .depthTestEnable = desc->depth.depth_test ? VK_TRUE : VK_FALSE,
-    .depthWriteEnable = desc->depth.depth_write ? VK_TRUE : VK_FALSE,
-    .depthCompareOp = hina_compare_op_to_vk(desc->depth.depth_compare), .stencilTestEnable = stencil_test,
-    .front = stencil_test
-               ? (VkStencilOpState)
-               {
-                 .failOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_front.fail_op),
-                 .passOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_front.pass_op),
-                 .depthFailOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_front.depth_fail_op),
-                 .compareOp = hina_compare_op_to_vk(desc->stencil_front.compare_op),
-                 .compareMask = desc->stencil_front.compare_mask, .writeMask = desc->stencil_front.write_mask,
-                 .reference = desc->stencil_front.reference
-               }
-               : (VkStencilOpState){0},
-    .back = stencil_test
-              ? (VkStencilOpState){
-                .failOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_back.fail_op),
-                .passOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_back.pass_op),
-                .depthFailOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_back.depth_fail_op),
-                .compareOp = hina_compare_op_to_vk(desc->stencil_back.compare_op),
-                .compareMask = desc->stencil_back.compare_mask, .writeMask = desc->stencil_back.write_mask,
-                .reference = desc->stencil_back.reference
-              }
-              : (VkStencilOpState){0}
-  };
-  // Determine color attachment count (derived from color_formats array, first UNDEFINED terminates)
-  uint32_t color_attachment_count = hina_count_color_attachments(desc->color_formats);
-
-  // Create blend attachment state for each color attachment (MRT support)
-  // For dynamic local read, we may need more slots (total attachments across all subpasses)
-  VkPipelineColorBlendAttachmentState cb_atts[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
-  for (uint32_t i = 0; i < color_attachment_count; ++i)
-  {
-    // Per-attachment blend: use blend[i] if VkPhysicalDeviceFeatures::independentBlend is supported.
-    // Otherwise fall back to blend[0] for ALL attachments (graceful degradation, no error).
-    // Use cases like WBOIT require different blend per attachment - check has_independent_blend first.
-    uint32_t blend_idx = g_device_caps.has_independent_blend ? i : 0;
-    cb_atts[i].colorWriteMask = (VkColorComponentFlags)desc->blend[blend_idx].color_write_mask;
-    if (cb_atts[i].colorWriteMask == 0)
-      cb_atts[i].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
-        VK_COLOR_COMPONENT_A_BIT;
-    cb_atts[i].blendEnable = desc->blend[blend_idx].enable ? VK_TRUE : VK_FALSE;
-    cb_atts[i].srcColorBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].src_color);
-    cb_atts[i].dstColorBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].dst_color);
-    cb_atts[i].colorBlendOp = hina_blend_op_to_vk(desc->blend[blend_idx].color_op);
-    cb_atts[i].srcAlphaBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].src_alpha);
-    cb_atts[i].dstAlphaBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].dst_alpha);
-    cb_atts[i].alphaBlendOp = hina_blend_op_to_vk(desc->blend[blend_idx].alpha_op);
-  }
-  VkPipelineColorBlendStateCreateInfo cb = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = color_attachment_count,
-    .pAttachments = cb_atts
-  };
-  memcpy(cb.blendConstants, desc->blend[0].constants, sizeof(cb.blendConstants));
-  // Dynamic state setup:
-  // - 1.0 core states are always dynamic (viewport, scissor, line width, depth bias values, blend constants)
-  // - Extended dynamic states (depth bias enable) are used when available on dynamic rendering path
-  // - Legacy path bakes depthBiasEnable=true into pipeline, values control the effect
-  VkDynamicState dyn_states[8];
-  uint32_t dyn_count = 0;
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_VIEWPORT;
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_SCISSOR;
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_LINE_WIDTH;
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS; // 1.0 core - values only
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS; // 1.0 core
-  if (vkCmdSetDepthBiasEnable)
-  {
-    dyn_states[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE; // 1.3/ext
-  }
-  const VkPipelineDynamicStateCreateInfo dyn = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = dyn_count,
-    .pDynamicStates = dyn_states
-  };
-  // Build color attachment formats from desc
-  // Note: color_attachment_count was already computed above for blend state
-  VkFormat color_formats[HINA_MAX_COLOR_ATTACHMENTS] = {VK_FORMAT_UNDEFINED};
-  for (uint32_t i = 0; i < color_attachment_count; ++i)
-    color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
-  // Convert depth/stencil formats
-  VkFormat depth_fmt = desc->depth_format != HINA_FORMAT_UNDEFINED
-                         ? hina_format_to_vk(desc->depth_format)
-                         : VK_FORMAT_UNDEFINED;
-  VkFormat stencil_fmt = desc->stencil_format != HINA_FORMAT_UNDEFINED
-                           ? hina_format_to_vk(desc->stencil_format)
-                           : VK_FORMAT_UNDEFINED;
-  // Dynamic rendering local read: chain attachment location/input index info for tile passes
-  uint32_t dyn_local_read_locations[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
-  uint32_t dyn_local_read_input_indices[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
-  VkRenderingAttachmentLocationInfo dyn_att_location_info = {
-    .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO
-  };
-  VkRenderingInputAttachmentIndexInfo dyn_input_att_info = {
-    .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO
-  };
-  const bool use_dyn_local_read = tile_subpass_count > 0 && hina_tile_can_use_dynamic_local_read_layout(desc->tile_layout);
-  // For dynamic local read: colorAttachmentCount must equal total attachments in rendering
-  // Unused attachments get VK_FORMAT_UNDEFINED
-  VkFormat dyn_local_read_formats[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
-  uint32_t dyn_color_att_count = color_attachment_count;
-  if (use_dyn_local_read)
-  {
-    const hina_tile_pass_layout* tile_layout = desc->tile_layout;
-    uint32_t total_attachments = hina_tile_count_total_attachments(tile_layout);
-    dyn_color_att_count = total_attachments;
-    for (uint32_t i = 0; i < total_attachments; i++) dyn_local_read_formats[i] = VK_FORMAT_UNDEFINED;
-    uint32_t start = 0;
-    for (uint32_t sp = 0; sp < desc->subpass_index; sp++) start += tile_layout->subpasses[sp].color_count;
-    for (uint32_t c = 0; c < color_attachment_count; c++) dyn_local_read_formats[start + c] = color_formats[c];
-    // pColorAttachmentLocations[attachment_idx] = shader_location
-    for (uint32_t i = 0; i < total_attachments; i++) dyn_local_read_locations[i] = VK_ATTACHMENT_UNUSED;
-    for (uint32_t c = 0; c < color_attachment_count; c++) dyn_local_read_locations[start + c] = c;
-    dyn_att_location_info.colorAttachmentCount = total_attachments;
-    dyn_att_location_info.pColorAttachmentLocations = dyn_local_read_locations;
-    // pColorAttachmentInputIndices[attachment_idx] = input_attachment_index
-    for (uint32_t i = 0; i < total_attachments; i++) dyn_local_read_input_indices[i] = VK_ATTACHMENT_UNUSED;
-    const hina_tile_subpass_layout* sp_layout = &tile_layout->subpasses[desc->subpass_index];
-    for (uint32_t ti = 0; ti < sp_layout->input_count; ti++)
-    {
-      const hina_tile_input* input = &sp_layout->tile_inputs[ti];
-      uint32_t global_idx = 0;
-      for (uint32_t sp = 0; sp < input->subpass_output_index; sp++) global_idx += tile_layout->subpasses[sp].color_count;
-      global_idx += input->attachment_index;
-      dyn_local_read_input_indices[global_idx] = ti;
-    }
-    dyn_input_att_info.colorAttachmentCount = total_attachments;
-    dyn_input_att_info.pColorAttachmentInputIndices = dyn_local_read_input_indices;
-    // Depth input: index follows color inputs (matches legacy subpass input attachment order)
-    uint32_t depth_input_idx = sp_layout->input_count;
-    dyn_input_att_info.pDepthInputAttachmentIndex = sp_layout->depth_input ? &depth_input_idx : NULL;
-    dyn_att_location_info.pNext = &dyn_input_att_info;
-    // Blend state uses flattened attachment indices, not fragment output locations
-    for (uint32_t i = 0; i < total_attachments; i++)
-    {
-      cb_atts[i].blendEnable = VK_FALSE;
-      cb_atts[i].colorWriteMask = 0;
-      cb_atts[i].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-      cb_atts[i].dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-      cb_atts[i].colorBlendOp = VK_BLEND_OP_ADD;
-      cb_atts[i].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-      cb_atts[i].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-      cb_atts[i].alphaBlendOp = VK_BLEND_OP_ADD;
-    }
-    for (uint32_t c = 0; c < color_attachment_count; c++)
-    {
-      uint32_t dst = start + c;
-      if (dst < total_attachments)
-      {
-        // Per-attachment blend: use blend[c] if independentBlend supported, else fallback to blend[0]
-        uint32_t blend_idx = g_device_caps.has_independent_blend ? c : 0;
-        cb_atts[dst].colorWriteMask = (VkColorComponentFlags)desc->blend[blend_idx].color_write_mask;
-        if (cb_atts[dst].colorWriteMask == 0)
-          cb_atts[dst].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
-            VK_COLOR_COMPONENT_A_BIT;
-        cb_atts[dst].blendEnable = desc->blend[blend_idx].enable ? VK_TRUE : VK_FALSE;
-        cb_atts[dst].srcColorBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].src_color);
-        cb_atts[dst].dstColorBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].dst_color);
-        cb_atts[dst].colorBlendOp = hina_blend_op_to_vk(desc->blend[blend_idx].color_op);
-        cb_atts[dst].srcAlphaBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].src_alpha);
-        cb_atts[dst].dstAlphaBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].dst_alpha);
-        cb_atts[dst].alphaBlendOp = hina_blend_op_to_vk(desc->blend[blend_idx].alpha_op);
-      }
-    }
-    cb.attachmentCount = total_attachments;
-  }
-  VkPipelineRenderingCreateInfo rendering = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-    .pNext = use_dyn_local_read ? &dyn_att_location_info : NULL, .colorAttachmentCount = dyn_color_att_count,
-    .pColorAttachmentFormats = use_dyn_local_read ? dyn_local_read_formats : color_formats,
-    .depthAttachmentFormat = depth_fmt, .stencilAttachmentFormat = stencil_fmt
-  };
-  VkGraphicsPipelineCreateInfo pi = {
-    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = vkCmdBeginRendering ? (void*)&rendering : NULL,
-    .stageCount = stage_count, .pStages = stages_ci, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
-    .pTessellationState = has_tcs ? &tess : NULL, .pViewportState = &vp, .pRasterizationState = &rs,
-    .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dyn,
-    .layout = layout
-  };
-  // Use legacy VkRenderPass when:
-  // 1. Dynamic rendering is not available (!vkCmdBeginRendering), OR
-  // 2. This is a tile pass pipeline and dynamic local read can't be used (unsupported or depth_input without depth/stencil support)
-  const bool need_legacy_rp = !vkCmdBeginRendering || (tile_subpass_count > 0 && !
-    hina_tile_can_use_dynamic_local_read_layout(desc->tile_layout));
-  if (need_legacy_rp)
-  {
-    VkRenderPass rp = VK_NULL_HANDLE;
-    // For tile pass pipelines (subpass_index > 0 or tile_layout provided),
-    // use the tile template render pass for proper subpass structure
-    if (tile_subpass_count > 0)
-    {
-      // Build format override from pipeline desc - this allows users to skip
-      // specifying formats in tile_layout for the current subpass
-      hina_tile_template_override override = {
-        .subpass_index = desc->subpass_index, .color_count = color_attachment_count, .depth_format = depth_fmt,
-        .samples = hina_samples_to_vk(desc->samples)
-      };
-      for (uint32_t i = 0; i < color_attachment_count; i++) override.color_formats[i] = color_formats[i];
-      rp = hina_legacy_get_cached_tile_template_render_pass(ctx, desc->tile_layout, &override);
-    }
-    else
-    {
-      // Use the actual color format from the pipeline descriptor, not the swapchain format
-      // This ensures render pass compatibility when rendering to offscreen targets
-      VkFormat legacy_color_fmt = color_attachment_count ? color_formats[0] : VK_FORMAT_UNDEFINED;
-      VkFormat legacy_depth_fmt = depth_fmt;
-      // Use COLOR_ATTACHMENT_OPTIMAL as final layout - explicit transitions handle the rest
-      // Per Vulkan spec, initial/final layouts don't affect render pass compatibility
-      VkSampleCountFlagBits vk_samples = hina_samples_to_vk(desc->samples);
-      HINA_LOGI(ctx, "Creating pipeline render pass: color_fmt=%d, depth_fmt=%d, samples=%d", (int)legacy_color_fmt,
-                (int)legacy_depth_fmt, (int)vk_samples);
-      rp = hina_legacy_get_cached_render_pass(ctx, NULL, legacy_color_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
-                                              VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_UNDEFINED,
-                                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_UNDEFINED,
-                                              legacy_depth_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
-                                              VK_ATTACHMENT_STORE_OP_DONT_CARE);
-    }
-    if (!rp)
-    {
-      if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-      hina_pipeline_slot_free(idx);
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    pi.renderPass = rp;
-    pi.subpass = desc->subpass_index;
-  }
-  // Pipeline creation feedback (VK_EXT_pipeline_creation_feedback)
-  VkPipelineCreationFeedback pipeline_feedback = {0};
-  VkPipelineCreationFeedback stage_feedbacks[5] = {0}; // VS, TCS, TES, GS, FS
-  VkPipelineCreationFeedbackCreateInfo feedback_ci = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, .pNext = pi.pNext,
-    .pPipelineCreationFeedback = &pipeline_feedback, .pipelineStageCreationFeedbackCount = stage_count,
-    .pPipelineStageCreationFeedbacks = stage_feedbacks
-  };
-  if (g_debug_caps.has_pipeline_creation_feedback) pi.pNext = &feedback_ci;
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  VkResult create_result = vkCreateGraphicsPipelines(ctx->core.device->core.device,
-    ctx->core.device->cache.pipeline_cache, 1, &pi, NULL, &pipeline);
-  if (create_result != VK_SUCCESS)
-  {
-    // Cleanup temp shader modules on failure
     if (vs_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
     if (tcs_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
     if (tes_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
     if (gs_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
     if (fs_temp) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
     if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
+    if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
+    e->reflection = NULL;
     hina_pipeline_slot_free(idx);
-    // Resource pressure: out of memory is recoverable
-    if (create_result == VK_ERROR_OUT_OF_DEVICE_MEMORY || create_result == VK_ERROR_OUT_OF_HOST_MEMORY)
-    {
-      HINA_LOGW(ctx, "vkCreateGraphicsPipelines failed: %s (resource pressure)", hina_vk_result_string(create_result));
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    // Fatal: any other error crashes immediately
-    fprintf(stderr, "[hina][FATAL] vkCreateGraphicsPipelines failed: %s\n  %s:%d\n",
-            hina_vk_result_string(create_result), __FILE__, __LINE__);
-    fflush(stderr);
-    abort();
+    return (hina_pipeline){HINA_INVALID_HANDLE};
   }
-  // Log pipeline creation feedback
-  hina_log_pipeline_creation_feedback(ctx, "Graphics", &pipeline_feedback, stage_feedbacks, stage_count);
   // Cleanup temp shader modules after successful pipeline creation
-  // (modules only needed during pipeline creation, not at runtime)
   if (vs_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
   if (tcs_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
   if (tes_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
   if (gs_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
   if (fs_temp) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
-  if (desc->label)
-  {
-    hina_set_object_name(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, desc->label);
-  }
-  else
-  {
-    hina_set_object_namef(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, "hina_graphics_pipeline[%u]", idx);
-  }
-  e->pipeline = pipeline;
-  e->layout = layout;
-  e->kind = HINA_PIPELINE_KIND_GRAPHICS;
-  e->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
-  e->required_set_mask = hina_compute_required_set_mask(e->reflection);
-  {
-    hina_format depth_format = desc->depth_format != HINA_FORMAT_UNDEFINED ? desc->depth_format : desc->stencil_format;
-    uint32_t samples = desc->samples ? (uint32_t)desc->samples : 1u;
-    e->kind_data.graphics.pass_layout = hina_pass_layout_make(desc->color_formats, color_attachment_count, depth_format,
-                                                              samples);
-  }
-#ifdef HINA_DEBUG
-  if (desc->label) hina_debug_name_add(handle.id, VK_OBJECT_TYPE_PIPELINE, desc->label);
-#endif
   return handle;
 }
 
@@ -15659,18 +15658,114 @@ static VkShaderModule hina_get_or_create_module(hina_context* ctx, void** cache_
   return module;
 }
 
+// ── Shared compute pipeline builder ──────────────────────────────────────────
+// Mirrors hina_build_graphics_pipeline: callers do unique prep (slot alloc,
+// reflection, layout, shader module acquisition), then hand off to this
+// shared builder for the VkComputePipelineCreateInfo → slot finalization path.
+//
+// On failure: cleans up layout/reflection/slot, returns VK_NULL_HANDLE.
+//             OOM is recoverable (logged warning); all other errors abort.
+// Caller responsibility: destroy any temp shader modules (unconditionally).
+
+typedef struct hina_compute_pipeline_args {
+  hina_pipeline_slot* slot;
+  hina_pipeline       handle;
+  uint16_t            idx;
+  VkPipelineLayout    layout;
+  VkShaderModule      cs;
+  const hina_stage_specialization* cs_spec;  // NULL = no specialization
+  uint32_t local_size_x, local_size_y, local_size_z;  // 0 = unknown (raw path)
+} hina_compute_pipeline_args;
+
+static VkPipeline hina_build_compute_pipeline(hina_context* ctx,
+                                              const hina_compute_pipeline_args* args,
+                                              const char* label)
+{
+  // Shader stage
+  VkPipelineShaderStageCreateInfo stage = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+    .module = args->cs, .pName = "main"
+  };
+  // Specialization constants
+  VkSpecializationMapEntry cs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
+  uint8_t cs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
+  VkSpecializationInfo cs_spec_info = {0};
+  if (args->cs_spec)
+  {
+    hina_apply_stage_specialization(args->cs_spec, cs_spec_entries, cs_spec_data, &cs_spec_info);
+    if (cs_spec_info.mapEntryCount > 0) stage.pSpecializationInfo = &cs_spec_info;
+  }
+  // Pipeline create info
+  VkComputePipelineCreateInfo ci = {
+    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = stage, .layout = args->layout
+  };
+  // Pipeline creation feedback (VK_EXT_pipeline_creation_feedback)
+  VkPipelineCreationFeedback feedback = {0};
+  VkPipelineCreationFeedback stage_feedback = {0};
+  VkPipelineCreationFeedbackCreateInfo feedback_ci = {
+    .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, .pPipelineCreationFeedback = &feedback,
+    .pipelineStageCreationFeedbackCount = 1, .pPipelineStageCreationFeedbacks = &stage_feedback
+  };
+  if (g_debug_caps.has_pipeline_creation_feedback) ci.pNext = &feedback_ci;
+  // Create pipeline
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkResult result = vkCreateComputePipelines(ctx->core.device->core.device,
+    ctx->core.device->cache.pipeline_cache, 1, &ci, NULL, &pipeline);
+  if (result != VK_SUCCESS)
+  {
+    if (args->layout) vkDestroyPipelineLayout(ctx->core.device->core.device, args->layout, NULL);
+    if (args->slot->reflection) hina_destroy_pipeline_reflection(ctx, args->slot->reflection);
+    args->slot->reflection = NULL;
+    hina_pipeline_slot_free(args->idx);
+    // Resource pressure: out of memory is recoverable
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY)
+    {
+      HINA_LOGW(ctx, "vkCreateComputePipelines failed: %s (resource pressure)", hina_vk_result_string(result));
+      return VK_NULL_HANDLE;
+    }
+    // Fatal: any other error crashes immediately
+    fprintf(stderr, "[hina][FATAL] vkCreateComputePipelines failed: %s\n  %s:%d\n",
+            hina_vk_result_string(result), __FILE__, __LINE__);
+    fflush(stderr);
+    abort();
+  }
+  // Log pipeline creation feedback
+  hina_log_pipeline_creation_feedback(ctx, "Compute", &feedback, &stage_feedback, 1);
+  // Object naming
+  if (label)
+    hina_set_object_name(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, label);
+  else
+    hina_set_object_namef(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, "hina_compute_pipeline[%u]", args->idx);
+  // Finalize slot
+  hina_pipeline_slot* e = args->slot;
+  e->pipeline = pipeline;
+  e->layout = args->layout;
+  e->kind = HINA_PIPELINE_KIND_COMPUTE;
+  e->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
+  e->required_set_mask = hina_compute_required_set_mask(e->reflection);
+  e->kind_data.compute.local_size_x = args->local_size_x;
+  e->kind_data.compute.local_size_y = args->local_size_y;
+  e->kind_data.compute.local_size_z = args->local_size_z;
+#ifdef HINA_DEBUG
+  if (label) hina_debug_name_add(args->handle.id, VK_OBJECT_TYPE_PIPELINE, label);
+#endif
+  return pipeline;
+}
+
 hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, const hina_hsl_pipeline_desc* desc,
                                              hina_hsl_cache* cache)
 {
   if (!module || !desc) return (hina_pipeline){HINA_INVALID_HANDLE};
-  const uint32_t tile_subpass_count = desc->tile_layout ? hina_count_tile_subpasses_layout(desc->tile_layout) : 0;
 #ifdef HINA_DEBUG
-  if (tile_subpass_count > 0)
   {
-    hina_validate_tile_pass_layout(desc->tile_layout);
-    HINA_ASSERTF(desc->subpass_index < tile_subpass_count,
-                 "pipeline subpass_index out of range: %u (subpass_count=%u)", desc->subpass_index,
-                 tile_subpass_count);
+    const uint32_t tile_subpass_count = desc->tile_layout ? hina_count_tile_subpasses_layout(desc->tile_layout) : 0;
+    if (tile_subpass_count > 0)
+    {
+      hina_validate_tile_pass_layout(desc->tile_layout);
+      HINA_ASSERTF(desc->subpass_index < tile_subpass_count,
+                   "pipeline subpass_index out of range: %u (subpass_count=%u)", desc->subpass_index,
+                   tile_subpass_count);
+    }
   }
 #endif
   hina_context* ctx = &g_hina_ctx;
@@ -15873,75 +15968,18 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
       return (hina_pipeline){HINA_INVALID_HANDLE};
     }
     hina_set_object_namef(ctx, (uint64_t)cs_module, VK_OBJECT_TYPE_SHADER_MODULE, "hina_tmp_cs_module[%u]", idx);
-    VkPipelineShaderStageCreateInfo stage_ci = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-      .module = cs_module, .pName = "main"
+    hina_compute_pipeline_args args = {
+      .slot = e, .handle = handle, .idx = idx, .layout = layout,
+      .cs = cs_module, .cs_spec = cs_spec,
+      .local_size_x = cs_stage->local_size_x,
+      .local_size_y = cs_stage->local_size_y,
+      .local_size_z = cs_stage->local_size_z,
     };
-    // Build specialization info
-    VkSpecializationMapEntry cs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-    uint8_t cs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-    VkSpecializationInfo cs_spec_info = {0};
-    if (cs_spec)
-    {
-      hina_apply_stage_specialization(cs_spec, cs_spec_entries, cs_spec_data, &cs_spec_info);
-      if (cs_spec_info.mapEntryCount > 0) stage_ci.pSpecializationInfo = &cs_spec_info;
-    }
-    VkComputePipelineCreateInfo ci = {
-      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = stage_ci, .layout = layout
-    };
-    // Pipeline creation feedback (VK_EXT_pipeline_creation_feedback)
-    VkPipelineCreationFeedback compute_feedback = {0};
-    VkPipelineCreationFeedback compute_stage_feedback = {0};
-    VkPipelineCreationFeedbackCreateInfo compute_feedback_ci = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, .pPipelineCreationFeedback = &compute_feedback,
-      .pipelineStageCreationFeedbackCount = 1, .pPipelineStageCreationFeedbacks = &compute_stage_feedback
-    };
-    if (g_debug_caps.has_pipeline_creation_feedback) ci.pNext = &compute_feedback_ci;
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult result = vkCreateComputePipelines(ctx->core.device->core.device, ctx->core.device->cache.pipeline_cache, 1,
-                                               &ci, NULL, &pipeline);
+    VkPipeline pipeline = hina_build_compute_pipeline(ctx, &args, desc->label);
     vkDestroyShaderModule(ctx->core.device->core.device, cs_module, NULL);
-    if (result != VK_SUCCESS)
-    {
-      if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-      hina_destroy_pipeline_reflection(ctx, e->reflection);
-      e->reflection = NULL;
-      hina_pipeline_slot_free(idx);
-      // Resource pressure: out of memory is recoverable
-      if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY)
-      {
-        HINA_LOGW(ctx, "vkCreateComputePipelines failed: %s (resource pressure)", hina_vk_result_string(result));
-        return (hina_pipeline){HINA_INVALID_HANDLE};
-      }
-      // Fatal: any other error crashes immediately
-      fprintf(stderr, "[hina][FATAL] vkCreateComputePipelines failed: %s\n  %s:%d\n",
-              hina_vk_result_string(result), __FILE__, __LINE__);
-      fflush(stderr);
-      abort();
-    }
-    // Log pipeline creation feedback
-    hina_log_pipeline_creation_feedback(ctx, "Compute", &compute_feedback, &compute_stage_feedback, 1);
-    if (desc->label)
-    {
-      hina_set_object_name(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, desc->label);
-    }
-    else
-    {
-      hina_set_object_namef(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, "hina_compute_pipeline[%u]", idx);
-    }
-    e->pipeline = pipeline;
-    e->layout = layout;
-    e->kind = HINA_PIPELINE_KIND_COMPUTE;
-    e->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
-    e->required_set_mask = hina_compute_required_set_mask(e->reflection);
-    e->kind_data.compute.local_size_x = cs_stage->local_size_x;
-    e->kind_data.compute.local_size_y = cs_stage->local_size_y;
-    e->kind_data.compute.local_size_z = cs_stage->local_size_z;
+    if (!pipeline) return (hina_pipeline){HINA_INVALID_HANDLE};
     HINA_LOGI(ctx, "=== Compute pipeline created from module successfully (id=%u, workgroup=%u×%u×%u) ===",
               handle.id, cs_stage->local_size_x, cs_stage->local_size_y, cs_stage->local_size_z);
-#ifdef HINA_DEBUG
-    if (desc->label) hina_debug_name_add(handle.id, VK_OBJECT_TYPE_PIPELINE, desc->label);
-#endif
     return handle;
   }
   // Color attachment count validation (derived from color_formats array):
@@ -16148,90 +16186,6 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
       return (hina_pipeline){HINA_INVALID_HANDLE};
     }
   }
-  // Build shader stage create infos
-  VkPipelineShaderStageCreateInfo stages_ci[5] = {0};
-  uint32_t stage_count = 0;
-  VkSpecializationMapEntry vs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry tcs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry tes_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry gs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry fs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  uint8_t vs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t tcs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t tes_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t gs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t fs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  VkSpecializationInfo vs_spec_info = {0};
-  VkSpecializationInfo tcs_spec_info = {0};
-  VkSpecializationInfo tes_spec_info = {0};
-  VkSpecializationInfo gs_spec_info = {0};
-  VkSpecializationInfo fs_spec_info = {0};
-  stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  stages_ci[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
-  stages_ci[stage_count].module = vs_module;
-  stages_ci[stage_count].pName = "main";
-  if (stage_specs[HINA_SPEC_STAGE_VERTEX])
-  {
-    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_VERTEX], vs_spec_entries, vs_spec_data, &vs_spec_info);
-    if (vs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &vs_spec_info;
-  }
-  stage_count++;
-  if (has_tcs)
-  {
-    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
-    stages_ci[stage_count].module = tcs_module;
-    stages_ci[stage_count].pName = "main";
-    if (stage_specs[HINA_SPEC_STAGE_TESS_CONTROL])
-    {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_CONTROL], tcs_spec_entries, tcs_spec_data,
-                                      &tcs_spec_info);
-      if (tcs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tcs_spec_info;
-    }
-    stage_count++;
-  }
-  if (has_tes)
-  {
-    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages_ci[stage_count].stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-    stages_ci[stage_count].module = tes_module;
-    stages_ci[stage_count].pName = "main";
-    if (stage_specs[HINA_SPEC_STAGE_TESS_EVAL])
-    {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_EVAL], tes_spec_entries, tes_spec_data,
-                                      &tes_spec_info);
-      if (tes_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tes_spec_info;
-    }
-    stage_count++;
-  }
-  if (has_gs)
-  {
-    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages_ci[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
-    stages_ci[stage_count].module = gs_module;
-    stages_ci[stage_count].pName = "main";
-    if (stage_specs[HINA_SPEC_STAGE_GEOMETRY])
-    {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_GEOMETRY], gs_spec_entries, gs_spec_data,
-                                      &gs_spec_info);
-      if (gs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &gs_spec_info;
-    }
-    stage_count++;
-  }
-  if (has_fs)
-  {
-    stages_ci[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages_ci[stage_count].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages_ci[stage_count].module = fs_module;
-    stages_ci[stage_count].pName = "main";
-    if (stage_specs[HINA_SPEC_STAGE_FRAGMENT])
-    {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_FRAGMENT], fs_spec_entries, fs_spec_data,
-                                      &fs_spec_info);
-      if (fs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &fs_spec_info;
-    }
-    stage_count++;
-  }
   // Auto-detect vertex layout from module's pre-reflected vertex inputs
   hina_vertex_layout auto_layout = desc->layout;
   if (desc->layout.attr_count == 0 && module->vertex_inputs && module->vertex_input_count > 0)
@@ -16261,335 +16215,34 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
       HINA_LOGI(ctx, "  Auto layout: %u attrs, stride=%u", attr_idx, offset);
     }
   }
-  // Build vertex input state
-  VkVertexInputBindingDescription bindings[HINA_MAX_VERTEX_BUFFERS];
-  VkVertexInputAttributeDescription attrs[HINA_MAX_VERTEX_ATTRS];
-  uint32_t binding_count = auto_layout.buffer_count;
-  if (binding_count > HINA_MAX_VERTEX_BUFFERS) binding_count = HINA_MAX_VERTEX_BUFFERS;
-  for (uint32_t i = 0; i < binding_count; ++i)
+  // Delegate to shared builder
+  hina_gfx_pipeline_args args = {
+    .slot = e, .handle = handle, .idx = idx, .layout = layout,
+    .vs = vs_module, .tcs = tcs_module, .tes = tes_module,
+    .gs = gs_module, .fs = fs_module,
+    .vertex_layout = &auto_layout,
+  };
+  VkPipeline pipeline = hina_build_graphics_pipeline(ctx, &args, desc);
+  if (!pipeline)
   {
-    bindings[i].binding = i;
-    bindings[i].stride = auto_layout.buffer_strides[i];
-    bindings[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-  }
-  uint32_t attr_count = auto_layout.attr_count;
-  if (attr_count > HINA_MAX_VERTEX_ATTRS) attr_count = HINA_MAX_VERTEX_ATTRS;
-  for (uint32_t i = 0; i < attr_count; ++i)
-  {
-    attrs[i].location = auto_layout.attrs[i].location;
-    attrs[i].binding = auto_layout.attrs[i].buffer_index;
-    attrs[i].format = hina_format_to_vk(auto_layout.attrs[i].format);
-    attrs[i].offset = auto_layout.attrs[i].offset;
-  }
-  const VkPipelineVertexInputStateCreateInfo vi = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = binding_count,
-    .pVertexBindingDescriptions = binding_count ? bindings : NULL, .vertexAttributeDescriptionCount = attr_count,
-    .pVertexAttributeDescriptions = attr_count ? attrs : NULL
-  };
-  const VkPipelineInputAssemblyStateCreateInfo ia = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-    .topology = hina_topology_to_vk(desc->primitive_topology)
-  };
-  const VkPipelineTessellationStateCreateInfo tess = has_tcs
-                                                       ? (VkPipelineTessellationStateCreateInfo){
-                                                         .sType =
-                                                         VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
-                                                         .patchControlPoints = desc->patch_control_points
-                                                       }
-                                                       : (VkPipelineTessellationStateCreateInfo){0};
-  const VkPipelineViewportStateCreateInfo vp = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1
-  };
-  // Depth bias enable: dynamic if has_dynamic_state2, otherwise baked true (values control effect)
-  const VkPipelineRasterizationStateCreateInfo rs = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-    .polygonMode = hina_polygon_mode_to_vk(desc->polygon_mode), .cullMode = hina_cull_mode_to_vk(desc->cull_mode),
-    .frontFace = hina_front_face_to_vk(desc->front_face),
-    .depthBiasEnable = vkCmdSetDepthBiasEnable ? VK_FALSE : VK_TRUE,
-    .depthBiasConstantFactor = desc->depth_bias.constant, .depthBiasSlopeFactor = desc->depth_bias.slope,
-    .depthBiasClamp = desc->depth_bias.clamp, .lineWidth = 1.0f
-  };
-  const VkPipelineMultisampleStateCreateInfo ms = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-    .rasterizationSamples = hina_samples_to_vk(desc->samples)
-  };
-  const bool stencil_test = desc->stencil_front.compare_op != HINA_COMPARE_OP_NEVER || desc->stencil_back.compare_op !=
-    HINA_COMPARE_OP_NEVER;
-  const VkPipelineDepthStencilStateCreateInfo ds = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-    .depthTestEnable = desc->depth.depth_test ? VK_TRUE : VK_FALSE,
-    .depthWriteEnable = desc->depth.depth_write ? VK_TRUE : VK_FALSE,
-    .depthCompareOp = hina_compare_op_to_vk(desc->depth.depth_compare),
-    .stencilTestEnable = stencil_test ? VK_TRUE : VK_FALSE,
-    .front = {
-      .failOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_front.fail_op),
-      .passOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_front.pass_op),
-      .depthFailOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_front.depth_fail_op),
-      .compareOp = hina_compare_op_to_vk(desc->stencil_front.compare_op),
-      .compareMask = desc->stencil_front.compare_mask, .writeMask = desc->stencil_front.write_mask,
-      .reference = desc->stencil_front.reference
-    },
-    .back = {
-      .failOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_back.fail_op),
-      .passOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_back.pass_op),
-      .depthFailOp = hina_stencil_op_to_vk((uint8_t)desc->stencil_back.depth_fail_op),
-      .compareOp = hina_compare_op_to_vk(desc->stencil_back.compare_op), .compareMask = desc->stencil_back.compare_mask,
-      .writeMask = desc->stencil_back.write_mask, .reference = desc->stencil_back.reference
-    }
-  };
-  // Color attachment count (derived from color_formats array, first UNDEFINED terminates)
-  uint32_t color_count = hina_count_color_attachments(desc->color_formats);
-  HINA_ASSERT(!(color_count == 0 && has_fs) && "Fragment shader requires at least one color attachment");
-
-  // Create blend attachment state for each color attachment (MRT support)
-  // For dynamic local read, we may need more slots (total attachments across all subpasses)
-  VkPipelineColorBlendAttachmentState blend_attachments[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
-  for (uint32_t i = 0; i < color_count; ++i)
-  {
-    // Per-attachment blend: use blend[i] if VkPhysicalDeviceFeatures::independentBlend is supported.
-    // Otherwise fall back to blend[0] for ALL attachments (graceful degradation, no error).
-    uint32_t blend_idx = g_device_caps.has_independent_blend ? i : 0;
-    blend_attachments[i].blendEnable = desc->blend[blend_idx].enable ? VK_TRUE : VK_FALSE;
-    blend_attachments[i].srcColorBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].src_color);
-    blend_attachments[i].dstColorBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].dst_color);
-    blend_attachments[i].colorBlendOp = hina_blend_op_to_vk(desc->blend[blend_idx].color_op);
-    blend_attachments[i].srcAlphaBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].src_alpha);
-    blend_attachments[i].dstAlphaBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].dst_alpha);
-    blend_attachments[i].alphaBlendOp = hina_blend_op_to_vk(desc->blend[blend_idx].alpha_op);
-    blend_attachments[i].colorWriteMask = (VkColorComponentFlags)desc->blend[blend_idx].color_write_mask;
-    if (blend_attachments[i].colorWriteMask == 0)
-      blend_attachments[i].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT
-        | VK_COLOR_COMPONENT_A_BIT;
-  }
-  // Blend state - attachment count may be updated later for dynamic local read
-  VkPipelineColorBlendStateCreateInfo cb = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = color_count,
-    .pAttachments = color_count ? blend_attachments : NULL
-  };
-  memcpy(cb.blendConstants, desc->blend[0].constants, sizeof(cb.blendConstants));
-  // Dynamic state setup (same as hina_ctx_make_pipeline)
-  VkDynamicState dyn_states[8];
-  uint32_t dyn_count = 0;
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_VIEWPORT;
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_SCISSOR;
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_LINE_WIDTH;
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS; // 1.0 core - values only
-  dyn_states[dyn_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS; // 1.0 core
-  if (vkCmdSetDepthBiasEnable)
-  {
-    dyn_states[dyn_count++] = VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE; // 1.3/ext
-  }
-  const VkPipelineDynamicStateCreateInfo dyn = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = dyn_count,
-    .pDynamicStates = dyn_states
-  };
-  // Build color attachment formats for dynamic rendering
-  VkFormat vk_color_formats[HINA_MAX_COLOR_ATTACHMENTS] = {VK_FORMAT_UNDEFINED};
-  for (uint32_t i = 0; i < color_count; ++i)
-    vk_color_formats[i] = hina_format_to_vk(desc->color_formats[i]);
-  // Dynamic rendering local read: chain attachment location/input index info for tile passes
-  uint32_t hsl_dyn_locations[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
-  uint32_t hsl_dyn_input_indices[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
-  VkRenderingAttachmentLocationInfo hsl_att_location_info = {
-    .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO
-  };
-  VkRenderingInputAttachmentIndexInfo hsl_input_att_info = {
-    .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO
-  };
-  const bool hsl_use_dyn_local_read = tile_subpass_count > 0 && hina_tile_can_use_dynamic_local_read_layout(desc->tile_layout);
-  // For dynamic local read: colorAttachmentCount must equal total attachments in rendering
-  VkFormat hsl_dyn_formats[HINA_MAX_COLOR_ATTACHMENTS * HINA_MAX_TILE_SUBPASSES];
-  uint32_t hsl_color_att_count = color_count;
-  if (hsl_use_dyn_local_read)
-  {
-    const hina_tile_pass_layout* tile_layout = desc->tile_layout;
-    uint32_t total_attachments = hina_tile_count_total_attachments(tile_layout);
-    hsl_color_att_count = total_attachments;
-    for (uint32_t i = 0; i < total_attachments; i++) hsl_dyn_formats[i] = VK_FORMAT_UNDEFINED;
-    uint32_t start = 0;
-    for (uint32_t sp = 0; sp < desc->subpass_index; sp++) start += tile_layout->subpasses[sp].color_count;
-    for (uint32_t c = 0; c < color_count; c++) hsl_dyn_formats[start + c] = vk_color_formats[c];
-    for (uint32_t i = 0; i < total_attachments; i++) hsl_dyn_locations[i] = VK_ATTACHMENT_UNUSED;
-    for (uint32_t c = 0; c < color_count; c++) hsl_dyn_locations[start + c] = c;
-    hsl_att_location_info.colorAttachmentCount = total_attachments;
-    hsl_att_location_info.pColorAttachmentLocations = hsl_dyn_locations;
-    for (uint32_t i = 0; i < total_attachments; i++) hsl_dyn_input_indices[i] = VK_ATTACHMENT_UNUSED;
-    const hina_tile_subpass_layout* sp_layout = &tile_layout->subpasses[desc->subpass_index];
-    for (uint32_t ti = 0; ti < sp_layout->input_count; ti++)
-    {
-      const hina_tile_input* input = &sp_layout->tile_inputs[ti];
-      uint32_t global_idx = 0;
-      for (uint32_t sp = 0; sp < input->subpass_output_index; sp++) global_idx += tile_layout->subpasses[sp].color_count;
-      global_idx += input->attachment_index;
-      hsl_dyn_input_indices[global_idx] = ti;
-    }
-    hsl_input_att_info.colorAttachmentCount = total_attachments;
-    hsl_input_att_info.pColorAttachmentInputIndices = hsl_dyn_input_indices;
-    // Depth input: index follows color inputs (matches legacy subpass input attachment order)
-    uint32_t hsl_depth_input_idx = sp_layout->input_count;
-    hsl_input_att_info.pDepthInputAttachmentIndex = sp_layout->depth_input ? &hsl_depth_input_idx : NULL;
-    hsl_att_location_info.pNext = &hsl_input_att_info;
-    for (uint32_t i = 0; i < total_attachments; i++)
-    {
-      blend_attachments[i].blendEnable = VK_FALSE;
-      blend_attachments[i].colorWriteMask = 0;
-      blend_attachments[i].srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-      blend_attachments[i].dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-      blend_attachments[i].colorBlendOp = VK_BLEND_OP_ADD;
-      blend_attachments[i].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-      blend_attachments[i].dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-      blend_attachments[i].alphaBlendOp = VK_BLEND_OP_ADD;
-    }
-    for (uint32_t c = 0; c < color_count; c++)
-    {
-      uint32_t dst = start + c;
-      if (dst < total_attachments)
-      {
-        // Per-attachment blend: use blend[c] if independentBlend supported, else fallback to blend[0]
-        uint32_t blend_idx = g_device_caps.has_independent_blend ? c : 0;
-        blend_attachments[dst].colorWriteMask = (VkColorComponentFlags)desc->blend[blend_idx].color_write_mask;
-        if (blend_attachments[dst].colorWriteMask == 0)
-          blend_attachments[dst].colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        blend_attachments[dst].blendEnable = desc->blend[blend_idx].enable ? VK_TRUE : VK_FALSE;
-        blend_attachments[dst].srcColorBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].src_color);
-        blend_attachments[dst].dstColorBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].dst_color);
-        blend_attachments[dst].colorBlendOp = hina_blend_op_to_vk(desc->blend[blend_idx].color_op);
-        blend_attachments[dst].srcAlphaBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].src_alpha);
-        blend_attachments[dst].dstAlphaBlendFactor = hina_blend_factor_to_vk(desc->blend[blend_idx].dst_alpha);
-        blend_attachments[dst].alphaBlendOp = hina_blend_op_to_vk(desc->blend[blend_idx].alpha_op);
-      }
-    }
-    cb.attachmentCount = total_attachments;
-  }
-  VkPipelineRenderingCreateInfo rendering_info = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
-    .pNext = hsl_use_dyn_local_read ? &hsl_att_location_info : NULL, .colorAttachmentCount = hsl_color_att_count,
-    .pColorAttachmentFormats = hsl_use_dyn_local_read ? hsl_dyn_formats : vk_color_formats,
-    .depthAttachmentFormat = hina_format_to_vk(desc->depth_format),
-    .stencilAttachmentFormat = hina_format_to_vk(desc->stencil_format)
-  };
-  VkGraphicsPipelineCreateInfo ci = {
-    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-    .pNext = vkCmdBeginRendering ? (void*)&rendering_info : NULL, .stageCount = stage_count, .pStages = stages_ci,
-    .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pTessellationState = has_tcs ? &tess : NULL,
-    .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
-    .pColorBlendState = &cb, .pDynamicState = &dyn, .layout = layout
-  };
-  // Legacy render pass when:
-  // 1. Dynamic rendering is not available (!vkCmdBeginRendering), OR
-  // 2. This is a tile pass pipeline and dynamic local read can't be used
-  const bool need_legacy_rp = !vkCmdBeginRendering || (tile_subpass_count > 0 && !
-    hina_tile_can_use_dynamic_local_read_layout(desc->tile_layout));
-  if (need_legacy_rp)
-  {
-    VkRenderPass rp = VK_NULL_HANDLE;
-    // For tile pass pipelines (subpass_index > 0 or tile_layout provided),
-    // use the tile template render pass for proper subpass structure
-    if (tile_subpass_count > 0)
-    {
-      // Build format override from pipeline desc - this allows users to skip
-      // specifying formats in tile_layout for the current subpass
-      hina_tile_template_override override = {
-        .subpass_index = desc->subpass_index, .color_count = color_count,
-        .depth_format = hina_format_to_vk(desc->depth_format), .samples = hina_samples_to_vk(desc->samples)
-      };
-      for (uint32_t i = 0; i < color_count; i++) override.color_formats[i] = vk_color_formats[i];
-      rp = hina_legacy_get_cached_tile_template_render_pass(ctx, desc->tile_layout, &override);
-    }
-    else
-    {
-      // Use the actual color format from the pipeline descriptor, not the swapchain format
-      // This ensures render pass compatibility when rendering to offscreen targets
-      VkFormat legacy_color_fmt = color_count ? vk_color_formats[0] : VK_FORMAT_UNDEFINED;
-      VkFormat legacy_depth_fmt = hina_format_to_vk(desc->depth_format);
-      VkSampleCountFlagBits vk_samples = hina_samples_to_vk(desc->samples);
-      // Use COLOR_ATTACHMENT_OPTIMAL as final layout - explicit transitions handle the rest
-      HINA_LOGI(ctx, "Creating pipeline render pass (module): color_fmt=%d, depth_fmt=%d, samples=%d",
-                (int)legacy_color_fmt, (int)legacy_depth_fmt, (int)vk_samples);
-      rp = hina_legacy_get_cached_render_pass(ctx, NULL, legacy_color_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
-                                              VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_UNDEFINED,
-                                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_FORMAT_UNDEFINED,
-                                              legacy_depth_fmt, vk_samples, VK_ATTACHMENT_LOAD_OP_CLEAR,
-                                              VK_ATTACHMENT_STORE_OP_DONT_CARE);
-    }
-    if (!rp)
-    {
-      HINA_LOGE(ctx, "Failed to get legacy render pass for pipeline");
-      if (gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
-      if (tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-      if (tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-      vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-      if (fs_module) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
-      if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-      hina_destroy_pipeline_reflection(ctx, e->reflection);
-      e->reflection = NULL;
-      hina_pipeline_slot_free(idx);
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    ci.renderPass = rp;
-    ci.subpass = desc->subpass_index;
-  }
-  // Pipeline creation feedback (VK_EXT_pipeline_creation_feedback)
-  VkPipelineCreationFeedback gfx2_feedback = {0};
-  VkPipelineCreationFeedback gfx2_stage_feedbacks[5] = {0}; // VS, TCS, TES, GS, FS
-  VkPipelineCreationFeedbackCreateInfo gfx2_feedback_ci = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, .pNext = ci.pNext,
-    .pPipelineCreationFeedback = &gfx2_feedback, .pipelineStageCreationFeedbackCount = stage_count,
-    .pPipelineStageCreationFeedbacks = gfx2_stage_feedbacks
-  };
-  if (g_debug_caps.has_pipeline_creation_feedback) ci.pNext = &gfx2_feedback_ci;
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  VkResult result = vkCreateGraphicsPipelines(ctx->core.device->core.device, ctx->core.device->cache.pipeline_cache, 1,
-                                              &ci, NULL, &pipeline);
-  // Destroy temporary shader modules (cached modules are kept for reuse)
-  if (gs_is_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
-  if (tes_is_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-  if (tcs_is_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-  if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-  if (fs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
-  if (result != VK_SUCCESS)
-  {
+    if (gs_is_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
+    if (tes_is_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
+    if (tcs_is_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
+    if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
+    if (fs_is_temp && fs_module) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
     if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
     hina_destroy_pipeline_reflection(ctx, e->reflection);
     e->reflection = NULL;
     hina_pipeline_slot_free(idx);
-    // Resource pressure: out of memory is recoverable
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY)
-    {
-      HINA_LOGW(ctx, "vkCreateGraphicsPipelines failed: %s (resource pressure)", hina_vk_result_string(result));
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    // Fatal: any other error crashes immediately
-    fprintf(stderr, "[hina][FATAL] vkCreateGraphicsPipelines failed: %s\n  %s:%d\n",
-            hina_vk_result_string(result), __FILE__, __LINE__);
-    fflush(stderr);
-    abort();
+    return (hina_pipeline){HINA_INVALID_HANDLE};
   }
-  // Log pipeline creation feedback
-  hina_log_pipeline_creation_feedback(ctx, "Graphics", &gfx2_feedback, gfx2_stage_feedbacks, stage_count);
-  if (desc->label)
-  {
-    hina_set_object_name(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, desc->label);
-  }
-  else
-  {
-    hina_set_object_namef(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, "hina_graphics_pipeline[%u]", idx);
-  }
-  e->pipeline = pipeline;
-  e->layout = layout;
-  e->kind = HINA_PIPELINE_KIND_GRAPHICS;
-  e->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
-  e->required_set_mask = hina_compute_required_set_mask(e->reflection);
-  {
-    hina_format depth_format = desc->depth_format != HINA_FORMAT_UNDEFINED ? desc->depth_format : desc->stencil_format;
-    uint32_t samples = desc->samples ? (uint32_t)desc->samples : 1u;
-    e->kind_data.graphics.pass_layout = hina_pass_layout_make(desc->color_formats, color_count, depth_format, samples);
-  }
+  // Cleanup temp shader modules (cached modules are kept for reuse)
+  if (gs_is_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
+  if (tes_is_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
+  if (tcs_is_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
+  if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
+  if (fs_is_temp && fs_module) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
   HINA_LOGI(ctx, "=== Pipeline created from module successfully (id=%u) ===", handle.id);
-#ifdef HINA_DEBUG
-  if (desc->label) hina_debug_name_add(handle.id, VK_OBJECT_TYPE_PIPELINE, desc->label);
-#endif
   return handle;
 }
 
@@ -16648,75 +16301,16 @@ static hina_pipeline hina_make_compute_pipeline_internal(hina_context* ctx, cons
     hina_pipeline_slot_free(idx);
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
-  VkPipelineShaderStageCreateInfo stage = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-    .module = cs_module, .pName = "main"
-  };
   const hina_stage_specialization* cs_spec = hina_find_stage_specialization(
     desc->specializations, desc->specialization_count, HINA_SHADER_STAGE_COMPUTE);
-  VkSpecializationMapEntry cs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  uint8_t cs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  VkSpecializationInfo cs_spec_info = {0};
-  if (cs_spec)
-  {
-    hina_apply_stage_specialization(cs_spec, cs_spec_entries, cs_spec_data, &cs_spec_info);
-    if (cs_spec_info.mapEntryCount > 0) stage.pSpecializationInfo = &cs_spec_info;
-  }
-  VkComputePipelineCreateInfo ci = {
-    .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = stage, .layout = layout
+  hina_compute_pipeline_args args = {
+    .slot = e, .handle = handle, .idx = idx, .layout = layout,
+    .cs = cs_module, .cs_spec = cs_spec,
+    // Raw SPIR-V path: workgroup size unknown (would need additional reflection)
+    .local_size_x = 0, .local_size_y = 0, .local_size_z = 0,
   };
-  // Pipeline creation feedback (VK_EXT_pipeline_creation_feedback)
-  VkPipelineCreationFeedback comp2_feedback = {0};
-  VkPipelineCreationFeedback comp2_stage_feedback = {0};
-  VkPipelineCreationFeedbackCreateInfo comp2_feedback_ci = {
-    .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, .pPipelineCreationFeedback = &comp2_feedback,
-    .pipelineStageCreationFeedbackCount = 1, .pPipelineStageCreationFeedbacks = &comp2_stage_feedback
-  };
-  if (g_debug_caps.has_pipeline_creation_feedback) ci.pNext = &comp2_feedback_ci;
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  VkResult create_result = vkCreateComputePipelines(ctx->core.device->core.device,
-    ctx->core.device->cache.pipeline_cache, 1, &ci, NULL, &pipeline);
-  if (create_result != VK_SUCCESS)
-  {
-    if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-    if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
-    e->reflection = NULL;
-    hina_pipeline_slot_free(idx);
-    // Resource pressure: out of memory is recoverable
-    if (create_result == VK_ERROR_OUT_OF_DEVICE_MEMORY || create_result == VK_ERROR_OUT_OF_HOST_MEMORY)
-    {
-      HINA_LOGW(ctx, "vkCreateComputePipelines failed: %s (resource pressure)", hina_vk_result_string(create_result));
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    // Fatal: any other error crashes immediately
-    fprintf(stderr, "[hina][FATAL] vkCreateComputePipelines failed: %s\n  %s:%d\n",
-            hina_vk_result_string(create_result), __FILE__, __LINE__);
-    fflush(stderr);
-    abort();
-  }
-  // Log pipeline creation feedback
-  hina_log_pipeline_creation_feedback(ctx, "Compute", &comp2_feedback, &comp2_stage_feedback, 1);
-  // Note: Shader module is cached in shader struct - caller destroys via hina_destroy_shader()
-  if (desc->label)
-  {
-    hina_set_object_name(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, desc->label);
-  }
-  else
-  {
-    hina_set_object_namef(ctx, (uint64_t)pipeline, VK_OBJECT_TYPE_PIPELINE, "hina_compute_pipeline[%u]", idx);
-  }
-  e->pipeline = pipeline;
-  e->layout = layout;
-  e->kind = HINA_PIPELINE_KIND_COMPUTE;
-  e->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
-  e->required_set_mask = hina_compute_required_set_mask(e->reflection);
-  // Raw SPIR-V path: workgroup size unknown (would need additional reflection)
-  e->kind_data.compute.local_size_x = 0;
-  e->kind_data.compute.local_size_y = 0;
-  e->kind_data.compute.local_size_z = 0;
-#ifdef HINA_DEBUG
-  if (desc->label) hina_debug_name_add(handle.id, VK_OBJECT_TYPE_PIPELINE, desc->label);
-#endif
+  VkPipeline pipeline = hina_build_compute_pipeline(ctx, &args, desc->label);
+  if (!pipeline) return (hina_pipeline){HINA_INVALID_HANDLE};
   return handle;
 }
 
@@ -18561,11 +18155,17 @@ bool hina_begin_tile_pass(hina_cmd* cmd, const hina_tile_pass_desc* desc)
   hina_validate_tile_pass_desc(desc);
 #endif
   (void)subpass_count; // Used in assert above
+  // Debug label for tile pass (visible in GPU debuggers like RenderDoc)
+  cmd->tile.has_label = desc->label != NULL;
+  if (desc->label) hina_cmd_begin_label(cmd, desc->label, NULL);
   // Choose backend: dynamic local read if supported, fall back to legacy if depth_input unsupported
   const bool use_dynamic = hina_tile_can_use_dynamic_local_read_desc(desc);
   cmd->tile.uses_dynamic = use_dynamic;
-  if (use_dynamic) return hina_begin_tile_pass_dynamic(cmd, desc);
-  else return hina_begin_tile_pass_legacy(cmd, desc);
+  bool ok;
+  if (use_dynamic) ok = hina_begin_tile_pass_dynamic(cmd, desc);
+  else ok = hina_begin_tile_pass_legacy(cmd, desc);
+  if (!ok && cmd->tile.has_label) { hina_cmd_end_label(cmd); cmd->tile.has_label = false; }
+  return ok;
 }
 
 void hina_tile_pass_next(hina_cmd* cmd, const hina_tile_pass_desc* desc)
@@ -18583,6 +18183,9 @@ void hina_tile_pass_next(hina_cmd* cmd, const hina_tile_pass_desc* desc)
 #endif
   if (cmd->tile.uses_dynamic) hina_tile_pass_next_dynamic(cmd, desc);
   else hina_tile_pass_next_legacy(cmd, desc);
+  // Insert debug label for the new subpass (current_subpass was incremented by backend)
+  const char* sp_label = desc->subpasses[cmd->tile.current_subpass].label;
+  if (sp_label) hina_cmd_insert_label(cmd, sp_label, NULL);
 }
 
 void hina_end_tile_pass(hina_cmd* cmd)
@@ -18590,6 +18193,7 @@ void hina_end_tile_pass(hina_cmd* cmd)
   HINA_ASSERT(cmd && cmd->recording && cmd->tile.active);
   if (cmd->tile.uses_dynamic) hina_end_tile_pass_dynamic(cmd);
   else hina_end_tile_pass_legacy(cmd);
+  if (cmd->tile.has_label) { hina_cmd_end_label(cmd); cmd->tile.has_label = false; }
 }
 
 void hina_cmd_push_constants(hina_cmd* cmd, uint32_t offset, uint32_t size, const void* data)
@@ -18774,13 +18378,13 @@ void hina_cmd_bind_pipeline(hina_cmd* cmd, hina_pipeline pip)
       cmd->dynamic_state.blend_constants[2] = target_blend[2];
       cmd->dynamic_state.blend_constants[3] = target_blend[3];
     }
-    // Depth bias enable (1.3/ext): only set if different
+    // Depth bias enable (1.3/ext): set from pipeline's stored depth_bias_enable
     if (vkCmdSetDepthBiasEnable)
     {
-      const bool target_bias_enable = false;
+      const bool target_bias_enable = e->depth_bias_enable != 0;
       if (cmd->dynamic_state.depth_bias_enable != target_bias_enable)
       {
-        vkCmdSetDepthBiasEnable(cmd->vk_cmd, VK_FALSE);
+        vkCmdSetDepthBiasEnable(cmd->vk_cmd, target_bias_enable ? VK_TRUE : VK_FALSE);
         cmd->dynamic_state.depth_bias_enable = target_bias_enable;
       }
     }
