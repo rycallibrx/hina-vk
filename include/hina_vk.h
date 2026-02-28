@@ -198,6 +198,7 @@ extern "C" {
 #define HINA_MAX_DESCRIPTOR_SETS 4u         // maxBoundDescriptorSets (Vk1.0 min: 4)
 #define HINA_MAX_TILE_INPUTS 4u             // Max input attachments per subpass
 #define HINA_MAX_TILE_SUBPASSES 4u          // Max subpasses in a tile pass
+#define HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES 12u // Max entries per bind group layout
 #define HINA_STAGE_VERTEX        HINA_FLAG_BIT(0)
 #define HINA_STAGE_TESS_CONTROL  HINA_FLAG_BIT(1)
 #define HINA_STAGE_TESS_EVAL     HINA_FLAG_BIT(2)
@@ -1665,7 +1666,7 @@ typedef struct hina_bind_group_layout_entry
 typedef struct hina_bind_group_layout_desc
 {
   const hina_bind_group_layout_entry* entries;
-  uint32_t entry_count; // Max 12 entries per layout
+  uint32_t entry_count; // Max HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES entries per layout
   const char* label; // Optional debug label
 } hina_bind_group_layout_desc;
 

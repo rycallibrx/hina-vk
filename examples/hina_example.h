@@ -202,6 +202,7 @@ struct hina_example_app {
     int frame_count;
     int max_frames;
     float max_seconds;
+    int warmup_frames;
 
     // Executable path for asset loading (desktop only, nullptr on Android)
     const char* exe_path;
@@ -298,6 +299,7 @@ struct hina_example_config {
     bool vsync;
     int max_frames;
     float max_seconds;
+    int warmup_frames;     // Frames to skip before collecting perf stats (default: 120)
     const char* exe_path;  // argv[0] for asset path resolution (desktop only)
 };
 
@@ -332,6 +334,9 @@ struct hina_example_config {
 #ifndef HINA_EXAMPLE_DEFAULT_MAX_SECONDS
 #define HINA_EXAMPLE_DEFAULT_MAX_SECONDS 0.0f
 #endif
+#ifndef HINA_EXAMPLE_DEFAULT_WARMUP_FRAMES
+#define HINA_EXAMPLE_DEFAULT_WARMUP_FRAMES 120
+#endif
 
 inline hina_example_config hina_example_config_default() {
     hina_example_config cfg = {};
@@ -346,6 +351,7 @@ inline hina_example_config hina_example_config_default() {
     cfg.vsync = (HINA_EXAMPLE_DEFAULT_VSYNC != 0);
     cfg.max_frames = HINA_EXAMPLE_DEFAULT_MAX_FRAMES;
     cfg.max_seconds = HINA_EXAMPLE_DEFAULT_MAX_SECONDS;
+    cfg.warmup_frames = HINA_EXAMPLE_DEFAULT_WARMUP_FRAMES;
     return cfg;
 }
 
@@ -363,6 +369,7 @@ inline void hina_example_print_usage(const char* prog_name) {
     printf("  --vsync / --no-vsync  Enable/disable vsync\n");
     printf("  --frames=N            Exit after N frames\n");
     printf("  --duration=N          Exit after N seconds\n");
+    printf("  --warmup=N            Skip first N frames from perf stats (default: 120)\n");
     printf("  --width=N --height=N  Window dimensions\n");
     printf("  --debug-no-sync2      Force legacy vkQueueSubmit/vkCmdPipelineBarrier\n");
     printf("  --separate-families   Force compute to separate queue family (tests ownership)\n");
@@ -394,6 +401,7 @@ inline bool hina_example_parse_args(hina_example_config* cfg, int argc, char** a
         else if (strcmp(arg, "--no-vsync") == 0) cfg->vsync = false;
         else if (strncmp(arg, "--frames=", 9) == 0) cfg->max_frames = atoi(arg + 9);
         else if (strncmp(arg, "--duration=", 11) == 0) cfg->max_seconds = static_cast<float>(atof(arg + 11));
+        else if (strncmp(arg, "--warmup=", 9) == 0) cfg->warmup_frames = atoi(arg + 9);
         else if (strncmp(arg, "--width=", 8) == 0) cfg->width = atoi(arg + 8);
         else if (strncmp(arg, "--height=", 9) == 0) cfg->height = atoi(arg + 9);
         else {
@@ -888,6 +896,7 @@ inline bool hina_example_init(hina_example_app* app, const hina_example_config* 
     app->start_time = app->last_time;
     app->max_frames = cfg->max_frames;
     app->max_seconds = cfg->max_seconds;
+    app->warmup_frames = cfg->warmup_frames;
     app->exe_path = cfg->exe_path;
 
     // SDL Initialization

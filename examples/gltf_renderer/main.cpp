@@ -1736,12 +1736,11 @@ int main(int argc, char** argv) {
 
     // Performance statistics tracking
     hina_perf_stats perf;
-    hina_perf_stats_init(&perf);
+    hina_perf_stats_init(&perf, app.warmup_frames > 0 ? (uint32_t)app.warmup_frames : 120u);
 
     while (hina_example_poll(&app)) {
         // Update perf stats with frame time from previous frame
         hina_perf_stats_update(&perf, app.delta_time);
-        auto frame_start = std::chrono::high_resolution_clock::now();
 
         // Only update camera if ImGui doesn't want the mouse
         if (!hina_example_ui_want_mouse(&app)) {
@@ -2004,13 +2003,6 @@ int main(int argc, char** argv) {
 
         // Frame timing
         frame_count++;
-        auto frame_end_time = std::chrono::high_resolution_clock::now();
-        double frame_ms = std::chrono::duration<double, std::milli>(frame_end_time - frame_start).count();
-
-        // Stall detection: warn if frame took > 100ms (indicates blocking)
-        if (frame_ms > 100.0) {
-            printf("WARNING: Frame %u took %.2f ms - possible stall!\n", frame_count, frame_ms);
-        }
     }
 
     // Print final performance summary

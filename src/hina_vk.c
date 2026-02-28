@@ -1263,17 +1263,17 @@ typedef struct HINA_ALIGN(64) hina_desc_layout_slot
   uint16_t generation; // 2
   uint16_t next_free; // 2
   uint8_t in_use; // 1
-  uint8_t entry_count; // 1: Number of entries in this layout (max 12)
+  uint8_t entry_count; // 1: Number of entries in this layout (max HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES)
   uint8_t dynamic_count; // 1: Number of dynamic offset bindings
   uint8_t borrowed; // 1: If true, don't destroy layout on free (borrowed from pipeline)
-  // Entry metadata for validation (max 12 entries, 4B each = 48B)
+  // Entry metadata for validation (max HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES entries, 4B each = 48B)
   struct
   {
     uint8_t type; // hina_binding_type
     uint8_t flags; // Low bits: hina_binding_flags, high bits: HINA_STAGE_* mask
     uint8_t binding; // Binding index
     uint8_t count; // Array count
-  } entries[12]; // 48
+  } entries[HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES]; // 48
 } hina_desc_layout_slot;
 
 HINA_STATIC_ASSERT(sizeof(hina_desc_layout_slot) == 64, hina_desc_layout_slot_must_be_64_bytes);
@@ -3580,6 +3580,13 @@ static void hina_flush_zombies_locked(hina_context* ctx, uint32_t frame_index)
 static void hina_flush_zombies(hina_context* ctx, uint32_t frame_index)
 {
   hina_device* dev = ctx->core.device;
+  /* Fast path: skip the mutex entirely when the list is empty.
+     On the timeline semaphore path (modern hardware), per-frame zombie lists
+     are never populated — all destruction goes through per-lane zombie rings.
+     The plain read of count is benign: count is only modified under zombie_lock,
+     and a naturally-aligned 32-bit read cannot tear on x86/ARM. A stale zero is
+     harmless — the next call will see the updated value. */
+  if (dev->sync.zombies[frame_index].state.count == 0) return;
   mtx_lock(&dev->lock.zombie_lock);
   hina_flush_zombies_locked(ctx, frame_index);
   mtx_unlock(&dev->lock.zombie_lock);
@@ -5639,72 +5646,6 @@ static uint16_t hina_calc_mip_levels(uint32_t width, uint32_t height, uint32_t d
 }
 
 // Convert VkFormat back to hina_format
-static hina_format hina_vk_format_to_hina(VkFormat fmt)
-{
-  switch (fmt)
-  {
-  case VK_FORMAT_R8_UNORM: return HINA_FORMAT_R8_UNORM;
-  case VK_FORMAT_R8_SNORM: return HINA_FORMAT_R8_SNORM;
-  case VK_FORMAT_R8_UINT: return HINA_FORMAT_R8_UINT;
-  case VK_FORMAT_R8_SINT: return HINA_FORMAT_R8_SINT;
-  case VK_FORMAT_R8G8_UNORM: return HINA_FORMAT_R8G8_UNORM;
-  case VK_FORMAT_R8G8_SNORM: return HINA_FORMAT_R8G8_SNORM;
-  case VK_FORMAT_R8G8_UINT: return HINA_FORMAT_R8G8_UINT;
-  case VK_FORMAT_R8G8_SINT: return HINA_FORMAT_R8G8_SINT;
-  case VK_FORMAT_R8G8B8_UNORM: return HINA_FORMAT_R8G8B8_UNORM;
-  case VK_FORMAT_R8G8B8_SNORM: return HINA_FORMAT_R8G8B8_SNORM;
-  case VK_FORMAT_R8G8B8_UINT: return HINA_FORMAT_R8G8B8_UINT;
-  case VK_FORMAT_R8G8B8_SINT: return HINA_FORMAT_R8G8B8_SINT;
-  case VK_FORMAT_R8G8B8A8_UNORM: return HINA_FORMAT_R8G8B8A8_UNORM;
-  case VK_FORMAT_R8G8B8A8_SNORM: return HINA_FORMAT_R8G8B8A8_SNORM;
-  case VK_FORMAT_R8G8B8A8_UINT: return HINA_FORMAT_R8G8B8A8_UINT;
-  case VK_FORMAT_R8G8B8A8_SINT: return HINA_FORMAT_R8G8B8A8_SINT;
-  case VK_FORMAT_R8G8B8A8_SRGB: return HINA_FORMAT_R8G8B8A8_SRGB;
-  case VK_FORMAT_B8G8R8A8_UNORM: return HINA_FORMAT_B8G8R8A8_UNORM;
-  case VK_FORMAT_B8G8R8A8_SRGB: return HINA_FORMAT_B8G8R8A8_SRGB;
-  case VK_FORMAT_R16_UNORM: return HINA_FORMAT_R16_UNORM;
-  case VK_FORMAT_R16_SNORM: return HINA_FORMAT_R16_SNORM;
-  case VK_FORMAT_R16_UINT: return HINA_FORMAT_R16_UINT;
-  case VK_FORMAT_R16_SINT: return HINA_FORMAT_R16_SINT;
-  case VK_FORMAT_R16_SFLOAT: return HINA_FORMAT_R16_SFLOAT;
-  case VK_FORMAT_R16G16_UNORM: return HINA_FORMAT_R16G16_UNORM;
-  case VK_FORMAT_R16G16_SNORM: return HINA_FORMAT_R16G16_SNORM;
-  case VK_FORMAT_R16G16_UINT: return HINA_FORMAT_R16G16_UINT;
-  case VK_FORMAT_R16G16_SINT: return HINA_FORMAT_R16G16_SINT;
-  case VK_FORMAT_R16G16_SFLOAT: return HINA_FORMAT_R16G16_SFLOAT;
-  case VK_FORMAT_R16G16B16_UNORM: return HINA_FORMAT_R16G16B16_UNORM;
-  case VK_FORMAT_R16G16B16_SNORM: return HINA_FORMAT_R16G16B16_SNORM;
-  case VK_FORMAT_R16G16B16_UINT: return HINA_FORMAT_R16G16B16_UINT;
-  case VK_FORMAT_R16G16B16_SINT: return HINA_FORMAT_R16G16B16_SINT;
-  case VK_FORMAT_R16G16B16_SFLOAT: return HINA_FORMAT_R16G16B16_SFLOAT;
-  case VK_FORMAT_R16G16B16A16_UNORM: return HINA_FORMAT_R16G16B16A16_UNORM;
-  case VK_FORMAT_R16G16B16A16_SNORM: return HINA_FORMAT_R16G16B16A16_SNORM;
-  case VK_FORMAT_R16G16B16A16_UINT: return HINA_FORMAT_R16G16B16A16_UINT;
-  case VK_FORMAT_R16G16B16A16_SINT: return HINA_FORMAT_R16G16B16A16_SINT;
-  case VK_FORMAT_R16G16B16A16_SFLOAT: return HINA_FORMAT_R16G16B16A16_SFLOAT;
-  case VK_FORMAT_R32_UINT: return HINA_FORMAT_R32_UINT;
-  case VK_FORMAT_R32_SINT: return HINA_FORMAT_R32_SINT;
-  case VK_FORMAT_R32_SFLOAT: return HINA_FORMAT_R32_SFLOAT;
-  case VK_FORMAT_R32G32_UINT: return HINA_FORMAT_R32G32_UINT;
-  case VK_FORMAT_R32G32_SINT: return HINA_FORMAT_R32G32_SINT;
-  case VK_FORMAT_R32G32_SFLOAT: return HINA_FORMAT_R32G32_SFLOAT;
-  case VK_FORMAT_R32G32B32_UINT: return HINA_FORMAT_R32G32B32_UINT;
-  case VK_FORMAT_R32G32B32_SINT: return HINA_FORMAT_R32G32B32_SINT;
-  case VK_FORMAT_R32G32B32_SFLOAT: return HINA_FORMAT_R32G32B32_SFLOAT;
-  case VK_FORMAT_R32G32B32A32_UINT: return HINA_FORMAT_R32G32B32A32_UINT;
-  case VK_FORMAT_R32G32B32A32_SINT: return HINA_FORMAT_R32G32B32A32_SINT;
-  case VK_FORMAT_R32G32B32A32_SFLOAT: return HINA_FORMAT_R32G32B32A32_SFLOAT;
-  case VK_FORMAT_D16_UNORM: return HINA_FORMAT_D16_UNORM;
-  case VK_FORMAT_X8_D24_UNORM_PACK32: return HINA_FORMAT_X8_D24_UNORM_PACK32;
-  case VK_FORMAT_D32_SFLOAT: return HINA_FORMAT_D32_SFLOAT;
-  case VK_FORMAT_S8_UINT: return HINA_FORMAT_S8_UINT;
-  case VK_FORMAT_D16_UNORM_S8_UINT: return HINA_FORMAT_D16_UNORM_S8_UINT;
-  case VK_FORMAT_D24_UNORM_S8_UINT: return HINA_FORMAT_D24_UNORM_S8_UINT;
-  case VK_FORMAT_D32_SFLOAT_S8_UINT: return HINA_FORMAT_D32_SFLOAT_S8_UINT;
-  default: return HINA_FORMAT_UNDEFINED;
-  }
-}
-
 static HINA_INLINE bool hina_format_is_integer(hina_format fmt)
 {
   switch (fmt)
@@ -5741,7 +5682,7 @@ static HINA_INLINE bool hina_format_is_integer(hina_format fmt)
 
 static HINA_INLINE bool hina_vk_format_is_integer(VkFormat fmt)
 {
-  hina_format hfmt = hina_vk_format_to_hina(fmt);
+  hina_format hfmt = hina_format_from_vk(fmt);
   return hfmt != HINA_FORMAT_UNDEFINED && hina_format_is_integer(hfmt);
 }
 
@@ -6200,10 +6141,6 @@ static uint32_t hina_queue_to_family(hina_context* ctx, hina_queue queue)
   }
   return ctx->core.device->queue.graphics_family;
 }
-
-static VkAttachmentLoadOp hina_load_to_vk(uint8_t op) { return (VkAttachmentLoadOp)op; }
-
-static VkAttachmentStoreOp hina_store_to_vk(uint8_t op) { return (VkAttachmentStoreOp)op; }
 
 static VkStencilOp hina_stencil_op_to_vk(uint8_t op) { return (VkStencilOp)op; }
 
@@ -8754,49 +8691,51 @@ static void hina_log_enabled_features(hina_context* ctx)
   HINA_LOGI(ctx, "=========================================");
 }
 
+// Canonical descriptor type table — base counts are for the temp pool (1x).
+// Main pool uses 4x multiplier, temp pool uses 1x.
+static const struct { VkDescriptorType type; uint32_t base_count; } g_desc_pool_type_table[] = {
+  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
+  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128},          {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256},
+  {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 256}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256},
+  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 256}, {VK_DESCRIPTOR_TYPE_SAMPLER, 128},
+  {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 64}
+};
+
+static VkDescriptorPool hina_create_descriptor_pool_from_table(
+    hina_context* ctx, uint32_t multiplier, uint32_t max_sets,
+    VkDescriptorPoolCreateFlags flags, const char* label)
+{
+  VkDescriptorPoolSize sizes[HINA_ARRAY_SIZE(g_desc_pool_type_table)];
+  for (uint32_t i = 0; i < HINA_ARRAY_SIZE(g_desc_pool_type_table); ++i)
+  {
+    sizes[i].type = g_desc_pool_type_table[i].type;
+    sizes[i].descriptorCount = g_desc_pool_type_table[i].base_count * multiplier;
+  }
+  const VkDescriptorPoolCreateInfo ci = {
+    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .flags = flags,
+    .maxSets = max_sets, .poolSizeCount = (uint32_t)HINA_ARRAY_SIZE(sizes), .pPoolSizes = sizes
+  };
+  VkDescriptorPool pool = VK_NULL_HANDLE;
+  if (!HINA_VK_CHECK_MSG(ctx, vkCreateDescriptorPool(ctx->core.device->core.device, &ci, NULL, &pool), "creating %s", label))
+    return VK_NULL_HANDLE;
+  hina_set_object_namef(ctx, (uint64_t)pool, VK_OBJECT_TYPE_DESCRIPTOR_POOL, "%s", label);
+  return pool;
+}
+
 static bool hina_init_descriptor_pool(hina_context* ctx)
 {
   if (ctx->core.device->descriptor_pool) return true;
-  hina_device* dev = ctx->core.device;
-  VkDescriptorPoolSize sizes[] = {
-    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2048}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
-    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 512}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1024},
-    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024},
-    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512},
-    {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 256}
-  };
-  const VkDescriptorPoolCreateInfo ci = {
-    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-    .maxSets = 1024, .poolSizeCount = (uint32_t)HINA_ARRAY_SIZE(sizes), .pPoolSizes = sizes
-  };
-  if (!HINA_VK_CHECK_MSG(ctx, vkCreateDescriptorPool(dev->core.device, &ci, NULL, &dev->descriptor_pool),
-                         "creating descriptor pool")) return false;
-  hina_set_object_namef(ctx, (uint64_t)dev->descriptor_pool, VK_OBJECT_TYPE_DESCRIPTOR_POOL, "hina_desc_pool_main");
-  return true;
+  ctx->core.device->descriptor_pool = hina_create_descriptor_pool_from_table(
+      ctx, 4, 1024, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, "hina_desc_pool_main");
+  return ctx->core.device->descriptor_pool != VK_NULL_HANDLE;
 }
 
 static VkDescriptorPool hina_create_temp_descriptor_pool(hina_context* ctx)
 {
   // Per-frame temp pools are reset in bulk, no per-set frees.
-  VkDescriptorPoolSize sizes[] = {
-    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256},
-    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128}, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256},
-    {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 256}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256},
-    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 256}, {VK_DESCRIPTOR_TYPE_SAMPLER, 128},
-    {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 64}
-  };
-  const VkDescriptorPoolCreateInfo ci = {
-    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 256,
-    .poolSizeCount = (uint32_t)HINA_ARRAY_SIZE(sizes), .pPoolSizes = sizes
-  };
-  VkDescriptorPool pool = VK_NULL_HANDLE;
-  if (!HINA_VK_CHECK_MSG(ctx, vkCreateDescriptorPool(ctx->core.device->core.device, &ci, NULL, &pool),
-                         "creating temp descriptor pool"))
-  {
-    return VK_NULL_HANDLE;
-  }
-  hina_set_object_namef(ctx, (uint64_t)pool, VK_OBJECT_TYPE_DESCRIPTOR_POOL, "hina_desc_pool_temp_ctx=%p", (void*)ctx);
-  return pool;
+  char label[64];
+  snprintf(label, sizeof(label), "hina_desc_pool_temp_ctx=%p", (void*)ctx);
+  return hina_create_descriptor_pool_from_table(ctx, 1, 256, 0, label);
 }
 
 static bool hina_init_pipeline_cache(hina_context* ctx, const hina_desc* desc)
@@ -9134,15 +9073,12 @@ hina_pipeline_desc hina_pipeline_desc_default(void)
 
 hina_hsl_pipeline_desc hina_hsl_pipeline_desc_default(void)
 {
-  hina_blend_state default_blend = hina_blend_state_default();
-  return (hina_hsl_pipeline_desc){
-    .blend = { default_blend, default_blend, default_blend, default_blend },
-    .depth = hina_depth_stencil_state_default(),
-    .primitive_topology = HINA_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, .polygon_mode = HINA_POLYGON_MODE_FILL,
-    .cull_mode = HINA_CULL_MODE_BACK, .front_face = HINA_FRONT_FACE_COUNTER_CLOCKWISE,
-    .samples = HINA_SAMPLE_COUNT_1_BIT,
-    // color_formats must be set explicitly - use hina_get_surface_format() for swapchain rendering
-  };
+  // Layout compatibility proven by HINA_STATIC_ASSERTs near hina_build_graphics_pipeline:
+  // hina_hsl_pipeline_desc == tail of hina_pipeline_desc starting at .layout
+  hina_pipeline_desc d = hina_pipeline_desc_default();
+  hina_hsl_pipeline_desc h;
+  memcpy(&h, &d.layout, sizeof(h));
+  return h;
 }
 
 // Forward declaration (defined later in swapchain section)
@@ -10095,6 +10031,55 @@ HINA_NOINLINE static VkResult hina_staging_submit_fence_impl(hina_queue_lane* la
   return result;
 }
 
+// Timeline submit helper: lock lane, bump signal, submit, unlock, encode ticket.
+// Returns true on success, writes encoded ticket to *out_ticket.
+// wait_sem=VK_NULL_HANDLE and wait_value=0 means no dependency.
+static bool hina_staging_submit_timeline_queue(
+    hina_context* ctx, int8_t lane_idx_raw, VkCommandBuffer cmd,
+    VkSemaphore wait_sem, uint64_t wait_value, VkPipelineStageFlags wait_stage,
+    hina_ticket* out_ticket, const char* label)
+{
+  int8_t lane_idx = lane_idx_raw;
+  if (lane_idx < 0) lane_idx = 0;
+  hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
+  hina_lane_lock(lane);
+  uint64_t signal_value = lane->last_signaled + 1;
+  VkResult result = hina_staging_submit_timeline_impl(lane, cmd, wait_sem, wait_value, wait_stage, signal_value);
+  if (result == VK_SUCCESS)
+  {
+    lane->last_signaled = signal_value;
+    lane->submit_count++;
+  }
+  hina_lane_unlock(lane);
+  if (result != VK_SUCCESS)
+  {
+    HINA_LOGE(ctx, "Staging %s submit failed: %d", label, result);
+    return false;
+  }
+  hina_atomic_inc64(&ctx->core.device->sync.timeline.value);
+  *out_ticket = hina_ticket_encode((uint8_t)lane_idx, signal_value);
+  return true;
+}
+
+// Resolves a ticket dependency into a wait semaphore/value pair.
+// Returns true if a valid dependency was found.
+static HINA_INLINE bool hina_staging_resolve_timeline_dep(
+    hina_context* ctx, hina_ticket dep_ticket,
+    VkSemaphore* out_sem, uint64_t* out_value)
+{
+  if (!dep_ticket) return false;
+  uint8_t dep_lane = hina_ticket_lane(dep_ticket);
+  uint64_t dep_value = hina_ticket_value(dep_ticket);
+  hina_queue_lane* dep = &ctx->core.device->queue.lanes.lanes[dep_lane];
+  if (dep->valid && dep->timeline)
+  {
+    *out_sem = dep->timeline;
+    *out_value = dep_value;
+    return true;
+  }
+  return false;
+}
+
 static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
 {
   hina_staging_context* sc = &ctx->staging;
@@ -10144,111 +10129,33 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
   {
     if (has_xfer_pending)
     {
-      int8_t lane_idx = (int8_t)sc->lane_idx;
-      if (lane_idx < 0) lane_idx = 0;
-      hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
-      hina_lane_lock(lane);
-      uint64_t signal_value = lane->last_signaled + 1;
-      VkResult result = hina_staging_submit_timeline_impl(lane, sc->vk_cmd, VK_NULL_HANDLE, 0, 0, signal_value);
-      if (result == VK_SUCCESS)
-      {
-        lane->last_signaled = signal_value;
-        lane->submit_count++;
-      }
-      hina_lane_unlock(lane);
-      if (result != VK_SUCCESS)
-      {
-        HINA_LOGE(ctx, "Staging submit failed: %d", result);
+      if (!hina_staging_submit_timeline_queue(ctx, (int8_t)sc->lane_idx, sc->vk_cmd,
+              VK_NULL_HANDLE, 0, 0, &transfer_ticket, "transfer"))
         return 0;
-      }
-      hina_atomic_inc64(&ctx->core.device->sync.timeline.value);
-      transfer_ticket = hina_ticket_encode((uint8_t)lane_idx, signal_value);
       sc->last_submit_ticket = transfer_ticket;
     }
     if (has_gfx_pending)
     {
-      int8_t lane_idx = (int8_t)sc->gfx_lane_idx;
-      if (lane_idx < 0) lane_idx = 0;
-      hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
       VkSemaphore wait_sem = VK_NULL_HANDLE;
       uint64_t wait_value = 0;
-      if (split_gfx && transfer_ticket)
-      {
-        uint8_t dep_lane = hina_ticket_lane(transfer_ticket);
-        uint64_t dep_value = hina_ticket_value(transfer_ticket);
-        hina_queue_lane* dep = &ctx->core.device->queue.lanes.lanes[dep_lane];
-        if (dep->valid && dep->timeline)
-        {
-          wait_sem = dep->timeline;
-          wait_value = dep_value;
-        }
-      }
-      hina_lane_lock(lane);
-      uint64_t signal_value = lane->last_signaled + 1;
-      VkResult result = hina_staging_submit_timeline_impl(lane, sc->gfx_vk_cmd, wait_sem, wait_value,
-                                                          VK_PIPELINE_STAGE_TRANSFER_BIT, signal_value);
-      if (result == VK_SUCCESS)
-      {
-        lane->last_signaled = signal_value;
-        lane->submit_count++;
-      }
-      hina_lane_unlock(lane);
-      if (result != VK_SUCCESS)
-      {
-        HINA_LOGE(ctx, "Staging graphics submit failed: %d", result);
+      if (split_gfx)
+        hina_staging_resolve_timeline_dep(ctx, transfer_ticket, &wait_sem, &wait_value);
+      if (!hina_staging_submit_timeline_queue(ctx, (int8_t)sc->gfx_lane_idx, sc->gfx_vk_cmd,
+              wait_sem, wait_value, VK_PIPELINE_STAGE_TRANSFER_BIT, &gfx_ticket, "graphics"))
         return 0;
-      }
-      hina_atomic_inc64(&ctx->core.device->sync.timeline.value);
-      gfx_ticket = hina_ticket_encode((uint8_t)lane_idx, signal_value);
       sc->last_gfx_submit_ticket = gfx_ticket;
     }
     if (has_comp_pending)
     {
-      int8_t lane_idx = (int8_t)sc->comp_lane_idx;
-      if (lane_idx < 0) lane_idx = 0;
-      hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
       VkSemaphore wait_sem = VK_NULL_HANDLE;
       uint64_t wait_value = 0;
-      VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-      if (chain_comp_after_gfx && gfx_ticket)
-      {
-        uint8_t dep_lane = hina_ticket_lane(gfx_ticket);
-        uint64_t dep_value = hina_ticket_value(gfx_ticket);
-        hina_queue_lane* dep = &ctx->core.device->queue.lanes.lanes[dep_lane];
-        if (dep->valid && dep->timeline)
-        {
-          wait_sem = dep->timeline;
-          wait_value = dep_value;
-        }
-      }
-      else if (split_comp && transfer_ticket)
-      {
-        uint8_t dep_lane = hina_ticket_lane(transfer_ticket);
-        uint64_t dep_value = hina_ticket_value(transfer_ticket);
-        hina_queue_lane* dep = &ctx->core.device->queue.lanes.lanes[dep_lane];
-        if (dep->valid && dep->timeline)
-        {
-          wait_sem = dep->timeline;
-          wait_value = dep_value;
-        }
-      }
-      hina_lane_lock(lane);
-      uint64_t signal_value = lane->last_signaled + 1;
-      VkResult result = hina_staging_submit_timeline_impl(lane, sc->comp_vk_cmd, wait_sem, wait_value, wait_stage,
-                                                          signal_value);
-      if (result == VK_SUCCESS)
-      {
-        lane->last_signaled = signal_value;
-        lane->submit_count++;
-      }
-      hina_lane_unlock(lane);
-      if (result != VK_SUCCESS)
-      {
-        HINA_LOGE(ctx, "Staging compute submit failed: %d", result);
+      if (chain_comp_after_gfx)
+        hina_staging_resolve_timeline_dep(ctx, gfx_ticket, &wait_sem, &wait_value);
+      else if (split_comp)
+        hina_staging_resolve_timeline_dep(ctx, transfer_ticket, &wait_sem, &wait_value);
+      if (!hina_staging_submit_timeline_queue(ctx, (int8_t)sc->comp_lane_idx, sc->comp_vk_cmd,
+              wait_sem, wait_value, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, &comp_ticket, "compute"))
         return 0;
-      }
-      hina_atomic_inc64(&ctx->core.device->sync.timeline.value);
-      comp_ticket = hina_ticket_encode((uint8_t)lane_idx, signal_value);
       sc->last_comp_submit_ticket = comp_ticket;
     }
   }
@@ -11578,19 +11485,27 @@ void* hina_mapped_buffer_ptr(hina_buffer buf)
   return hot->vk.mapped;
 }
 
-static void hina_ctx_flush_buffer(hina_context* ctx, hina_buffer buf, size_t offset, size_t size)
+static HINA_INLINE void hina_ctx_flush_or_invalidate_buffer(hina_context* ctx, hina_buffer buf, size_t offset, size_t size, bool flush)
 {
-  HINA_ASSERTF(hina_buffer_slot_valid(buf), "[%s] hina_flush_buffer: invalid buffer handle",
+  HINA_ASSERTF(hina_buffer_slot_valid(buf), "[%s] hina_flush_or_invalidate_buffer: invalid buffer handle",
                hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
   uint16_t idx = hina_id_index(buf.id);
   hina_buffer_hot* hot = HINA_BUF_HOT(idx);
   HINA_ASSERTF((hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_VISIBLE) != 0,
-               "[%s] hina_flush_buffer: buffer is not host-visible (HINA_BUFFER_GPU)",
+               "[%s] hina_flush_or_invalidate_buffer: buffer is not host-visible (HINA_BUFFER_GPU)",
                hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
   // Early-out for coherent memory (no-op, always safe to call)
   if (hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_COHERENT) return;
-  VkDeviceSize flush_size = size ? size : VK_WHOLE_SIZE;
-  vmaFlushAllocation(ctx->core.device->allocator.vma, hot->vk.allocation, offset, flush_size);
+  VkDeviceSize actual_size = size ? size : VK_WHOLE_SIZE;
+  if (flush)
+    vmaFlushAllocation(ctx->core.device->allocator.vma, hot->vk.allocation, offset, actual_size);
+  else
+    vmaInvalidateAllocation(ctx->core.device->allocator.vma, hot->vk.allocation, offset, actual_size);
+}
+
+static void hina_ctx_flush_buffer(hina_context* ctx, hina_buffer buf, size_t offset, size_t size)
+{
+  hina_ctx_flush_or_invalidate_buffer(ctx, buf, offset, size, true);
 }
 
 void hina_flush_buffer(hina_buffer buf, size_t offset, size_t size)
@@ -11600,17 +11515,7 @@ void hina_flush_buffer(hina_buffer buf, size_t offset, size_t size)
 
 static void hina_ctx_invalidate_buffer(hina_context* ctx, hina_buffer buf, size_t offset, size_t size)
 {
-  HINA_ASSERTF(hina_buffer_slot_valid(buf), "[%s] hina_invalidate_buffer: invalid buffer handle",
-               hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
-  uint16_t idx = hina_id_index(buf.id);
-  hina_buffer_hot* hot = HINA_BUF_HOT(idx);
-  HINA_ASSERTF((hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_VISIBLE) != 0,
-               "[%s] hina_invalidate_buffer: buffer is not host-visible (HINA_BUFFER_GPU)",
-               hina_debug_get_label(buf.id, VK_OBJECT_TYPE_BUFFER));
-  // Early-out for coherent memory (no-op, always safe to call)
-  if (hot->config.flags_packed & HINA_BUFFER_HOT_FLAG_HOST_COHERENT) return;
-  VkDeviceSize inv_size = size ? size : VK_WHOLE_SIZE;
-  vmaInvalidateAllocation(ctx->core.device->allocator.vma, hot->vk.allocation, offset, inv_size);
+  hina_ctx_flush_or_invalidate_buffer(ctx, buf, offset, size, false);
 }
 
 void hina_invalidate_buffer(hina_buffer buf, size_t offset, size_t size)
@@ -12812,7 +12717,7 @@ size_t hina_texture_mip_size(hina_texture tex, uint32_t mip)
   hina_texture_hot* hot = HINA_TEX_HOT(idx);
   HINA_ASSERTF(mip < hot->mip_levels, "hina_texture_mip_size: mip %u out of bounds (max %u)", mip, hot->mip_levels);
   // Get format size
-  hina_format hfmt = hina_vk_format_to_hina(hot->dims.format);
+  hina_format hfmt = hina_format_from_vk(hot->dims.format);
   uint32_t mip_width = hina_mip_dim(hot->dims.width, mip);
   uint32_t mip_height = hina_mip_dim(hot->dims.height, mip);
   uint32_t mip_depth = hot->texture_dim == HINA_TEX_DIM_3D ? hina_mip_dim(hot->depth ? hot->depth : 1u, mip) : 1u;
@@ -12934,29 +12839,50 @@ static void hina_download_texture_region(hina_context* ctx, const hina_texture_h
   memcpy(dst, staging_mapped, required_size);
 }
 
+typedef struct {
+  hina_texture_hot*  hot;
+  uint16_t           sidx;
+  hina_format        hfmt;
+  uint32_t           pixel_size;
+  uint32_t           mip_width;
+  uint32_t           mip_height;
+  VkImageAspectFlags aspect;
+} hina_download_validate_result;
+
+static HINA_INLINE bool hina_validate_download_texture(hina_context* ctx, hina_texture tex, uint32_t mip_level,
+                                                       void* dst, size_t dst_size,
+                                                       hina_download_validate_result* out)
+{
+  HINA_ASSERT(ctx);
+  if (!dst || dst_size == 0) return false;
+  HINA_ASSERTF(hina_texture_slot_valid(tex), "hina_validate_download_texture: invalid texture handle");
+  out->sidx       = hina_id_index(tex.id);
+  out->hot        = HINA_TEX_HOT(out->sidx);
+  HINA_ASSERTF(mip_level < out->hot->mip_levels,
+               "hina_validate_download_texture: mip %u out of bounds (max %u)", mip_level, out->hot->mip_levels);
+  out->hfmt       = hina_format_from_vk(out->hot->dims.format);
+  out->pixel_size = hina_format_size(out->hfmt);
+  HINA_ASSERTF(out->pixel_size > 0, "hina_validate_download_texture: unsupported format for download");
+  out->mip_width  = hina_mip_dim(out->hot->dims.width, mip_level);
+  out->mip_height = hina_mip_dim(out->hot->dims.height, mip_level);
+  out->aspect     = hina_aspect_from_format(out->hot->dims.format);
+  return true;
+}
+
 void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t layer, void* dst,
                                size_t dst_size)
 {
-  HINA_ASSERT(ctx && "hina_ctx_download_texture: ctx is NULL");
-  HINA_ASSERT(dst && dst_size > 0 && "hina_ctx_download_texture: invalid dst or dst_size");
-  HINA_ASSERTF(hina_texture_slot_valid(src), "hina_ctx_download_texture: invalid texture handle");
-  uint16_t sidx = hina_id_index(src.id);
-  hina_texture_hot* hot = HINA_TEX_HOT(sidx);
-  HINA_ASSERTF(hot->texture_dim != HINA_TEX_DIM_3D,
+  hina_download_validate_result v;
+  if (!hina_validate_download_texture(ctx, src, mip, dst, dst_size, &v)) return;
+  HINA_ASSERTF(v.hot->texture_dim != HINA_TEX_DIM_3D,
                "hina_ctx_download_texture: use hina_ctx_download_texture_3d for 3D textures");
-  HINA_ASSERTF(mip < hot->mip_levels, "hina_ctx_download_texture: mip %u out of bounds (max %u)", mip, hot->mip_levels);
-  HINA_ASSERTF(layer < hot->layers, "hina_ctx_download_texture: layer %u out of bounds (max %u)", layer, hot->layers);
-  hina_format hfmt = hina_vk_format_to_hina(hot->dims.format);
-  uint32_t pixel_size = hina_format_size(hfmt);
-  HINA_ASSERTF(pixel_size > 0, "hina_ctx_download_texture: unsupported format for download");
-  uint32_t mip_width = hina_mip_dim(hot->dims.width, mip);
-  uint32_t mip_height = hina_mip_dim(hot->dims.height, mip);
-  size_t required_size = (size_t)mip_width * mip_height * pixel_size;
+  HINA_ASSERTF(layer < v.hot->layers, "hina_ctx_download_texture: layer %u out of bounds (max %u)", layer,
+               v.hot->layers);
+  size_t required_size = (size_t)v.mip_width * v.mip_height * v.pixel_size;
   HINA_ASSERTF(dst_size >= required_size, "hina_ctx_download_texture: dst_size (%zu) < required (%zu)", dst_size,
                required_size);
-  VkImageAspectFlags aspect = hina_aspect_from_format(hot->dims.format);
-  hina_download_texture_region(ctx, hot, (VkImageSubresourceLayers){aspect, mip, layer, 1},
-                               (VkOffset3D){0, 0, 0}, (VkExtent3D){mip_width, mip_height, 1},
+  hina_download_texture_region(ctx, v.hot, (VkImageSubresourceLayers){v.aspect, mip, layer, 1},
+                               (VkOffset3D){0, 0, 0}, (VkExtent3D){v.mip_width, v.mip_height, 1},
                                required_size, dst);
 }
 
@@ -12968,29 +12894,18 @@ void hina_download_texture(hina_texture src, uint32_t mip, uint32_t layer, void*
 void hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth,
                                   void* dst, size_t dst_size)
 {
-  HINA_ASSERT(ctx && "hina_ctx_download_texture_3d: ctx is NULL");
-  HINA_ASSERT(dst && dst_size > 0 && "hina_ctx_download_texture_3d: invalid dst or dst_size");
-  HINA_ASSERTF(hina_texture_slot_valid(src), "hina_ctx_download_texture_3d: invalid texture handle");
-  uint16_t sidx = hina_id_index(src.id);
-  hina_texture_hot* hot = HINA_TEX_HOT(sidx);
-  HINA_ASSERTF(hot->texture_dim == HINA_TEX_DIM_3D, "hina_ctx_download_texture_3d: source is not a 3D texture");
-  HINA_ASSERTF(mip < hot->mip_levels, "hina_ctx_download_texture_3d: mip %u out of bounds (max %u)", mip,
-               hot->mip_levels);
-  uint32_t mip_depth = hina_mip_dim(hot->depth ? hot->depth : 1u, mip);
+  hina_download_validate_result v;
+  if (!hina_validate_download_texture(ctx, src, mip, dst, dst_size, &v)) return;
+  HINA_ASSERTF(v.hot->texture_dim == HINA_TEX_DIM_3D, "hina_ctx_download_texture_3d: source is not a 3D texture");
+  uint32_t mip_depth = hina_mip_dim(v.hot->depth ? v.hot->depth : 1u, mip);
   HINA_ASSERTF(depth > 0 && z_offset < mip_depth && z_offset + depth <= mip_depth,
                "hina_ctx_download_texture_3d: z range [%u, %u) out of bounds (depth=%u)", z_offset, z_offset + depth,
                mip_depth);
-  hina_format hfmt = hina_vk_format_to_hina(hot->dims.format);
-  uint32_t pixel_size = hina_format_size(hfmt);
-  HINA_ASSERTF(pixel_size > 0, "hina_ctx_download_texture_3d: unsupported format for download");
-  uint32_t mip_width = hina_mip_dim(hot->dims.width, mip);
-  uint32_t mip_height = hina_mip_dim(hot->dims.height, mip);
-  size_t required_size = (size_t)mip_width * mip_height * depth * pixel_size;
+  size_t required_size = (size_t)v.mip_width * v.mip_height * depth * v.pixel_size;
   HINA_ASSERTF(dst_size >= required_size, "hina_ctx_download_texture_3d: dst_size (%zu) < required (%zu)", dst_size,
                required_size);
-  VkImageAspectFlags aspect = hina_aspect_from_format(hot->dims.format);
-  hina_download_texture_region(ctx, hot, (VkImageSubresourceLayers){aspect, mip, 0, 1},
-                               (VkOffset3D){0, 0, (int32_t)z_offset}, (VkExtent3D){mip_width, mip_height, depth},
+  hina_download_texture_region(ctx, v.hot, (VkImageSubresourceLayers){v.aspect, mip, 0, 1},
+                               (VkOffset3D){0, 0, (int32_t)z_offset}, (VkExtent3D){v.mip_width, v.mip_height, depth},
                                required_size, dst);
 }
 
@@ -13056,7 +12971,7 @@ hina_ticket hina_ctx_generate_mips(hina_context* ctx, hina_texture tex)
   uint16_t idx = hina_id_index(tex.id);
   hina_texture_hot* hot = HINA_TEX_HOT(idx);
   if (hot->mip_levels <= 1) return 0;
-  hina_format hfmt = hina_vk_format_to_hina(hot->dims.format);
+  hina_format hfmt = hina_format_from_vk(hot->dims.format);
   if (hina_format_is_block_compressed(hfmt))
   {
     HINA_LOGE(ctx, "Cannot generate mips for compressed textures");
@@ -13299,9 +13214,9 @@ static hina_bind_group_layout hina_ctx_create_bind_group_layout(hina_context* ct
     HINA_LOGW(ctx, "hina_create_bind_group_layout: entry_count is 0");
     return (hina_bind_group_layout){HINA_INVALID_HANDLE};
   }
-  if (desc->entry_count > 12)
+  if (desc->entry_count > HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES)
   {
-    HINA_LOGE(ctx, "hina_create_bind_group_layout: entry_count %u exceeds max 12", desc->entry_count);
+    HINA_LOGE(ctx, "hina_create_bind_group_layout: entry_count %u exceeds max %u", desc->entry_count, (uint32_t)HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES);
     return (hina_bind_group_layout){HINA_INVALID_HANDLE};
   }
   if (!desc->entries)
@@ -13319,7 +13234,7 @@ static hina_bind_group_layout hina_ctx_create_bind_group_layout(hina_context* ct
   uint16_t idx = hina_id_index(internal_handle.id);
   hina_desc_layout_slot* slot = HINA_DESC_LAYOUT_ENTRY(idx);
   // Build VkDescriptorSetLayoutBinding array
-  VkDescriptorSetLayoutBinding vk_bindings[12];
+  VkDescriptorSetLayoutBinding vk_bindings[HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES];
   uint8_t dynamic_count = 0;
   for (uint32_t i = 0; i < desc->entry_count; ++i)
   {
@@ -13412,10 +13327,10 @@ static hina_bind_group_layout hina_ctx_create_bind_group_layout_from_hsl_module(
     return (hina_bind_group_layout){HINA_INVALID_HANDLE};
   }
   // Collect bindings for the requested set from graphics stages (merged)
-  hina_bind_group_layout_entry entries[12];
+  hina_bind_group_layout_entry entries[HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES];
   uint32_t entry_count = 0;
 #define ADD_BINDING(stage_bindings, stage_count, default_stage_flag) \
-    for (uint32_t i = 0; i < (stage_count) && entry_count < 12; ++i) { \
+    for (uint32_t i = 0; i < (stage_count) && entry_count < HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES; ++i) { \
       const hina_hsl_binding* b = &(stage_bindings)[i]; \
       if (b->set != set_index) continue; \
       uint32_t stage_mask = hina_vk_stage_flags_to_hina(b->stage_flags); \
@@ -13452,35 +13367,21 @@ static hina_bind_group_layout hina_ctx_create_bind_group_layout_from_hsl_module(
         entry_count++; \
       } \
     }
-  // Add VS bindings
-  if (module->vs.bindings && module->vs.binding_count > 0)
   {
-    ADD_BINDING(module->vs.bindings, module->vs.binding_count, HINA_STAGE_VERTEX);
-  }
-  // Add TCS bindings
-  if (module->tcs.bindings && module->tcs.binding_count > 0)
-  {
-    ADD_BINDING(module->tcs.bindings, module->tcs.binding_count, HINA_STAGE_TESS_CONTROL);
-  }
-  // Add TES bindings
-  if (module->tes.bindings && module->tes.binding_count > 0)
-  {
-    ADD_BINDING(module->tes.bindings, module->tes.binding_count, HINA_STAGE_TESS_EVAL);
-  }
-  // Add GS bindings
-  if (module->gs.bindings && module->gs.binding_count > 0)
-  {
-    ADD_BINDING(module->gs.bindings, module->gs.binding_count, HINA_STAGE_GEOMETRY);
-  }
-  // Add FS bindings (merge with VS)
-  if (module->fs.bindings && module->fs.binding_count > 0)
-  {
-    ADD_BINDING(module->fs.bindings, module->fs.binding_count, HINA_STAGE_FRAGMENT);
-  }
-  // Add CS bindings (merge with existing)
-  if (module->cs.bindings && module->cs.binding_count > 0)
-  {
-    ADD_BINDING(module->cs.bindings, module->cs.binding_count, HINA_STAGE_COMPUTE);
+    const hina_shader_stage_data* stages[] = {
+      (const hina_shader_stage_data*)&module->vs,  (const hina_shader_stage_data*)&module->tcs,
+      (const hina_shader_stage_data*)&module->tes, (const hina_shader_stage_data*)&module->gs,
+      (const hina_shader_stage_data*)&module->fs,  (const hina_shader_stage_data*)&module->cs
+    };
+    static const uint32_t stage_flags[] = {
+      HINA_STAGE_VERTEX, HINA_STAGE_TESS_CONTROL, HINA_STAGE_TESS_EVAL,
+      HINA_STAGE_GEOMETRY, HINA_STAGE_FRAGMENT, HINA_STAGE_COMPUTE
+    };
+    for (uint32_t si = 0; si < 6; ++si)
+    {
+      if (stages[si]->bindings && stages[si]->binding_count > 0)
+        ADD_BINDING(stages[si]->bindings, stages[si]->binding_count, stage_flags[si]);
+    }
   }
 #undef ADD_BINDING
   if (entry_count == 0)
@@ -13629,14 +13530,14 @@ static hina_bind_group hina_ctx_create_bind_group_internal(hina_context* ctx, co
   // Write descriptor set entries
   if (desc->entries && desc->entry_count > 0)
   {
-    VkWriteDescriptorSet writes[12];
-    VkDescriptorBufferInfo buffer_infos[12];
-    VkDescriptorImageInfo image_infos[12];
+    VkWriteDescriptorSet writes[HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES];
+    VkDescriptorBufferInfo buffer_infos[HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES];
+    VkDescriptorImageInfo image_infos[HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES];
     uint32_t write_count = 0;
     uint32_t buf_idx = 0;
     uint32_t img_idx = 0;
     memset(writes, 0, sizeof(writes)); // Required: pNext and unused pointers must be NULL
-    for (uint32_t i = 0; i < desc->entry_count && write_count < 12; ++i)
+    for (uint32_t i = 0; i < desc->entry_count && write_count < HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES; ++i)
     {
       const hina_bind_group_entry* e = &desc->entries[i];
       VkWriteDescriptorSet* w = &writes[write_count];
@@ -14568,18 +14469,11 @@ static VkPipeline hina_build_graphics_pipeline(hina_context* ctx,
     }
   }
 
-  VkSpecializationMapEntry vs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry tcs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry tes_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry gs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  VkSpecializationMapEntry fs_spec_entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
-  uint8_t vs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t tcs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t tes_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t gs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  uint8_t fs_spec_data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
-  VkSpecializationInfo vs_spec_info = {0}, tcs_spec_info = {0}, tes_spec_info = {0};
-  VkSpecializationInfo gs_spec_info = {0}, fs_spec_info = {0};
+  struct {
+    VkSpecializationMapEntry entries[HINA_MAX_SPECIALIZATION_CONSTANTS];
+    uint8_t                  data[HINA_MAX_SPECIALIZATION_CONSTANTS * sizeof(uint32_t)];
+    VkSpecializationInfo     info;
+  } spec_state[5] = {0};
 
   // ── Shader stages ─────────────────────────────────────────────────────
   VkPipelineShaderStageCreateInfo stages_ci[5] = {0};
@@ -14591,8 +14485,8 @@ static VkPipeline hina_build_graphics_pipeline(hina_context* ctx,
   stages_ci[stage_count].pName = "main";
   if (stage_specs[HINA_SPEC_STAGE_VERTEX])
   {
-    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_VERTEX], vs_spec_entries, vs_spec_data, &vs_spec_info);
-    if (vs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &vs_spec_info;
+    hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_VERTEX], spec_state[0].entries, spec_state[0].data, &spec_state[0].info);
+    if (spec_state[0].info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &spec_state[0].info;
   }
   stage_count++;
 
@@ -14604,9 +14498,9 @@ static VkPipeline hina_build_graphics_pipeline(hina_context* ctx,
     stages_ci[stage_count].pName = "main";
     if (stage_specs[HINA_SPEC_STAGE_TESS_CONTROL])
     {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_CONTROL], tcs_spec_entries, tcs_spec_data,
-                                      &tcs_spec_info);
-      if (tcs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tcs_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_CONTROL], spec_state[1].entries, spec_state[1].data,
+                                      &spec_state[1].info);
+      if (spec_state[1].info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &spec_state[1].info;
     }
     stage_count++;
   }
@@ -14619,9 +14513,9 @@ static VkPipeline hina_build_graphics_pipeline(hina_context* ctx,
     stages_ci[stage_count].pName = "main";
     if (stage_specs[HINA_SPEC_STAGE_TESS_EVAL])
     {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_EVAL], tes_spec_entries, tes_spec_data,
-                                      &tes_spec_info);
-      if (tes_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &tes_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_TESS_EVAL], spec_state[2].entries, spec_state[2].data,
+                                      &spec_state[2].info);
+      if (spec_state[2].info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &spec_state[2].info;
     }
     stage_count++;
   }
@@ -14634,9 +14528,9 @@ static VkPipeline hina_build_graphics_pipeline(hina_context* ctx,
     stages_ci[stage_count].pName = "main";
     if (stage_specs[HINA_SPEC_STAGE_GEOMETRY])
     {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_GEOMETRY], gs_spec_entries, gs_spec_data,
-                                      &gs_spec_info);
-      if (gs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &gs_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_GEOMETRY], spec_state[3].entries, spec_state[3].data,
+                                      &spec_state[3].info);
+      if (spec_state[3].info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &spec_state[3].info;
     }
     stage_count++;
   }
@@ -14649,9 +14543,9 @@ static VkPipeline hina_build_graphics_pipeline(hina_context* ctx,
     stages_ci[stage_count].pName = "main";
     if (stage_specs[HINA_SPEC_STAGE_FRAGMENT])
     {
-      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_FRAGMENT], fs_spec_entries, fs_spec_data,
-                                      &fs_spec_info);
-      if (fs_spec_info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &fs_spec_info;
+      hina_apply_stage_specialization(stage_specs[HINA_SPEC_STAGE_FRAGMENT], spec_state[4].entries, spec_state[4].data,
+                                      &spec_state[4].info);
+      if (spec_state[4].info.mapEntryCount > 0) stages_ci[stage_count].pSpecializationInfo = &spec_state[4].info;
     }
     stage_count++;
   }
@@ -14965,6 +14859,57 @@ static VkPipeline hina_build_graphics_pipeline(hina_context* ctx,
   return pipeline;
 }
 
+// Validates tessellation/geometry shader stage configuration.
+// Returns false on validation failure (logs error internally).
+// noun: "shader" for raw SPIR-V path, "stage" for HSL path.
+static bool hina_validate_graphics_shader_stages(
+    hina_context* ctx, bool has_tcs, bool has_tes, bool has_gs,
+    hina_primitive_topology topo, uint32_t patch_control_points, const char* noun)
+{
+  if (has_tcs != has_tes)
+  {
+    HINA_LOGE(ctx, "Tessellation requires both control and evaluation %ss", noun);
+    return false;
+  }
+  if (has_gs && !g_device_caps.has_geometry_shader)
+  {
+    HINA_LOGE(ctx, "Geometry %s requested but not supported by device", noun);
+    return false;
+  }
+  if ((has_tcs || has_tes) && !g_device_caps.has_tessellation_shader)
+  {
+    HINA_LOGE(ctx, "Tessellation %s requested but not supported by device", noun);
+    return false;
+  }
+  if (topo == HINA_PRIMITIVE_TOPOLOGY_PATCH_LIST)
+  {
+    if (!has_tcs)
+    {
+      HINA_LOGE(ctx, "PATCH_LIST topology requires tessellation %ss", noun);
+      return false;
+    }
+    if (patch_control_points == 0 || patch_control_points > 32)
+    {
+      HINA_LOGE(ctx, "Invalid patch_control_points: %u (valid range 1-32)", patch_control_points);
+      return false;
+    }
+  }
+  else
+  {
+    if (has_tcs || has_tes)
+    {
+      HINA_LOGE(ctx, "Tessellation %ss require PATCH_LIST topology", noun);
+      return false;
+    }
+    if (patch_control_points != 0)
+    {
+      HINA_LOGE(ctx, "patch_control_points is only valid with tessellation %ss", noun);
+      return false;
+    }
+  }
+  return true;
+}
+
 // Internal implementation - used by deprecated wrappers and _ex function
 static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_pipeline_desc* desc)
 {
@@ -14990,47 +14935,9 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   bool has_tcs = hina_shader_is_valid(&desc->tcs);
   bool has_tes = hina_shader_is_valid(&desc->tes);
   bool has_gs = hina_shader_is_valid(&desc->gs);
-  if (has_tcs != has_tes)
-  {
-    HINA_LOGE(ctx, "Tessellation requires both control and evaluation shaders");
+  if (!hina_validate_graphics_shader_stages(ctx, has_tcs, has_tes, has_gs,
+          desc->primitive_topology, desc->patch_control_points, "shader"))
     return (hina_pipeline){HINA_INVALID_HANDLE};
-  }
-  if (has_gs && !g_device_caps.has_geometry_shader)
-  {
-    HINA_LOGE(ctx, "Geometry shader requested but not supported by device");
-    return (hina_pipeline){HINA_INVALID_HANDLE};
-  }
-  if ((has_tcs || has_tes) && !g_device_caps.has_tessellation_shader)
-  {
-    HINA_LOGE(ctx, "Tessellation shader requested but not supported by device");
-    return (hina_pipeline){HINA_INVALID_HANDLE};
-  }
-  if (desc->primitive_topology == HINA_PRIMITIVE_TOPOLOGY_PATCH_LIST)
-  {
-    if (!has_tcs)
-    {
-      HINA_LOGE(ctx, "PATCH_LIST topology requires tessellation shaders");
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    if (desc->patch_control_points == 0 || desc->patch_control_points > 32)
-    {
-      HINA_LOGE(ctx, "Invalid patch_control_points: %u (valid range 1-32)", desc->patch_control_points);
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
-  else
-  {
-    if (has_tcs || has_tes)
-    {
-      HINA_LOGE(ctx, "Tessellation shaders require PATCH_LIST topology");
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    if (desc->patch_control_points != 0)
-    {
-      HINA_LOGE(ctx, "patch_control_points is only valid with tessellation stages");
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
   VkShaderStageFlags default_stage_flags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
   if (has_tcs)
   {
@@ -15074,61 +14981,53 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
   // Get or create shader modules (temp modules will be destroyed after pipeline creation)
+  struct { VkShaderModule mod; bool is_temp; } temp_mods[5] = {{0}};
+  uint32_t temp_mod_count = 0;
   bool vs_temp = false, tcs_temp = false, tes_temp = false, gs_temp = false, fs_temp = false;
   VkShaderModule vs_module = hina_get_or_create_shader_module(ctx, &desc->vs, "vs", &vs_temp);
-  VkShaderModule tcs_module = has_tcs
-                                ? hina_get_or_create_shader_module(ctx, &desc->tcs, "tcs", &tcs_temp)
-                                : VK_NULL_HANDLE;
-  VkShaderModule tes_module = has_tes
-                                ? hina_get_or_create_shader_module(ctx, &desc->tes, "tes", &tes_temp)
-                                : VK_NULL_HANDLE;
+  if (vs_module) { temp_mods[temp_mod_count].mod = vs_module; temp_mods[temp_mod_count].is_temp = vs_temp; temp_mod_count++; }
+  VkShaderModule tcs_module = has_tcs ? hina_get_or_create_shader_module(ctx, &desc->tcs, "tcs", &tcs_temp) : VK_NULL_HANDLE;
+  if (tcs_module) { temp_mods[temp_mod_count].mod = tcs_module; temp_mods[temp_mod_count].is_temp = tcs_temp; temp_mod_count++; }
+  VkShaderModule tes_module = has_tes ? hina_get_or_create_shader_module(ctx, &desc->tes, "tes", &tes_temp) : VK_NULL_HANDLE;
+  if (tes_module) { temp_mods[temp_mod_count].mod = tes_module; temp_mods[temp_mod_count].is_temp = tes_temp; temp_mod_count++; }
   VkShaderModule gs_module = has_gs ? hina_get_or_create_shader_module(ctx, &desc->gs, "gs", &gs_temp) : VK_NULL_HANDLE;
+  if (gs_module) { temp_mods[temp_mod_count].mod = gs_module; temp_mods[temp_mod_count].is_temp = gs_temp; temp_mod_count++; }
   VkShaderModule fs_module = hina_get_or_create_shader_module(ctx, &desc->fs, "fs", &fs_temp);
+  if (fs_module) { temp_mods[temp_mod_count].mod = fs_module; temp_mods[temp_mod_count].is_temp = fs_temp; temp_mod_count++; }
   // Validate modules
   if (!vs_module || !fs_module || (has_tcs && !tcs_module) || (has_tes && !tes_module) || (has_gs && !gs_module))
   {
     HINA_LOGE(ctx, "Failed to create shader modules for pipeline");
-    if (vs_temp && vs_module) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-    if (tcs_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-    if (tes_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-    if (gs_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
-    if (fs_temp && fs_module) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
-    if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-    if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
-    e->reflection = NULL;
-    hina_pipeline_slot_free(idx);
-    return (hina_pipeline){HINA_INVALID_HANDLE};
+    goto pipeline_internal_cleanup;
   }
   // Convert raw desc to common state format, then delegate to shared builder
-  hina_hsl_pipeline_desc state;
-  memcpy(&state, &desc->layout, sizeof(state));
-  hina_gfx_pipeline_args args = {
-    .slot = e, .handle = handle, .idx = idx, .layout = layout,
-    .vs = vs_module, .tcs = tcs_module, .tes = tes_module,
-    .gs = gs_module, .fs = fs_module,
-    .vertex_layout = &state.layout,
-  };
-  VkPipeline pipeline = hina_build_graphics_pipeline(ctx, &args, &state);
-  if (!pipeline)
   {
-    if (vs_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-    if (tcs_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-    if (tes_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-    if (gs_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
-    if (fs_temp) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
-    if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-    if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
-    e->reflection = NULL;
-    hina_pipeline_slot_free(idx);
-    return (hina_pipeline){HINA_INVALID_HANDLE};
+    hina_hsl_pipeline_desc state;
+    memcpy(&state, &desc->layout, sizeof(state));
+    hina_gfx_pipeline_args args = {
+      .slot = e, .handle = handle, .idx = idx, .layout = layout,
+      .vs = vs_module, .tcs = tcs_module, .tes = tes_module,
+      .gs = gs_module, .fs = fs_module,
+      .vertex_layout = &state.layout,
+    };
+    VkPipeline pipeline = hina_build_graphics_pipeline(ctx, &args, &state);
+    if (!pipeline) goto pipeline_internal_cleanup;
   }
-  // Cleanup temp shader modules after successful pipeline creation
-  if (vs_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-  if (tcs_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-  if (tes_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-  if (gs_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
-  if (fs_temp) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
+  // Success: cleanup temp shader modules only
+  for (uint32_t i = 0; i < temp_mod_count; ++i)
+    if (temp_mods[i].is_temp && temp_mods[i].mod)
+      vkDestroyShaderModule(ctx->core.device->core.device, temp_mods[i].mod, NULL);
   return handle;
+
+pipeline_internal_cleanup:
+  for (uint32_t i = 0; i < temp_mod_count; ++i)
+    if (temp_mods[i].is_temp && temp_mods[i].mod)
+      vkDestroyShaderModule(ctx->core.device->core.device, temp_mods[i].mod, NULL);
+  if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
+  if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
+  e->reflection = NULL;
+  hina_pipeline_slot_free(idx);
+  return (hina_pipeline){HINA_INVALID_HANDLE};
 }
 
 // Forward declaration for internal compute pipeline function
@@ -15520,12 +15419,16 @@ hina_hsl_module* hina_hsl_module_deserialize(const void* data, size_t size)
   if (!module) goto fail;
   module->_module_alloc = module_alloc;
   if (!hina_rb_read_string_alloc(&rb, &alloc, &module->source_name)) goto fail;
-  if (!hina_deserialize_stage(&rb, &module->vs, &alloc)) goto fail;
-  if (!hina_deserialize_stage(&rb, &module->tcs, &alloc)) goto fail;
-  if (!hina_deserialize_stage(&rb, &module->tes, &alloc)) goto fail;
-  if (!hina_deserialize_stage(&rb, &module->gs, &alloc)) goto fail;
-  if (!hina_deserialize_stage(&rb, &module->fs, &alloc)) goto fail;
-  if (!hina_deserialize_stage(&rb, &module->cs, &alloc)) goto fail;
+  {
+    hina_shader_stage_data* stages[] = {
+      &module->vs, &module->tcs, &module->tes,
+      &module->gs, &module->fs, &module->cs
+    };
+    for (uint32_t si = 0; si < 6; ++si)
+    {
+      if (!hina_deserialize_stage(&rb, stages[si], &alloc)) goto fail;
+    }
+  }
   if (!hina_rb_read_u32(&rb, &vi_count)) goto fail;
   module->vertex_input_count = vi_count;
   if (vi_count > 0)
@@ -15752,6 +15655,36 @@ static VkPipeline hina_build_compute_pipeline(hina_context* ctx,
   return pipeline;
 }
 
+static HINA_INLINE VkPipelineLayout hina_resolve_pipeline_layout(
+    hina_context* ctx, hina_pipeline_slot* e,
+    const hina_bind_group_layout* bind_group_layouts,
+    const hina_push_constant_range* push_constant_ranges,
+    uint32_t push_constant_range_count)
+{
+  uint32_t explicit_layout_count = hina_count_bind_group_layouts(bind_group_layouts);
+  VkDescriptorSetLayout explicit_vk_layouts[HINA_MAX_DESCRIPTOR_SETS] = {VK_NULL_HANDLE};
+  VkPipelineLayout layout;
+  if (explicit_layout_count > 0)
+  {
+    layout = hina_build_layout_from_explicit_bind_groups(ctx, bind_group_layouts, explicit_layout_count,
+                                                         push_constant_ranges, push_constant_range_count,
+                                                         &e->push_constant_stages, &e->push_constant_size,
+                                                         explicit_vk_layouts);
+    e->set_layout_count = explicit_layout_count;
+  }
+  else
+  {
+    layout = hina_build_layout_from_reflection(ctx, e->reflection, push_constant_ranges,
+                                               push_constant_range_count, &e->push_constant_stages,
+                                               &e->push_constant_size);
+    e->set_layout_count = e->reflection->set_count;
+  }
+  if (explicit_layout_count > 0)
+    hina_pipeline_reflection_apply_explicit_layouts(ctx, e->reflection, bind_group_layouts, explicit_layout_count,
+                                                    explicit_vk_layouts);
+  return layout;
+}
+
 hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, const hina_hsl_pipeline_desc* desc,
                                              hina_hsl_cache* cache)
 {
@@ -15806,47 +15739,9 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
   }
   if (!has_cs)
   {
-    if (has_tcs != has_tes)
-    {
-      HINA_LOGE(ctx, "Tessellation requires both control and evaluation stages");
+    if (!hina_validate_graphics_shader_stages(ctx, has_tcs, has_tes, has_gs,
+            desc->primitive_topology, desc->patch_control_points, "stage"))
       return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    if (has_gs && !g_device_caps.has_geometry_shader)
-    {
-      HINA_LOGE(ctx, "Geometry shader requested but not supported by device");
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    if ((has_tcs || has_tes) && !g_device_caps.has_tessellation_shader)
-    {
-      HINA_LOGE(ctx, "Tessellation shader requested but not supported by device");
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    if (desc->primitive_topology == HINA_PRIMITIVE_TOPOLOGY_PATCH_LIST)
-    {
-      if (!has_tcs)
-      {
-        HINA_LOGE(ctx, "PATCH_LIST topology requires tessellation stages");
-        return (hina_pipeline){HINA_INVALID_HANDLE};
-      }
-      if (desc->patch_control_points == 0 || desc->patch_control_points > 32)
-      {
-        HINA_LOGE(ctx, "Invalid patch_control_points: %u (valid range 1-32)", desc->patch_control_points);
-        return (hina_pipeline){HINA_INVALID_HANDLE};
-      }
-    }
-    else
-    {
-      if (has_tcs || has_tes)
-      {
-        HINA_LOGE(ctx, "Tessellation stages require PATCH_LIST topology");
-        return (hina_pipeline){HINA_INVALID_HANDLE};
-      }
-      if (desc->patch_control_points != 0)
-      {
-        HINA_LOGE(ctx, "patch_control_points is only valid with tessellation stages");
-        return (hina_pipeline){HINA_INVALID_HANDLE};
-      }
-    }
   }
   HINA_LOGI(ctx, "=== Creating pipeline from HSL module: %s ===",
             module->source_name ? module->source_name : "<unknown>");
@@ -15914,29 +15809,9 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
       return (hina_pipeline){HINA_INVALID_HANDLE};
     }
     // Build pipeline layout: use explicit layouts if provided, otherwise auto-generate from reflection
-    // Count derived from array - first invalid handle terminates (zero-init = use reflection)
-    VkPipelineLayout layout = VK_NULL_HANDLE;
-    uint32_t explicit_layout_count = hina_count_bind_group_layouts(desc->bind_group_layouts);
-    VkDescriptorSetLayout explicit_vk_layouts[HINA_MAX_DESCRIPTOR_SETS] = {VK_NULL_HANDLE};
-    const bool use_explicit_layouts = explicit_layout_count > 0;
-    if (explicit_layout_count > 0)
-    {
-      // Production path: Use explicit bind group layouts
-      layout = hina_build_layout_from_explicit_bind_groups(ctx, desc->bind_group_layouts, explicit_layout_count,
+    VkPipelineLayout layout = hina_resolve_pipeline_layout(ctx, e, desc->bind_group_layouts,
                                                            resolved_push_constant_ranges,
-                                                           resolved_push_constant_range_count,
-                                                           &e->push_constant_stages, &e->push_constant_size,
-                                                           explicit_vk_layouts);
-      e->set_layout_count = explicit_layout_count;
-    }
-    else
-    {
-      // Demo path: Auto-generate layouts from shader reflection
-      layout = hina_build_layout_from_reflection(ctx, e->reflection, resolved_push_constant_ranges,
-                                                 resolved_push_constant_range_count, &e->push_constant_stages,
-                                                 &e->push_constant_size);
-      e->set_layout_count = e->reflection->set_count;
-    }
+                                                           resolved_push_constant_range_count);
     if (!layout)
     {
       HINA_LOGE(ctx, "Failed to create pipeline layout");
@@ -15944,12 +15819,6 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
       e->reflection = NULL;
       hina_pipeline_slot_free(idx);
       return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-    if (use_explicit_layouts)
-    {
-      hina_pipeline_reflection_apply_explicit_layouts(ctx, e->reflection, desc->bind_group_layouts, explicit_layout_count,
-                                                      explicit_vk_layouts);
-      HINA_LOGI(ctx, "Using %u explicit bind group layout(s) (production path)", explicit_layout_count);
     }
     // Create VkShaderModule directly from module SPIR-V
     VkShaderModuleCreateInfo cs_ci = {
@@ -15994,49 +15863,24 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
   // Validate specialization constants against module's reflection data
-  if (stage_specs[HINA_SPEC_STAGE_VERTEX] && vs_stage->spec_constant_count > 0)
   {
-    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_VERTEX];
-    if (!hina_validate_spec_constants(ctx, "VS", spec->constants, spec->count,
-                                      vs_stage->spec_constants, vs_stage->spec_constant_count))
+    const bool gfx_stage_enabled[] = {true, has_tcs, has_tes, has_gs, has_fs};
+    const hina_shader_stage_data* gfx_stage_ptrs[] = {vs_stage, tcs_stage, tes_stage, gs_stage, fs_stage};
+    static const struct { uint32_t spec_idx; const char* label; } g_gfx_spec_validate[] = {
+      {HINA_SPEC_STAGE_VERTEX,       "VS" },
+      {HINA_SPEC_STAGE_TESS_CONTROL, "TCS"},
+      {HINA_SPEC_STAGE_TESS_EVAL,    "TES"},
+      {HINA_SPEC_STAGE_GEOMETRY,     "GS" },
+      {HINA_SPEC_STAGE_FRAGMENT,     "FS" },
+    };
+    for (uint32_t si = 0; si < HINA_ARRAY_SIZE(g_gfx_spec_validate); ++si)
     {
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
-  if (has_tcs && stage_specs[HINA_SPEC_STAGE_TESS_CONTROL] && tcs_stage->spec_constant_count > 0)
-  {
-    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_TESS_CONTROL];
-    if (!hina_validate_spec_constants(ctx, "TCS", spec->constants, spec->count,
-                                      tcs_stage->spec_constants, tcs_stage->spec_constant_count))
-    {
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
-  if (has_tes && stage_specs[HINA_SPEC_STAGE_TESS_EVAL] && tes_stage->spec_constant_count > 0)
-  {
-    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_TESS_EVAL];
-    if (!hina_validate_spec_constants(ctx, "TES", spec->constants, spec->count,
-                                      tes_stage->spec_constants, tes_stage->spec_constant_count))
-    {
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
-  if (has_gs && stage_specs[HINA_SPEC_STAGE_GEOMETRY] && gs_stage->spec_constant_count > 0)
-  {
-    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_GEOMETRY];
-    if (!hina_validate_spec_constants(ctx, "GS", spec->constants, spec->count,
-                                      gs_stage->spec_constants, gs_stage->spec_constant_count))
-    {
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
-  if (has_fs && stage_specs[HINA_SPEC_STAGE_FRAGMENT] && fs_stage->spec_constant_count > 0)
-  {
-    const hina_stage_specialization* spec = stage_specs[HINA_SPEC_STAGE_FRAGMENT];
-    if (!hina_validate_spec_constants(ctx, "FS", spec->constants, spec->count,
-                                      fs_stage->spec_constants, fs_stage->spec_constant_count))
-    {
-      return (hina_pipeline){HINA_INVALID_HANDLE};
+      if (!gfx_stage_enabled[si]) continue;
+      const hina_stage_specialization* spec = stage_specs[g_gfx_spec_validate[si].spec_idx];
+      if (!spec || gfx_stage_ptrs[si]->spec_constant_count == 0) continue;
+      if (!hina_validate_spec_constants(ctx, g_gfx_spec_validate[si].label, spec->constants, spec->count,
+                                        gfx_stage_ptrs[si]->spec_constants, gfx_stage_ptrs[si]->spec_constant_count))
+        return (hina_pipeline){HINA_INVALID_HANDLE};
     }
   }
   // Allocate pipeline entry
@@ -16059,29 +15903,9 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
   // Build pipeline layout: use explicit layouts if provided, otherwise auto-generate from reflection
-  // Count derived from array - first invalid handle terminates (zero-init = use reflection)
-  VkPipelineLayout layout = VK_NULL_HANDLE;
-  uint32_t explicit_layout_count = hina_count_bind_group_layouts(desc->bind_group_layouts);
-  VkDescriptorSetLayout explicit_vk_layouts[HINA_MAX_DESCRIPTOR_SETS] = {VK_NULL_HANDLE};
-  const bool use_explicit_layouts = explicit_layout_count > 0;
-  if (explicit_layout_count > 0)
-  {
-    // Production path: Use explicit bind group layouts
-    layout = hina_build_layout_from_explicit_bind_groups(ctx, desc->bind_group_layouts, explicit_layout_count,
+  VkPipelineLayout layout = hina_resolve_pipeline_layout(ctx, e, desc->bind_group_layouts,
                                                          resolved_push_constant_ranges,
-                                                         resolved_push_constant_range_count,
-                                                         &e->push_constant_stages, &e->push_constant_size,
-                                                         explicit_vk_layouts);
-    e->set_layout_count = explicit_layout_count;
-  }
-  else
-  {
-    // Demo path: Auto-generate layouts from shader reflection
-    layout = hina_build_layout_from_reflection(ctx, e->reflection, resolved_push_constant_ranges,
-                                               resolved_push_constant_range_count, &e->push_constant_stages,
-                                               &e->push_constant_size);
-    e->set_layout_count = e->reflection->set_count;
-  }
+                                                         resolved_push_constant_range_count);
   if (!layout)
   {
     HINA_LOGE(ctx, "Failed to create pipeline layout");
@@ -16090,102 +15914,31 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     hina_pipeline_slot_free(idx);
     return (hina_pipeline){HINA_INVALID_HANDLE};
   }
-  if (use_explicit_layouts)
-  {
-    hina_pipeline_reflection_apply_explicit_layouts(ctx, e->reflection, desc->bind_group_layouts, explicit_layout_count,
-                                                    explicit_vk_layouts);
-    HINA_LOGI(ctx, "Using %u explicit bind group layout(s) (production path)", explicit_layout_count);
-  }
   // Create or reuse VkShaderModules (cached if cache provided, temp otherwise)
   // Track which modules are temporary (need destruction after pipeline creation)
-  bool vs_is_temp = false, tcs_is_temp = false, tes_is_temp = false;
-  bool gs_is_temp = false, fs_is_temp = false;
-  VkShaderModule vs_module = hina_get_or_create_module(ctx, cache ? &cache->vs : NULL, vs_stage->spirv_data,
-                                                       vs_stage->spirv_size, "vs", idx);
-  vs_is_temp = cache == NULL || cache->vs == NULL;
-  if (!vs_module)
-  {
-    HINA_LOGE(ctx, "Failed to create VS shader module");
-    if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-    hina_destroy_pipeline_reflection(ctx, e->reflection);
-    e->reflection = NULL;
-    hina_pipeline_slot_free(idx);
-    return (hina_pipeline){HINA_INVALID_HANDLE};
-  }
-  VkShaderModule tcs_module = VK_NULL_HANDLE;
-  if (has_tcs)
-  {
-    tcs_module = hina_get_or_create_module(ctx, cache ? &cache->tcs : NULL, tcs_stage->spirv_data,
-                                           tcs_stage->spirv_size, "tcs", idx);
-    tcs_is_temp = cache == NULL || cache->tcs == NULL;
-    if (!tcs_module)
-    {
-      HINA_LOGE(ctx, "Failed to create TCS shader module");
-      if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-      if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-      hina_destroy_pipeline_reflection(ctx, e->reflection);
-      e->reflection = NULL;
-      hina_pipeline_slot_free(idx);
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
-  VkShaderModule tes_module = VK_NULL_HANDLE;
-  if (has_tes)
-  {
-    tes_module = hina_get_or_create_module(ctx, cache ? &cache->tes : NULL, tes_stage->spirv_data,
-                                           tes_stage->spirv_size, "tes", idx);
-    tes_is_temp = cache == NULL || cache->tes == NULL;
-    if (!tes_module)
-    {
-      HINA_LOGE(ctx, "Failed to create TES shader module");
-      if (tcs_is_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-      if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-      if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-      hina_destroy_pipeline_reflection(ctx, e->reflection);
-      e->reflection = NULL;
-      hina_pipeline_slot_free(idx);
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
-  VkShaderModule gs_module = VK_NULL_HANDLE;
-  if (has_gs)
-  {
-    gs_module = hina_get_or_create_module(ctx, cache ? &cache->gs : NULL, gs_stage->spirv_data, gs_stage->spirv_size,
-                                          "gs", idx);
-    gs_is_temp = cache == NULL || cache->gs == NULL;
-    if (!gs_module)
-    {
-      HINA_LOGE(ctx, "Failed to create GS shader module");
-      if (tes_is_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-      if (tcs_is_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-      if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-      if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-      hina_destroy_pipeline_reflection(ctx, e->reflection);
-      e->reflection = NULL;
-      hina_pipeline_slot_free(idx);
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
-  VkShaderModule fs_module = VK_NULL_HANDLE;
-  if (has_fs)
-  {
-    fs_module = hina_get_or_create_module(ctx, cache ? &cache->fs : NULL, fs_stage->spirv_data,
-                                          fs_stage->spirv_size, "fs", idx);
-    fs_is_temp = cache == NULL || cache->fs == NULL;
-    if (!fs_module)
-    {
-      HINA_LOGE(ctx, "Failed to create FS shader module");
-      if (gs_is_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
-      if (tes_is_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-      if (tcs_is_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-      if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-      if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-      hina_destroy_pipeline_reflection(ctx, e->reflection);
-      e->reflection = NULL;
-      hina_pipeline_slot_free(idx);
-      return (hina_pipeline){HINA_INVALID_HANDLE};
-    }
-  }
+  struct { VkShaderModule mod; bool is_temp; } temp_modules[5] = {{0}};
+  uint32_t temp_module_count = 0;
+  // Helper macro: create module, track it for cleanup, goto cleanup on failure
+#define ACQUIRE_MODULE(stage_name, cache_field, stage_data, label) do { \
+    stage_name##_module = hina_get_or_create_module(ctx, cache ? &cache->cache_field : NULL, \
+        (stage_data)->spirv_data, (stage_data)->spirv_size, label, idx); \
+    bool _is_temp = cache == NULL || cache->cache_field == NULL; \
+    if (!(stage_name##_module)) { \
+      HINA_LOGE(ctx, "Failed to create %s shader module", label); \
+      goto pipeline_from_module_cleanup; \
+    } \
+    temp_modules[temp_module_count].mod = stage_name##_module; \
+    temp_modules[temp_module_count].is_temp = _is_temp; \
+    temp_module_count++; \
+  } while(0)
+  VkShaderModule vs_module = VK_NULL_HANDLE, tcs_module = VK_NULL_HANDLE, tes_module = VK_NULL_HANDLE;
+  VkShaderModule gs_module = VK_NULL_HANDLE, fs_module = VK_NULL_HANDLE;
+  ACQUIRE_MODULE(vs, vs, vs_stage, "vs");
+  if (has_tcs) ACQUIRE_MODULE(tcs, tcs, tcs_stage, "tcs");
+  if (has_tes) ACQUIRE_MODULE(tes, tes, tes_stage, "tes");
+  if (has_gs)  ACQUIRE_MODULE(gs, gs, gs_stage, "gs");
+  if (has_fs)  ACQUIRE_MODULE(fs, fs, fs_stage, "fs");
+#undef ACQUIRE_MODULE
   // Auto-detect vertex layout from module's pre-reflected vertex inputs
   hina_vertex_layout auto_layout = desc->layout;
   if (desc->layout.attr_count == 0 && module->vertex_inputs && module->vertex_input_count > 0)
@@ -16223,27 +15976,23 @@ hina_pipeline hina_make_pipeline_from_module(const hina_hsl_module* module, cons
     .vertex_layout = &auto_layout,
   };
   VkPipeline pipeline = hina_build_graphics_pipeline(ctx, &args, desc);
-  if (!pipeline)
-  {
-    if (gs_is_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
-    if (tes_is_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-    if (tcs_is_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-    if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-    if (fs_is_temp && fs_module) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
-    if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
-    hina_destroy_pipeline_reflection(ctx, e->reflection);
-    e->reflection = NULL;
-    hina_pipeline_slot_free(idx);
-    return (hina_pipeline){HINA_INVALID_HANDLE};
-  }
-  // Cleanup temp shader modules (cached modules are kept for reuse)
-  if (gs_is_temp && gs_module) vkDestroyShaderModule(ctx->core.device->core.device, gs_module, NULL);
-  if (tes_is_temp && tes_module) vkDestroyShaderModule(ctx->core.device->core.device, tes_module, NULL);
-  if (tcs_is_temp && tcs_module) vkDestroyShaderModule(ctx->core.device->core.device, tcs_module, NULL);
-  if (vs_is_temp) vkDestroyShaderModule(ctx->core.device->core.device, vs_module, NULL);
-  if (fs_is_temp && fs_module) vkDestroyShaderModule(ctx->core.device->core.device, fs_module, NULL);
+  if (!pipeline) goto pipeline_from_module_cleanup;
+  // Success: cleanup temp shader modules only (cached modules are kept for reuse)
+  for (uint32_t i = 0; i < temp_module_count; ++i)
+    if (temp_modules[i].is_temp && temp_modules[i].mod)
+      vkDestroyShaderModule(ctx->core.device->core.device, temp_modules[i].mod, NULL);
   HINA_LOGI(ctx, "=== Pipeline created from module successfully (id=%u) ===", handle.id);
   return handle;
+
+pipeline_from_module_cleanup:
+  for (uint32_t i = 0; i < temp_module_count; ++i)
+    if (temp_modules[i].is_temp && temp_modules[i].mod)
+      vkDestroyShaderModule(ctx->core.device->core.device, temp_modules[i].mod, NULL);
+  if (layout) vkDestroyPipelineLayout(ctx->core.device->core.device, layout, NULL);
+  hina_destroy_pipeline_reflection(ctx, e->reflection);
+  e->reflection = NULL;
+  hina_pipeline_slot_free(idx);
+  return (hina_pipeline){HINA_INVALID_HANDLE};
 }
 
 // Internal implementation for compute pipelines
@@ -16494,7 +16243,8 @@ hina_cmd* hina_ctx_cmd_begin_ex(hina_context* ctx, hina_queue queue)
   }
   cmd->immediate = immediate;
   cmd->current_layout = VK_NULL_HANDLE;
-  cmd->current_push_constant_stages = 0;
+  cmd->current_push_constant_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                       VK_SHADER_STAGE_COMPUTE_BIT;
   cmd->current_push_constant_size = HINA_MAX_PUSH_CONSTANT_SIZE;
   // Initialize dynamic state to "unset" values (will trigger first-time set)
   cmd->dynamic_state.line_width = -1.0f; // Invalid, forces first set
@@ -16634,8 +16384,8 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
         HINA_LOGW(ctx, "hina_cmd_begin_pass: transient color on swapchain image forces STORE");
       }
     }
-    VkAttachmentLoadOp color_load = hina_load_to_vk((uint8_t)color_load_action);
-    VkAttachmentStoreOp color_store = hina_store_to_vk((uint8_t)color_store_action);
+    VkAttachmentLoadOp color_load = hina_load_op_to_vk(color_load_action);
+    VkAttachmentStoreOp color_store = hina_store_op_to_vk(color_store_action);
     // For render pass compatibility, use UNDEFINED as initial layout when doing CLEAR
     VkImageLayout color_initial = VK_IMAGE_LAYOUT_UNDEFINED;
     if (color_load == VK_ATTACHMENT_LOAD_OP_LOAD)
@@ -16705,8 +16455,8 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
         if (depth_load_action != HINA_LOAD_OP_CLEAR) depth_load_action = HINA_LOAD_OP_DONT_CARE;
         depth_store_action = HINA_STORE_OP_DONT_CARE;
       }
-      depth_load = hina_load_to_vk((uint8_t)depth_load_action);
-      depth_store = hina_store_to_vk((uint8_t)depth_store_action);
+      depth_load = hina_load_op_to_vk(depth_load_action);
+      depth_store = hina_store_op_to_vk(depth_store_action);
       HINA_ASSERTF(depth_hot->dims.width >= color_hot->dims.width && depth_hot->dims.height >= color_hot->dims.height,
                    "depth buffer (%ux%u) must be >= color attachment (%ux%u)", depth_hot->dims.width,
                    depth_hot->dims.height, color_hot->dims.width, color_hot->dims.height);
@@ -16753,406 +16503,239 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
   HINA_ZONE_END();
 }
 
-// Dynamic Rendering with sync2 barriers - NOINLINE keeps sync2 code isolated for I-Cache
-HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_sync2(hina_cmd* cmd, const hina_pass_action* action)
+// Helper used by the sync2 instantiation of HINA_IMPL_BEGIN_PASS_DYNAMIC.
+// Wrapping the VkDependencyInfo compound literal in a function avoids unprotected
+// commas inside the macro argument (C preprocessors only protect commas inside ()).
+static HINA_INLINE void hina_emit_barriers_sync2(
+    VkCommandBuffer vk_cmd, VkImageMemoryBarrier2* barriers, uint32_t count, hina_context* ctx)
 {
-  HINA_ZONE_N("begin_pass_dyn_s2");
-  hina_context* ctx = cmd->ctx;
-  HINA_DEBUG_INC_PASS(ctx);
-  HINA_GPU_ZONE_BEGIN(ctx->core.device, cmd, "render_pass");
-  const bool transient_color = (action->flags & HINA_PASS_TRANSIENT_COLOR_BIT) != 0;
-  const bool transient_depth = (action->flags & HINA_PASS_TRANSIENT_DEPTH_BIT) != 0;
-  VkRenderingAttachmentInfo color_infos[HINA_MAX_COLOR_ATTACHMENTS];
-  uint32_t color_count = 0;
-  memset(cmd->color_views, 0, sizeof(cmd->color_views));
-  cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE};
-  VkRenderingAttachmentInfo depth_info = {0};
-  VkRenderingAttachmentInfo stencil_info = {0};
-  bool has_depth = false;
-  bool has_stencil = false;
-  uint32_t width = action->width;
-  uint32_t height = action->height;
-  // Sync2 path: VkImageMemoryBarrier2 with per-barrier stage masks (88-byte stride)
-  // Max barriers = colors + resolves + depth = 4 + 4 + 1 = 9
-  VkImageMemoryBarrier2 barriers[HINA_MAX_COLOR_ATTACHMENTS * 2 + 1];
-  uint32_t barrier_count = 0;
-  for (uint32_t i = 0; i < HINA_MAX_COLOR_ATTACHMENTS; ++i)
-  {
-    hina_texture_view color_view_handle = action->colors[i].image;
-    if (color_view_handle.id == HINA_INVALID_HANDLE) break;
-    hina_texture_view_slot* color_view_slot = NULL;
-    VkImageView view = hina_get_or_create_view(color_view_handle, VK_IMAGE_ASPECT_COLOR_BIT, &color_view_slot);
-    if (!view || !color_view_slot) continue;
-    hina_texture_hot* hot = HINA_TEX_HOT(color_view_slot->parent_idx);
-    if (!hot->owns_image) cmd->uses_swapchain = true;
-    hina_layout_state target = hina_layout_for_hint(cmd->ctx, cmd->family_idx, HINA_TEXSTATE_COLOR_ATTACHMENT);
-    if (hot->state.layout != target.layout || hot->state.access != target.access || hot->state.stages != target.stages)
-    {
-      barriers[barrier_count++] = (VkImageMemoryBarrier2){
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = hot->state.stages,
-        .srcAccessMask = hot->state.access, .dstStageMask = target.stages, .dstAccessMask = target.access,
-        .oldLayout = hot->state.layout, .newLayout = target.layout, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = hot->vk.image,
-        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-      };
-      hot->state.layout = target.layout;
-      hot->state.access = target.access;
-      hot->state.stages = target.stages;
-    }
-    VkRenderingAttachmentInfo att = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    att.imageView = view;
-    att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    hina_load_op load_action = action->colors[i].load_op;
-    hina_store_op store_action = action->colors[i].store_op;
-    if (transient_color)
-    {
-      if (load_action != HINA_LOAD_OP_CLEAR) load_action = HINA_LOAD_OP_DONT_CARE;
-      store_action = HINA_STORE_OP_DONT_CARE;
-      if (!hot->owns_image)
-      {
-        store_action = HINA_STORE_OP_STORE;
-        HINA_LOGW(ctx, "hina_cmd_begin_pass: transient color on swapchain image forces STORE");
-      }
-    }
-    att.loadOp = load_action == HINA_LOAD_OP_CLEAR
-                   ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                   : load_action == HINA_LOAD_OP_LOAD
-                   ? VK_ATTACHMENT_LOAD_OP_LOAD
-                   : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att.storeOp = store_action == HINA_STORE_OP_STORE ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    memcpy(att.clearValue.color.float32, action->colors[i].clear_color, sizeof(float) * 4);
-    hina_texture_view resolve_view_handle = action->colors[i].resolve;
-    if (resolve_view_handle.id != HINA_INVALID_HANDLE)
-    {
-      hina_texture_view_slot* resolve_view_slot = NULL;
-      VkImageView resolve_view = hina_get_or_create_view(resolve_view_handle, VK_IMAGE_ASPECT_COLOR_BIT,
-                                                         &resolve_view_slot);
-      if (resolve_view && resolve_view_slot)
-      {
-        hina_texture_hot* resolve_hot = HINA_TEX_HOT(resolve_view_slot->parent_idx);
-        if (!resolve_hot->owns_image) cmd->uses_swapchain = true;
-        hina_layout_state resolve_target = hina_layout_for_hint(
-          cmd->ctx, cmd->family_idx, HINA_TEXSTATE_COLOR_ATTACHMENT);
-        if (resolve_hot->state.layout != resolve_target.layout || resolve_hot->state.access != resolve_target.access ||
-          resolve_hot->state.stages != resolve_target.stages)
-        {
-          barriers[barrier_count++] = (VkImageMemoryBarrier2){
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = resolve_hot->state.stages,
-            .srcAccessMask = resolve_hot->state.access, .dstStageMask = resolve_target.stages,
-            .dstAccessMask = resolve_target.access, .oldLayout = resolve_hot->state.layout,
-            .newLayout = resolve_target.layout, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = resolve_hot->vk.image,
-            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-          };
-          resolve_hot->state.layout = resolve_target.layout;
-          resolve_hot->state.access = resolve_target.access;
-          resolve_hot->state.stages = resolve_target.stages;
-        }
-        att.resolveMode = hina_resolve_mode_for_format(resolve_hot->dims.format);
-        att.resolveImageView = resolve_view;
-        att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      }
-    }
-    color_infos[color_count] = att;
-    cmd->color_views[color_count] = color_view_handle;
-    cmd->resolve_views[color_count] = resolve_view_handle;
-    color_count++;
-  }
-  cmd->color_count = color_count;
-  if (width == 0 && color_count)
-  {
-    hina_texture_view first_view = cmd->color_views[0];
-    if (hina_texture_view_slot_valid(first_view))
-    {
-      hina_texture_view_slot* view_slot = hina_texture_view_slot_get(hina_id_index(first_view.id));
-      hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx);
-      width = hot->dims.width;
-      height = hot->dims.height;
-    }
-  }
-  hina_texture_view depth_view_handle = action->depth.image;
-  hina_texture_view_slot* depth_view_slot = NULL;
-  VkImageView depth_view = hina_get_or_create_view(depth_view_handle, VK_IMAGE_ASPECT_DEPTH_BIT, &depth_view_slot);
-  if (depth_view && depth_view_slot)
-  {
-    hina_texture_hot* dh = HINA_TEX_HOT(depth_view_slot->parent_idx);
-    hina_layout_state target = hina_layout_for_hint(cmd->ctx, cmd->family_idx, HINA_TEXSTATE_DEPTH_ATTACHMENT);
-    if (dh->state.layout != target.layout || dh->state.access != target.access || dh->state.stages != target.stages)
-    {
-      VkImageAspectFlags depth_aspect = hina_aspect_from_format(dh->dims.format);
-      barriers[barrier_count++] = (VkImageMemoryBarrier2){
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = dh->state.stages,
-        .srcAccessMask = dh->state.access, .dstStageMask = target.stages, .dstAccessMask = target.access,
-        .oldLayout = dh->state.layout, .newLayout = target.layout, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = dh->vk.image,
-        .subresourceRange = {depth_aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-      };
-      dh->state.layout = target.layout;
-      dh->state.access = target.access;
-      dh->state.stages = target.stages;
-    }
-    cmd->depth_view = depth_view_handle;
-    VkImageAspectFlags view_aspect = hina_view_aspect_flags(depth_view_slot);
-    has_stencil = (view_aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
-    depth_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depth_info.imageView = depth_view;
-    depth_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    hina_load_op depth_load_action = action->depth.load_op;
-    hina_store_op depth_store_action = action->depth.store_op;
-    if (transient_depth)
-    {
-      if (depth_load_action != HINA_LOAD_OP_CLEAR) depth_load_action = HINA_LOAD_OP_DONT_CARE;
-      depth_store_action = HINA_STORE_OP_DONT_CARE;
-    }
-    depth_info.loadOp = depth_load_action == HINA_LOAD_OP_CLEAR
-                          ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                          : depth_load_action == HINA_LOAD_OP_LOAD
-                          ? VK_ATTACHMENT_LOAD_OP_LOAD
-                          : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depth_info.storeOp = depth_store_action == HINA_STORE_OP_STORE
-                           ? VK_ATTACHMENT_STORE_OP_STORE
-                           : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth_info.clearValue.depthStencil.depth = action->depth.depth_clear;
-    depth_info.clearValue.depthStencil.stencil = action->depth.stencil_clear;
-    has_depth = true;
-    if (has_stencil)
-    {
-      stencil_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-      stencil_info.imageView = depth_view;
-      stencil_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-      stencil_info.loadOp = depth_info.loadOp;
-      stencil_info.storeOp = depth_info.storeOp;
-      stencil_info.clearValue.depthStencil.depth = action->depth.depth_clear;
-      stencil_info.clearValue.depthStencil.stencil = action->depth.stencil_clear;
-    }
-    if (width == 0)
-    {
-      width = dh->dims.width;
-      height = dh->dims.height;
-    }
-    HINA_ASSERTF(dh->dims.width >= width && dh->dims.height >= height,
-                 "depth buffer (%ux%u) must be >= render area (%ux%u)", dh->dims.width, dh->dims.height, width, height);
-  }
-  if (barrier_count > 0)
-  {
-    VkDependencyInfo dep = {
-      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = barrier_count,
-      .pImageMemoryBarriers = barriers
-    };
-    vkCmdPipelineBarrier2(cmd->vk_cmd, &dep);
-    HINA_DEBUG_ADD_BARRIERS(ctx, barrier_count);
-  }
-  const VkRenderingInfo info = {
-    .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {width, height}}, .layerCount = 1,
-    .colorAttachmentCount = color_count, .pColorAttachments = color_count ? color_infos : NULL,
-    .pDepthAttachment = has_depth ? &depth_info : NULL, .pStencilAttachment = has_stencil ? &stencil_info : NULL
+  VkDependencyInfo dep = {
+    .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+    .imageMemoryBarrierCount = count,
+    .pImageMemoryBarriers = barriers
   };
-  vkCmdBeginRendering(cmd->vk_cmd, &info);
-  hina_cmd_set_viewport_scissor_internal(cmd, width, height);
-  cmd->is_rendering = true;
-  HINA_ZONE_END();
+  vkCmdPipelineBarrier2(vk_cmd, &dep);
+  HINA_DEBUG_ADD_BARRIERS(ctx, count);
 }
 
-// Dynamic Rendering with legacy barriers - NOINLINE keeps legacy code isolated for I-Cache
-HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_legacy(hina_cmd* cmd, const hina_pass_action* action)
-{
-  HINA_ZONE_N("begin_pass_dyn_leg");
-  hina_context* ctx = cmd->ctx;
-  HINA_DEBUG_INC_PASS(ctx);
-  HINA_GPU_ZONE_BEGIN(ctx->core.device, cmd, "render_pass");
-  const bool transient_color = (action->flags & HINA_PASS_TRANSIENT_COLOR_BIT) != 0;
-  const bool transient_depth = (action->flags & HINA_PASS_TRANSIENT_DEPTH_BIT) != 0;
-  VkRenderingAttachmentInfo color_infos[HINA_MAX_COLOR_ATTACHMENTS];
-  uint32_t color_count = 0;
-  memset(cmd->color_views, 0, sizeof(cmd->color_views));
-  cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE};
-  VkRenderingAttachmentInfo depth_info = {0};
-  VkRenderingAttachmentInfo stencil_info = {0};
-  bool has_depth = false;
-  bool has_stencil = false;
-  uint32_t width = action->width;
-  uint32_t height = action->height;
-  VkImageMemoryBarrier barriers[HINA_MAX_COLOR_ATTACHMENTS * 2 + 2];
-  uint32_t barrier_count = 0;
-  VkPipelineStageFlags src_stages = 0;
-  VkPipelineStageFlags dst_stages = 0;
-  for (uint32_t i = 0; i < HINA_MAX_COLOR_ATTACHMENTS; ++i)
-  {
-    hina_texture_view color_view_handle = action->colors[i].image;
-    if (color_view_handle.id == HINA_INVALID_HANDLE) break;
-    hina_texture_view_slot* color_view_slot = NULL;
-    VkImageView view = hina_get_or_create_view(color_view_handle, VK_IMAGE_ASPECT_COLOR_BIT, &color_view_slot);
-    if (!view || !color_view_slot) continue;
-    hina_texture_hot* hot = HINA_TEX_HOT(color_view_slot->parent_idx);
-    if (!hot->owns_image) cmd->uses_swapchain = true;
-    hina_layout_state target = hina_layout_for_hint(cmd->ctx, cmd->family_idx, HINA_TEXSTATE_COLOR_ATTACHMENT);
-    if (hot->state.layout != target.layout || hot->state.access != target.access || hot->state.stages != target.stages)
-    {
-      barriers[barrier_count++] = (VkImageMemoryBarrier){
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = hot->state.access,
-        .dstAccessMask = target.access, .oldLayout = hot->state.layout, .newLayout = target.layout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = hot->vk.image,
-        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-      };
-      src_stages |= hot->state.stages;
-      dst_stages |= target.stages;
-      hot->state.layout = target.layout;
-      hot->state.access = target.access;
-      hot->state.stages = target.stages;
-    }
-    VkRenderingAttachmentInfo att = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    att.imageView = view;
-    att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    hina_load_op load_action = action->colors[i].load_op;
-    hina_store_op store_action = action->colors[i].store_op;
-    if (transient_color)
-    {
-      if (load_action != HINA_LOAD_OP_CLEAR) load_action = HINA_LOAD_OP_DONT_CARE;
-      store_action = HINA_STORE_OP_DONT_CARE;
-      if (!hot->owns_image)
-      {
-        store_action = HINA_STORE_OP_STORE;
-        HINA_LOGW(ctx, "hina_cmd_begin_pass: transient color on swapchain image forces STORE");
-      }
-    }
-    att.loadOp = load_action == HINA_LOAD_OP_CLEAR
-                   ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                   : load_action == HINA_LOAD_OP_LOAD
-                   ? VK_ATTACHMENT_LOAD_OP_LOAD
-                   : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att.storeOp = store_action == HINA_STORE_OP_STORE ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    memcpy(att.clearValue.color.float32, action->colors[i].clear_color, sizeof(float) * 4);
-    hina_texture_view resolve_view_handle = action->colors[i].resolve;
-    if (resolve_view_handle.id != HINA_INVALID_HANDLE)
-    {
-      hina_texture_view_slot* resolve_view_slot = NULL;
-      VkImageView resolve_view = hina_get_or_create_view(resolve_view_handle, VK_IMAGE_ASPECT_COLOR_BIT,
-                                                         &resolve_view_slot);
-      if (resolve_view && resolve_view_slot)
-      {
-        hina_texture_hot* resolve_hot = HINA_TEX_HOT(resolve_view_slot->parent_idx);
-        if (!resolve_hot->owns_image) cmd->uses_swapchain = true;
-        hina_layout_state resolve_target = hina_layout_for_hint(
-          cmd->ctx, cmd->family_idx, HINA_TEXSTATE_COLOR_ATTACHMENT);
-        if (resolve_hot->state.layout != resolve_target.layout || resolve_hot->state.access != resolve_target.access ||
-          resolve_hot->state.stages != resolve_target.stages)
-        {
-          barriers[barrier_count++] = (VkImageMemoryBarrier){
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = resolve_hot->state.access,
-            .dstAccessMask = resolve_target.access, .oldLayout = resolve_hot->state.layout,
-            .newLayout = resolve_target.layout, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = resolve_hot->vk.image,
-            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-          };
-          src_stages |= resolve_hot->state.stages;
-          dst_stages |= resolve_target.stages;
-          resolve_hot->state.layout = resolve_target.layout;
-          resolve_hot->state.access = resolve_target.access;
-          resolve_hot->state.stages = resolve_target.stages;
-        }
-        att.resolveMode = hina_resolve_mode_for_format(resolve_hot->dims.format);
-        att.resolveImageView = resolve_view;
-        att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      }
-    }
-    color_infos[color_count] = att;
-    cmd->color_views[color_count] = color_view_handle;
-    cmd->resolve_views[color_count] = resolve_view_handle;
-    color_count++;
+// --- begin_pass_dynamic template: generates sync2 and legacy variants from a single body ---
+// Barrier fill: sync2 variant — per-barrier stage masks in VkImageMemoryBarrier2
+#define HINA_PASS_FILL_BARRIER_S2(hot_ptr, tgt, aspect_val) \
+  barriers[barrier_count++] = (VkImageMemoryBarrier2){ \
+    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = (hot_ptr)->state.stages, \
+    .srcAccessMask = (hot_ptr)->state.access, .dstStageMask = (tgt).stages, .dstAccessMask = (tgt).access, \
+    .oldLayout = (hot_ptr)->state.layout, .newLayout = (tgt).layout, \
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, \
+    .image = (hot_ptr)->vk.image, \
+    .subresourceRange = {(aspect_val), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS} \
   }
-  cmd->color_count = color_count;
-  if (width == 0 && color_count)
-  {
-    hina_texture_view first_view = cmd->color_views[0];
-    if (hina_texture_view_slot_valid(first_view))
-    {
-      hina_texture_view_slot* view_slot = hina_texture_view_slot_get(hina_id_index(first_view.id));
-      hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx);
-      width = hot->dims.width;
-      height = hot->dims.height;
-    }
-  }
-  hina_texture_view depth_view_handle = action->depth.image;
-  hina_texture_view_slot* depth_view_slot = NULL;
-  VkImageView depth_view = hina_get_or_create_view(depth_view_handle, VK_IMAGE_ASPECT_DEPTH_BIT, &depth_view_slot);
-  if (depth_view && depth_view_slot)
-  {
-    hina_texture_hot* dh = HINA_TEX_HOT(depth_view_slot->parent_idx);
-    hina_layout_state target = hina_layout_for_hint(cmd->ctx, cmd->family_idx, HINA_TEXSTATE_DEPTH_ATTACHMENT);
-    if (dh->state.layout != target.layout || dh->state.access != target.access || dh->state.stages != target.stages)
-    {
-      VkImageAspectFlags depth_aspect = hina_aspect_from_format(dh->dims.format);
-      barriers[barrier_count++] = (VkImageMemoryBarrier){
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = dh->state.access,
-        .dstAccessMask = target.access, .oldLayout = dh->state.layout, .newLayout = target.layout,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = dh->vk.image,
-        .subresourceRange = {depth_aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-      };
-      src_stages |= dh->state.stages;
-      dst_stages |= target.stages;
-      dh->state.layout = target.layout;
-      dh->state.access = target.access;
-      dh->state.stages = target.stages;
-    }
-    cmd->depth_view = depth_view_handle;
-    VkImageAspectFlags view_aspect = hina_view_aspect_flags(depth_view_slot);
-    has_stencil = (view_aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
-    depth_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    depth_info.imageView = depth_view;
-    depth_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    hina_load_op depth_load_action = action->depth.load_op;
-    hina_store_op depth_store_action = action->depth.store_op;
-    if (transient_depth)
-    {
-      if (depth_load_action != HINA_LOAD_OP_CLEAR) depth_load_action = HINA_LOAD_OP_DONT_CARE;
-      depth_store_action = HINA_STORE_OP_DONT_CARE;
-    }
-    depth_info.loadOp = depth_load_action == HINA_LOAD_OP_CLEAR
-                          ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                          : depth_load_action == HINA_LOAD_OP_LOAD
-                          ? VK_ATTACHMENT_LOAD_OP_LOAD
-                          : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depth_info.storeOp = depth_store_action == HINA_STORE_OP_STORE
-                           ? VK_ATTACHMENT_STORE_OP_STORE
-                           : VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth_info.clearValue.depthStencil.depth = action->depth.depth_clear;
-    depth_info.clearValue.depthStencil.stencil = action->depth.stencil_clear;
-    has_depth = true;
-    if (has_stencil)
-    {
-      stencil_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-      stencil_info.imageView = depth_view;
-      stencil_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-      stencil_info.loadOp = depth_info.loadOp;
-      stencil_info.storeOp = depth_info.storeOp;
-      stencil_info.clearValue.depthStencil.depth = action->depth.depth_clear;
-      stencil_info.clearValue.depthStencil.stencil = action->depth.stencil_clear;
-    }
-    if (width == 0)
-    {
-      width = dh->dims.width;
-      height = dh->dims.height;
-    }
-    HINA_ASSERTF(dh->dims.width >= width && dh->dims.height >= height,
-                 "depth buffer (%ux%u) must be >= render area (%ux%u)", dh->dims.width, dh->dims.height, width, height);
-  }
-  if (barrier_count > 0)
-  {
-    vkCmdPipelineBarrier(cmd->vk_cmd, src_stages, dst_stages, 0, 0, NULL, 0, NULL, barrier_count, barriers);
-    HINA_DEBUG_ADD_BARRIERS(ctx, barrier_count);
-  }
-  const VkRenderingInfo info = {
-    .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {width, height}}, .layerCount = 1,
-    .colorAttachmentCount = color_count, .pColorAttachments = color_count ? color_infos : NULL,
-    .pDepthAttachment = has_depth ? &depth_info : NULL, .pStencilAttachment = has_stencil ? &stencil_info : NULL
-  };
-  vkCmdBeginRendering(cmd->vk_cmd, &info);
-  hina_cmd_set_viewport_scissor_internal(cmd, width, height);
-  cmd->is_rendering = true;
-  HINA_ZONE_END();
+
+// Barrier fill: legacy variant — accumulated stage masks via src_stages/dst_stages
+#define HINA_PASS_FILL_BARRIER_LEG(hot_ptr, tgt, aspect_val) \
+  barriers[barrier_count++] = (VkImageMemoryBarrier){ \
+    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = (hot_ptr)->state.access, \
+    .dstAccessMask = (tgt).access, .oldLayout = (hot_ptr)->state.layout, .newLayout = (tgt).layout, \
+    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, \
+    .image = (hot_ptr)->vk.image, \
+    .subresourceRange = {(aspect_val), 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS} \
+  }; \
+  src_stages |= (hot_ptr)->state.stages; \
+  dst_stages |= (tgt).stages
+
+#define HINA_IMPL_BEGIN_PASS_DYNAMIC(SUFFIX, ZONE_STR, BARRIER_TYPE, BARRIER_ARRAY_SIZE, \
+                                     BARRIER_DECL_EXTRA, FILL_BARRIER, EMIT_BARRIERS) \
+HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_##SUFFIX( \
+    hina_cmd* cmd, const hina_pass_action* action) \
+{ \
+  HINA_ZONE_N(ZONE_STR); \
+  hina_context* ctx = cmd->ctx; \
+  HINA_DEBUG_INC_PASS(ctx); \
+  HINA_GPU_ZONE_BEGIN(ctx->core.device, cmd, "render_pass"); \
+  const bool transient_color = (action->flags & HINA_PASS_TRANSIENT_COLOR_BIT) != 0; \
+  const bool transient_depth = (action->flags & HINA_PASS_TRANSIENT_DEPTH_BIT) != 0; \
+  VkRenderingAttachmentInfo color_infos[HINA_MAX_COLOR_ATTACHMENTS]; \
+  uint32_t color_count = 0; \
+  memset(cmd->color_views, 0, sizeof(cmd->color_views)); \
+  cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE}; \
+  VkRenderingAttachmentInfo depth_info = {0}; \
+  VkRenderingAttachmentInfo stencil_info = {0}; \
+  bool has_depth = false; \
+  bool has_stencil = false; \
+  uint32_t width = action->width; \
+  uint32_t height = action->height; \
+  BARRIER_TYPE barriers[BARRIER_ARRAY_SIZE]; \
+  uint32_t barrier_count = 0; \
+  BARRIER_DECL_EXTRA \
+  for (uint32_t i = 0; i < HINA_MAX_COLOR_ATTACHMENTS; ++i) \
+  { \
+    hina_texture_view color_view_handle = action->colors[i].image; \
+    if (color_view_handle.id == HINA_INVALID_HANDLE) break; \
+    hina_texture_view_slot* color_view_slot = NULL; \
+    VkImageView view = hina_get_or_create_view(color_view_handle, VK_IMAGE_ASPECT_COLOR_BIT, &color_view_slot); \
+    if (!view || !color_view_slot) continue; \
+    hina_texture_hot* hot = HINA_TEX_HOT(color_view_slot->parent_idx); \
+    if (!hot->owns_image) cmd->uses_swapchain = true; \
+    hina_layout_state target = hina_layout_for_hint(cmd->ctx, cmd->family_idx, HINA_TEXSTATE_COLOR_ATTACHMENT); \
+    if (hot->state.layout != target.layout || hot->state.access != target.access || hot->state.stages != target.stages) \
+    { \
+      FILL_BARRIER(hot, target, VK_IMAGE_ASPECT_COLOR_BIT); \
+      hot->state.layout = target.layout; \
+      hot->state.access = target.access; \
+      hot->state.stages = target.stages; \
+    } \
+    VkRenderingAttachmentInfo att = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}; \
+    att.imageView = view; \
+    att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; \
+    hina_load_op load_action = action->colors[i].load_op; \
+    hina_store_op store_action = action->colors[i].store_op; \
+    if (transient_color) \
+    { \
+      if (load_action != HINA_LOAD_OP_CLEAR) load_action = HINA_LOAD_OP_DONT_CARE; \
+      store_action = HINA_STORE_OP_DONT_CARE; \
+      if (!hot->owns_image) \
+      { \
+        store_action = HINA_STORE_OP_STORE; \
+        HINA_LOGW(ctx, "hina_cmd_begin_pass: transient color on swapchain image forces STORE"); \
+      } \
+    } \
+    att.loadOp = load_action == HINA_LOAD_OP_CLEAR \
+                   ? VK_ATTACHMENT_LOAD_OP_CLEAR \
+                   : load_action == HINA_LOAD_OP_LOAD \
+                   ? VK_ATTACHMENT_LOAD_OP_LOAD \
+                   : VK_ATTACHMENT_LOAD_OP_DONT_CARE; \
+    att.storeOp = store_action == HINA_STORE_OP_STORE ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE; \
+    memcpy(att.clearValue.color.float32, action->colors[i].clear_color, sizeof(float) * 4); \
+    hina_texture_view resolve_view_handle = action->colors[i].resolve; \
+    if (resolve_view_handle.id != HINA_INVALID_HANDLE) \
+    { \
+      hina_texture_view_slot* resolve_view_slot = NULL; \
+      VkImageView resolve_view = hina_get_or_create_view(resolve_view_handle, VK_IMAGE_ASPECT_COLOR_BIT, \
+                                                         &resolve_view_slot); \
+      if (resolve_view && resolve_view_slot) \
+      { \
+        hina_texture_hot* resolve_hot = HINA_TEX_HOT(resolve_view_slot->parent_idx); \
+        if (!resolve_hot->owns_image) cmd->uses_swapchain = true; \
+        hina_layout_state resolve_target = hina_layout_for_hint( \
+          cmd->ctx, cmd->family_idx, HINA_TEXSTATE_COLOR_ATTACHMENT); \
+        if (resolve_hot->state.layout != resolve_target.layout || resolve_hot->state.access != resolve_target.access || \
+          resolve_hot->state.stages != resolve_target.stages) \
+        { \
+          FILL_BARRIER(resolve_hot, resolve_target, VK_IMAGE_ASPECT_COLOR_BIT); \
+          resolve_hot->state.layout = resolve_target.layout; \
+          resolve_hot->state.access = resolve_target.access; \
+          resolve_hot->state.stages = resolve_target.stages; \
+        } \
+        att.resolveMode = hina_resolve_mode_for_format(resolve_hot->dims.format); \
+        att.resolveImageView = resolve_view; \
+        att.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; \
+      } \
+    } \
+    color_infos[color_count] = att; \
+    cmd->color_views[color_count] = color_view_handle; \
+    cmd->resolve_views[color_count] = resolve_view_handle; \
+    color_count++; \
+  } \
+  cmd->color_count = color_count; \
+  if (width == 0 && color_count) \
+  { \
+    hina_texture_view first_view = cmd->color_views[0]; \
+    if (hina_texture_view_slot_valid(first_view)) \
+    { \
+      hina_texture_view_slot* view_slot = hina_texture_view_slot_get(hina_id_index(first_view.id)); \
+      hina_texture_hot* hot = HINA_TEX_HOT(view_slot->parent_idx); \
+      width = hot->dims.width; \
+      height = hot->dims.height; \
+    } \
+  } \
+  hina_texture_view depth_view_handle = action->depth.image; \
+  hina_texture_view_slot* depth_view_slot = NULL; \
+  VkImageView depth_view = hina_get_or_create_view(depth_view_handle, VK_IMAGE_ASPECT_DEPTH_BIT, &depth_view_slot); \
+  if (depth_view && depth_view_slot) \
+  { \
+    hina_texture_hot* dh = HINA_TEX_HOT(depth_view_slot->parent_idx); \
+    hina_layout_state target = hina_layout_for_hint(cmd->ctx, cmd->family_idx, HINA_TEXSTATE_DEPTH_ATTACHMENT); \
+    if (dh->state.layout != target.layout || dh->state.access != target.access || dh->state.stages != target.stages) \
+    { \
+      VkImageAspectFlags depth_aspect = hina_aspect_from_format(dh->dims.format); \
+      FILL_BARRIER(dh, target, depth_aspect); \
+      dh->state.layout = target.layout; \
+      dh->state.access = target.access; \
+      dh->state.stages = target.stages; \
+    } \
+    cmd->depth_view = depth_view_handle; \
+    VkImageAspectFlags view_aspect = hina_view_aspect_flags(depth_view_slot); \
+    has_stencil = (view_aspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0; \
+    depth_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO; \
+    depth_info.imageView = depth_view; \
+    depth_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; \
+    hina_load_op depth_load_action = action->depth.load_op; \
+    hina_store_op depth_store_action = action->depth.store_op; \
+    if (transient_depth) \
+    { \
+      if (depth_load_action != HINA_LOAD_OP_CLEAR) depth_load_action = HINA_LOAD_OP_DONT_CARE; \
+      depth_store_action = HINA_STORE_OP_DONT_CARE; \
+    } \
+    depth_info.loadOp = depth_load_action == HINA_LOAD_OP_CLEAR \
+                          ? VK_ATTACHMENT_LOAD_OP_CLEAR \
+                          : depth_load_action == HINA_LOAD_OP_LOAD \
+                          ? VK_ATTACHMENT_LOAD_OP_LOAD \
+                          : VK_ATTACHMENT_LOAD_OP_DONT_CARE; \
+    depth_info.storeOp = depth_store_action == HINA_STORE_OP_STORE \
+                           ? VK_ATTACHMENT_STORE_OP_STORE \
+                           : VK_ATTACHMENT_STORE_OP_DONT_CARE; \
+    depth_info.clearValue.depthStencil.depth = action->depth.depth_clear; \
+    depth_info.clearValue.depthStencil.stencil = action->depth.stencil_clear; \
+    has_depth = true; \
+    if (has_stencil) \
+    { \
+      stencil_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO; \
+      stencil_info.imageView = depth_view; \
+      stencil_info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; \
+      stencil_info.loadOp = depth_info.loadOp; \
+      stencil_info.storeOp = depth_info.storeOp; \
+      stencil_info.clearValue.depthStencil.depth = action->depth.depth_clear; \
+      stencil_info.clearValue.depthStencil.stencil = action->depth.stencil_clear; \
+    } \
+    if (width == 0) \
+    { \
+      width = dh->dims.width; \
+      height = dh->dims.height; \
+    } \
+    HINA_ASSERTF(dh->dims.width >= width && dh->dims.height >= height, \
+                 "depth buffer (%ux%u) must be >= render area (%ux%u)", dh->dims.width, dh->dims.height, width, height); \
+  } \
+  if (barrier_count > 0) \
+  { \
+    EMIT_BARRIERS \
+  } \
+  const VkRenderingInfo info = { \
+    .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {width, height}}, .layerCount = 1, \
+    .colorAttachmentCount = color_count, .pColorAttachments = color_count ? color_infos : NULL, \
+    .pDepthAttachment = has_depth ? &depth_info : NULL, .pStencilAttachment = has_stencil ? &stencil_info : NULL \
+  }; \
+  vkCmdBeginRendering(cmd->vk_cmd, &info); \
+  hina_cmd_set_viewport_scissor_internal(cmd, width, height); \
+  cmd->is_rendering = true; \
+  HINA_ZONE_END(); \
 }
+
+// clang-format off
+HINA_IMPL_BEGIN_PASS_DYNAMIC(sync2, "begin_pass_dyn_s2", \
+  VkImageMemoryBarrier2, HINA_MAX_COLOR_ATTACHMENTS * 2 + 1, \
+  /*no extra decls*/, \
+  HINA_PASS_FILL_BARRIER_S2, \
+  { hina_emit_barriers_sync2(cmd->vk_cmd, barriers, barrier_count, ctx); })
+
+HINA_IMPL_BEGIN_PASS_DYNAMIC(legacy, "begin_pass_dyn_leg", \
+  VkImageMemoryBarrier, HINA_MAX_COLOR_ATTACHMENTS * 2 + 2, \
+  VkPipelineStageFlags src_stages = 0; VkPipelineStageFlags dst_stages = 0;, \
+  HINA_PASS_FILL_BARRIER_LEG, \
+  { vkCmdPipelineBarrier(cmd->vk_cmd, src_stages, dst_stages, 0, 0, NULL, 0, NULL, barrier_count, barriers); HINA_DEBUG_ADD_BARRIERS(ctx, barrier_count); })
+// clang-format on
+
+#undef HINA_IMPL_BEGIN_PASS_DYNAMIC
+#undef HINA_PASS_FILL_BARRIER_S2
+#undef HINA_PASS_FILL_BARRIER_LEG
 
 // Dynamic rendering thin dispatcher: branches on sync2 availability
 HINA_NOINLINE static void hina_cmd_begin_pass_dynamic(hina_cmd* cmd, const hina_pass_action* action)
@@ -18210,11 +17793,7 @@ void hina_cmd_push_constants(hina_cmd* cmd, uint32_t offset, uint32_t size, cons
                size + offset, max_pc);
   HINA_ASSERTF(cmd->current_layout != VK_NULL_HANDLE,
                "hina_cmd_push_constants: no pipeline bound - call hina_cmd_bind_pipeline first");
-  VkShaderStageFlags stages = cmd->current_push_constant_stages
-                                ? cmd->current_push_constant_stages
-                                : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
-                                VK_SHADER_STAGE_COMPUTE_BIT;
-  vkCmdPushConstants(cmd->vk_cmd, cmd->current_layout, stages, offset, size, data);
+  vkCmdPushConstants(cmd->vk_cmd, cmd->current_layout, cmd->current_push_constant_stages, offset, size, data);
   HINA_ZONE_END();
 }
 
@@ -18334,7 +17913,10 @@ void hina_cmd_bind_pipeline(hina_cmd* cmd, hina_pipeline pip)
   }
   cmd->bound_pipeline_kind = e->kind;
   cmd->current_layout = e->layout;
-  cmd->current_push_constant_stages = e->push_constant_stages;
+  cmd->current_push_constant_stages = e->push_constant_stages
+                                       ? e->push_constant_stages
+                                       : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                                         VK_SHADER_STAGE_COMPUTE_BIT;
   cmd->current_push_constant_size = e->push_constant_size ? e->push_constant_size : HINA_MAX_PUSH_CONSTANT_SIZE;
   cmd->current_pipeline = pip;
   // Use cached bind_point to avoid function call
@@ -19780,23 +19362,67 @@ void hina_cmd_apply_vertex_input(hina_cmd* cmd, const hina_vertex_input* b)
   }
 }
 
+// Lightweight command guard: asserts recording state and valid vk_cmd.
+// Used by transfer, barrier, label, query, and state-setting commands.
+#define HINA_VALIDATE_CMD(cmd, fname) do { \
+  HINA_ASSERT(cmd); \
+  HINA_ASSERT((cmd)->recording && fname ": command buffer must be recording"); \
+  HINA_ASSERT((cmd)->vk_cmd != VK_NULL_HANDLE && fname ": vk_cmd is NULL"); \
+} while(0)
+
+// Shared validation preambles for draw/dispatch commands.
+// Each asserts recording state, render pass state, pipeline kind, then validates+flushes bindings.
+#define HINA_VALIDATE_GRAPHICS_CMD(cmd, fname) do { \
+  HINA_ASSERT(cmd); \
+  HINA_ASSERT((cmd)->recording && fname ": command buffer must be recording"); \
+  HINA_ASSERT((cmd)->vk_cmd != VK_NULL_HANDLE && fname ": vk_cmd is NULL"); \
+  HINA_ASSERTF((cmd)->is_rendering, fname ": not inside a render pass - call hina_cmd_begin_pass first"); \
+  HINA_ASSERTF((cmd)->current_pipeline.id != HINA_INVALID_HANDLE, fname ": no pipeline bound - call hina_cmd_bind_pipeline first"); \
+  HINA_ASSERTF((cmd)->bound_pipeline_kind == HINA_PIPELINE_KIND_GRAPHICS, fname ": bound pipeline is not graphics"); \
+  hina_validate_bindings(cmd, fname); \
+  hina_flush_bindings(cmd); \
+} while(0)
+
+#define HINA_VALIDATE_COMPUTE_CMD(cmd, fname) do { \
+  HINA_ASSERT(cmd); \
+  HINA_ASSERT((cmd)->recording && fname ": command buffer must be recording"); \
+  HINA_ASSERT((cmd)->vk_cmd != VK_NULL_HANDLE && fname ": vk_cmd is NULL"); \
+  HINA_ASSERTF(!(cmd)->is_rendering, fname ": cannot dispatch compute inside a render pass"); \
+  HINA_ASSERTF((cmd)->current_pipeline.id != HINA_INVALID_HANDLE, fname ": no pipeline bound - call hina_cmd_bind_pipeline first"); \
+  HINA_ASSERTF((cmd)->bound_pipeline_kind == HINA_PIPELINE_KIND_COMPUTE, fname ": bound pipeline is not compute"); \
+  hina_validate_bindings(cmd, fname); \
+  hina_flush_bindings(cmd); \
+} while(0)
+
+// Validates an indirect buffer: slot validity, upload readiness, queue ownership.
+// Returns the buffer slot on success, or NULL if the buffer upload is still pending.
+static HINA_INLINE hina_buffer_slot* hina_validate_indirect_buffer(
+    hina_cmd* cmd, hina_buffer indirect_buf, const char* caller)
+{
+  hina_buffer_slot* buf_slot = hina_buffer_slot_get_valid(indirect_buf);
+  HINA_ASSERT(buf_slot);
+  uint16_t buf_idx = hina_id_index(indirect_buf.id);
+  hina_buffer_hot* bhot = HINA_BUF_HOT(buf_idx);
+  if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
+  {
+    if (!hina_buffer_upload_ready(cmd->ctx, buf_idx))
+    {
+      HINA_LOGW(cmd->ctx, "%s: indirect buffer upload pending (slot %u)", caller, buf_idx);
+      return NULL;
+    }
+  }
+  HINA_ASSERTF(
+    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed) == cmd->family_idx || hina_debug_has_pending_acquire(cmd, buf_idx),
+    "%s: indirect buffer owned by queue family %u but used on queue family %u - use hina_cmd_acquire_buffer",
+    caller, HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed), cmd->family_idx);
+  return buf_slot;
+}
+
 void hina_cmd_draw(hina_cmd* cmd, uint32_t vtx_count, uint32_t instance_count, uint32_t first_vtx,
                    uint32_t first_instance)
 {
   HINA_ZONE_N("draw");
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_draw: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_draw: vk_cmd is NULL");
-  // Vulkan spec: commandBuffer must be a primary command buffer inside a render pass instance
-  HINA_ASSERTF(cmd->is_rendering, "hina_cmd_draw: not inside a render pass - call hina_cmd_begin_pass first");
-  // Vulkan spec: A valid graphics pipeline must be bound to VK_PIPELINE_BIND_POINT_GRAPHICS
-  HINA_ASSERTF(cmd->current_pipeline.id != HINA_INVALID_HANDLE,
-               "hina_cmd_draw: no pipeline bound - call hina_cmd_bind_pipeline first");
-  HINA_ASSERTF(cmd->bound_pipeline_kind == HINA_PIPELINE_KIND_GRAPHICS,
-               "hina_cmd_draw: bound pipeline is not graphics");
-  hina_validate_bindings(cmd, "hina_cmd_draw");
-  hina_flush_bindings(cmd);
+  HINA_VALIDATE_GRAPHICS_CMD(cmd, "hina_cmd_draw");
   vkCmdDraw(cmd->vk_cmd, vtx_count, instance_count, first_vtx, first_instance);
   // Stats (unconditional - no branch overhead)
   ++cmd->ctx->stats.draw_calls;
@@ -19808,19 +19434,7 @@ void hina_cmd_draw_indexed(hina_cmd* cmd, uint32_t idx_count, uint32_t instance_
                            int32_t vertex_offset, uint32_t first_instance)
 {
   HINA_ZONE_N("draw_indexed");
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_draw_indexed: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_draw_indexed: vk_cmd is NULL");
-  // Vulkan spec: commandBuffer must be a primary command buffer inside a render pass instance
-  HINA_ASSERTF(cmd->is_rendering, "hina_cmd_draw_indexed: not inside a render pass - call hina_cmd_begin_pass first");
-  // Vulkan spec: A valid graphics pipeline must be bound to VK_PIPELINE_BIND_POINT_GRAPHICS
-  HINA_ASSERTF(cmd->current_pipeline.id != HINA_INVALID_HANDLE,
-               "hina_cmd_draw_indexed: no pipeline bound - call hina_cmd_bind_pipeline first");
-  HINA_ASSERTF(cmd->bound_pipeline_kind == HINA_PIPELINE_KIND_GRAPHICS,
-               "hina_cmd_draw_indexed: bound pipeline is not graphics");
-  hina_validate_bindings(cmd, "hina_cmd_draw_indexed");
-  hina_flush_bindings(cmd);
+  HINA_VALIDATE_GRAPHICS_CMD(cmd, "hina_cmd_draw_indexed");
   vkCmdDrawIndexed(cmd->vk_cmd, idx_count, instance_count, first_index, vertex_offset, first_instance);
   // Stats (unconditional - no branch overhead)
   ++cmd->ctx->stats.draw_calls;
@@ -19832,37 +19446,9 @@ void hina_cmd_draw_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t of
                             uint32_t stride)
 {
   HINA_ZONE_N("draw_indirect");
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_draw_indirect: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_draw_indirect: vk_cmd is NULL");
-  HINA_ASSERTF(cmd->is_rendering, "hina_cmd_draw_indirect: not inside a render pass - call hina_cmd_begin_pass first");
-  HINA_ASSERTF(cmd->current_pipeline.id != HINA_INVALID_HANDLE, "hina_cmd_draw_indirect: no pipeline bound");
-  HINA_ASSERTF(cmd->bound_pipeline_kind == HINA_PIPELINE_KIND_GRAPHICS,
-               "hina_cmd_draw_indirect: bound pipeline is not graphics");
-  // Validate and get buffer in one operation (avoids double index extraction)
-  hina_buffer_slot* buf_slot = hina_buffer_slot_get_valid(indirect_buf);
-  HINA_ASSERT(buf_slot);
-  uint16_t buf_idx = hina_id_index(indirect_buf.id);
-  hina_buffer_hot* bhot = HINA_BUF_HOT(buf_idx);
-  // Fast-path: skip atomic check if already marked ready in hot struct
-  if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
-  {
-    if (!hina_buffer_upload_ready(cmd->ctx, buf_idx))
-    {
-      HINA_LOGW(cmd->ctx, "hina_cmd_draw_indirect: indirect buffer upload pending (slot %u)", buf_idx);
-      return;
-    }
-  }
-  // Assert queue ownership (exclusive sharing mode)
-  // Also allow pending acquire (deferred ownership update for multi-threaded recording)
-  HINA_ASSERTF(
-    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed) == cmd->family_idx || hina_debug_has_pending_acquire(cmd,
-      buf_idx),
-    "hina_cmd_draw_indirect: indirect buffer owned by queue family %u but used on queue family %u - use hina_cmd_acquire_buffer",
-    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed), cmd->family_idx);
-  hina_validate_bindings(cmd, "hina_cmd_draw_indirect");
-  hina_flush_bindings(cmd);
+  HINA_VALIDATE_GRAPHICS_CMD(cmd, "hina_cmd_draw_indirect");
+  hina_buffer_slot* buf_slot = hina_validate_indirect_buffer(cmd, indirect_buf, "hina_cmd_draw_indirect");
+  if (!buf_slot) return;
   vkCmdDrawIndirect(cmd->vk_cmd, buf_slot->vk.buffer, offset, draw_count, stride);
   // Stats (vertex count unknown for indirect - only count draw calls)
   cmd->ctx->stats.draw_calls += draw_count;
@@ -19872,39 +19458,10 @@ void hina_cmd_draw_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t of
 void hina_cmd_draw_indexed_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t offset, uint32_t draw_count,
                                     uint32_t stride)
 {
-  HINA_ZONE_N("draw_indirect");
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_draw_indexed_indirect: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_draw_indexed_indirect: vk_cmd is NULL");
-  HINA_ASSERTF(cmd->is_rendering,
-               "hina_cmd_draw_indexed_indirect: not inside a render pass - call hina_cmd_begin_pass first");
-  HINA_ASSERTF(cmd->current_pipeline.id != HINA_INVALID_HANDLE, "hina_cmd_draw_indexed_indirect: no pipeline bound");
-  HINA_ASSERTF(cmd->bound_pipeline_kind == HINA_PIPELINE_KIND_GRAPHICS,
-               "hina_cmd_draw_indexed_indirect: bound pipeline is not graphics");
-  // Validate and get buffer in one operation (avoids double index extraction)
-  hina_buffer_slot* buf_slot = hina_buffer_slot_get_valid(indirect_buf);
-  HINA_ASSERT(buf_slot);
-  uint16_t buf_idx = hina_id_index(indirect_buf.id);
-  hina_buffer_hot* bhot = HINA_BUF_HOT(buf_idx);
-  // Fast-path: skip atomic check if already marked ready in hot struct
-  if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
-  {
-    if (!hina_buffer_upload_ready(cmd->ctx, buf_idx))
-    {
-      HINA_LOGW(cmd->ctx, "hina_cmd_draw_indexed_indirect: indirect buffer upload pending (slot %u)", buf_idx);
-      return;
-    }
-  }
-  // Assert queue ownership (exclusive sharing mode)
-  // Also allow pending acquire (deferred ownership update for multi-threaded recording)
-  HINA_ASSERTF(
-    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed) == cmd->family_idx || hina_debug_has_pending_acquire(cmd,
-      buf_idx),
-    "hina_cmd_draw_indexed_indirect: indirect buffer owned by queue family %u but used on queue family %u - use hina_cmd_acquire_buffer",
-    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed), cmd->family_idx);
-  hina_validate_bindings(cmd, "hina_cmd_draw_indexed_indirect");
-  hina_flush_bindings(cmd);
+  HINA_ZONE_N("draw_indexed_indirect");
+  HINA_VALIDATE_GRAPHICS_CMD(cmd, "hina_cmd_draw_indexed_indirect");
+  hina_buffer_slot* buf_slot = hina_validate_indirect_buffer(cmd, indirect_buf, "hina_cmd_draw_indexed_indirect");
+  if (!buf_slot) return;
   vkCmdDrawIndexedIndirect(cmd->vk_cmd, buf_slot->vk.buffer, offset, draw_count, stride);
   // Stats (vertex count unknown for indirect - only count draw calls)
   cmd->ctx->stats.draw_calls += draw_count;
@@ -19913,10 +19470,7 @@ void hina_cmd_draw_indexed_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uin
 
 void hina_cmd_set_depth_bias(hina_cmd* cmd, float constant, float slope, float clamp)
 {
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_set_depth_bias: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_set_depth_bias: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_set_depth_bias");
   // On dynamic path (has_dynamic_state2): also set enable based on whether bias is non-zero
   // On legacy path: enable is baked true, values of (0,0,0) effectively disable
   if (vkCmdSetDepthBiasEnable)
@@ -19988,28 +19542,14 @@ void hina_cmd_set_scissor(hina_cmd* cmd, const hina_scissor* scissor)
 
 void hina_cmd_set_line_width(hina_cmd* cmd, float width)
 {
-  HINA_ASSERT(cmd);
-  HINA_ASSERT(cmd->recording && "hina_cmd_set_line_width: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_set_line_width: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_set_line_width");
   vkCmdSetLineWidth(cmd->vk_cmd, width);
 }
 
 void hina_cmd_dispatch(hina_cmd* cmd, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z)
 {
   HINA_ZONE_N("dispatch");
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_dispatch: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_dispatch: vk_cmd is NULL");
-  // Vulkan spec: commandBuffer must NOT be inside a render pass instance
-  HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_dispatch: cannot dispatch compute inside a render pass");
-  // Vulkan spec: A valid compute pipeline must be bound to VK_PIPELINE_BIND_POINT_COMPUTE
-  HINA_ASSERTF(cmd->current_pipeline.id != HINA_INVALID_HANDLE,
-               "hina_cmd_dispatch: no pipeline bound - call hina_cmd_bind_pipeline first");
-  HINA_ASSERTF(cmd->bound_pipeline_kind == HINA_PIPELINE_KIND_COMPUTE,
-               "hina_cmd_dispatch: bound pipeline is not compute");
-  hina_validate_bindings(cmd, "hina_cmd_dispatch");
-  hina_flush_bindings(cmd);
+  HINA_VALIDATE_COMPUTE_CMD(cmd, "hina_cmd_dispatch");
   vkCmdDispatch(cmd->vk_cmd, group_count_x, group_count_y, group_count_z);
   ++cmd->ctx->stats.dispatch_calls;
   HINA_ZONE_END();
@@ -20018,37 +19558,9 @@ void hina_cmd_dispatch(hina_cmd* cmd, uint32_t group_count_x, uint32_t group_cou
 void hina_cmd_dispatch_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t offset)
 {
   HINA_ZONE_N("dispatch_indirect");
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_dispatch_indirect: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_dispatch_indirect: vk_cmd is NULL");
-  HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_dispatch_indirect: cannot dispatch compute inside a render pass");
-  HINA_ASSERTF(cmd->current_pipeline.id != HINA_INVALID_HANDLE, "hina_cmd_dispatch_indirect: no pipeline bound");
-  HINA_ASSERTF(cmd->bound_pipeline_kind == HINA_PIPELINE_KIND_COMPUTE,
-               "hina_cmd_dispatch_indirect: bound pipeline is not compute");
-  // Validate and get buffer in one operation (avoids double index extraction)
-  hina_buffer_slot* buf_slot = hina_buffer_slot_get_valid(indirect_buf);
-  HINA_ASSERT(buf_slot);
-  uint16_t buf_idx = hina_id_index(indirect_buf.id);
-  hina_buffer_hot* bhot = HINA_BUF_HOT(buf_idx);
-  // Fast-path: skip atomic check if already marked ready in hot struct
-  if (!HINA_BUFFER_IS_UPLOAD_READY(bhot->config.flags_packed))
-  {
-    if (!hina_buffer_upload_ready(cmd->ctx, buf_idx))
-    {
-      HINA_LOGW(cmd->ctx, "hina_cmd_dispatch_indirect: indirect buffer upload pending (slot %u)", buf_idx);
-      return;
-    }
-  }
-  // Assert queue ownership (exclusive sharing mode)
-  // Also allow pending acquire (deferred ownership update for multi-threaded recording)
-  HINA_ASSERTF(
-    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed) == cmd->family_idx || hina_debug_has_pending_acquire(cmd,
-      buf_idx),
-    "hina_cmd_dispatch_indirect: indirect buffer owned by queue family %u but used on queue family %u - use hina_cmd_acquire_buffer",
-    HINA_BUFFER_GET_OWNER(buf_slot->config.flags_packed), cmd->family_idx);
-  hina_validate_bindings(cmd, "hina_cmd_dispatch_indirect");
-  hina_flush_bindings(cmd);
+  HINA_VALIDATE_COMPUTE_CMD(cmd, "hina_cmd_dispatch_indirect");
+  hina_buffer_slot* buf_slot = hina_validate_indirect_buffer(cmd, indirect_buf, "hina_cmd_dispatch_indirect");
+  if (!buf_slot) return;
   vkCmdDispatchIndirect(cmd->vk_cmd, buf_slot->vk.buffer, offset);
   ++cmd->ctx->stats.dispatch_calls;
   HINA_ZONE_END();
@@ -20057,9 +19569,7 @@ void hina_cmd_dispatch_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_
 void hina_cmd_dispatch_threads(hina_cmd* cmd, uint32_t thread_count_x, uint32_t thread_count_y, uint32_t thread_count_z)
 {
   HINA_ZONE_N("dispatch_threads");
-  HINA_ASSERT(cmd);
-  HINA_ASSERT(cmd->recording && "hina_cmd_dispatch_threads: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_dispatch_threads: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_dispatch_threads");
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_dispatch_threads: cannot dispatch compute inside a render pass");
   HINA_ASSERTF(cmd->current_pipeline.id != HINA_INVALID_HANDLE,
                "hina_cmd_dispatch_threads: no pipeline bound - call hina_cmd_bind_pipeline first");
@@ -20087,10 +19597,7 @@ void hina_cmd_dispatch_threads(hina_cmd* cmd, uint32_t thread_count_x, uint32_t 
 void hina_cmd_copy_buffer(hina_cmd* cmd, hina_buffer src, hina_buffer dst, uint64_t src_offset, uint64_t dst_offset,
                           uint64_t size)
 {
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_copy_buffer: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_copy_buffer: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_buffer");
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_buffer: cannot copy buffers inside a render pass");
   HINA_ASSERTF(hina_buffer_slot_valid(src), "[%s] hina_cmd_copy_buffer: invalid src buffer",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_BUFFER));
@@ -20105,10 +19612,7 @@ void hina_cmd_copy_buffer(hina_cmd* cmd, hina_buffer src, hina_buffer dst, uint6
 void hina_cmd_copy_buffer_to_texture(hina_cmd* cmd, hina_buffer src, hina_texture dst, uint64_t buffer_offset,
                                      uint32_t mip_level, uint32_t array_layer)
 {
-  HINA_ASSERT(cmd);
-  // Vulkan spec: commandBuffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_copy_buffer_to_texture: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_copy_buffer_to_texture: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_buffer_to_texture");
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_buffer_to_texture: cannot copy inside a render pass");
   HINA_ASSERTF(hina_buffer_slot_valid(src), "[%s] hina_cmd_copy_buffer_to_texture: invalid src buffer",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_BUFFER));
@@ -20135,11 +19639,7 @@ void hina_cmd_copy_buffer_to_texture(hina_cmd* cmd, hina_buffer src, hina_textur
 void hina_cmd_copy_texture_to_buffer(hina_cmd* cmd, hina_texture src, hina_buffer dst, uint32_t mip_level,
                                      uint32_t array_layer, uint64_t buffer_offset)
 {
-  HINA_ASSERT(cmd);
-  // Vulkan spec: vkCmdCopyImageToBuffer must be called outside a render pass instance
-  // and command buffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_copy_texture_to_buffer: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_copy_texture_to_buffer: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_texture_to_buffer");
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_texture_to_buffer: cannot copy inside a render pass");
   HINA_ASSERTF(hina_texture_slot_valid(src), "[%s] hina_cmd_copy_texture_to_buffer: invalid src texture",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_IMAGE));
@@ -20166,9 +19666,7 @@ void hina_cmd_copy_texture_to_buffer(hina_cmd* cmd, hina_texture src, hina_buffe
 void hina_cmd_copy_buffer_to_texture_3d(hina_cmd* cmd, hina_buffer src, hina_texture dst, uint64_t buffer_offset,
                                         uint32_t mip_level, uint32_t z_offset, uint32_t depth)
 {
-  HINA_ASSERT(cmd);
-  HINA_ASSERT(cmd->recording && "hina_cmd_copy_buffer_to_texture_3d: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_copy_buffer_to_texture_3d: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_buffer_to_texture_3d");
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_buffer_to_texture_3d: cannot copy inside a render pass");
   HINA_ASSERTF(hina_buffer_slot_valid(src), "[%s] hina_cmd_copy_buffer_to_texture_3d: invalid src buffer",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_BUFFER));
@@ -20197,9 +19695,7 @@ void hina_cmd_copy_buffer_to_texture_3d(hina_cmd* cmd, hina_buffer src, hina_tex
 void hina_cmd_copy_texture_to_buffer_3d(hina_cmd* cmd, hina_texture src, hina_buffer dst, uint32_t mip_level,
                                         uint32_t z_offset, uint32_t depth, uint64_t buffer_offset)
 {
-  HINA_ASSERT(cmd);
-  HINA_ASSERT(cmd->recording && "hina_cmd_copy_texture_to_buffer_3d: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_copy_texture_to_buffer_3d: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_texture_to_buffer_3d");
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_texture_to_buffer_3d: cannot copy inside a render pass");
   HINA_ASSERTF(hina_texture_slot_valid(src), "[%s] hina_cmd_copy_texture_to_buffer_3d: invalid src texture",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_IMAGE));
@@ -20228,11 +19724,7 @@ void hina_cmd_copy_texture_to_buffer_3d(hina_cmd* cmd, hina_texture src, hina_bu
 void hina_cmd_blit_texture(hina_cmd* cmd, hina_texture src, hina_texture dst, uint32_t src_mip, uint32_t dst_mip,
                            hina_filter filter)
 {
-  HINA_ASSERT(cmd);
-  // Vulkan spec: vkCmdBlitImage must be called outside a render pass instance
-  // and command buffer must be in recording state
-  HINA_ASSERT(cmd->recording && "hina_cmd_blit_texture: command buffer must be recording");
-  HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE && "hina_cmd_blit_texture: vk_cmd is NULL");
+  HINA_VALIDATE_CMD(cmd, "hina_cmd_blit_texture");
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_blit_texture: cannot blit inside a render pass");
   HINA_ASSERTF(hina_texture_slot_valid(src), "[%s] hina_cmd_blit_texture: invalid src texture",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_IMAGE));
@@ -20242,8 +19734,8 @@ void hina_cmd_blit_texture(hina_cmd* cmd, hina_texture src, hina_texture dst, ui
   uint16_t didx = hina_id_index(dst.id);
   hina_texture_hot* sh = HINA_TEX_HOT(sidx);
   hina_texture_hot* dh = HINA_TEX_HOT(didx);
-  hina_format sh_fmt = hina_vk_format_to_hina(sh->dims.format);
-  hina_format dh_fmt = hina_vk_format_to_hina(dh->dims.format);
+  hina_format sh_fmt = hina_format_from_vk(sh->dims.format);
+  hina_format dh_fmt = hina_format_from_vk(dh->dims.format);
   HINA_ASSERTF(!hina_format_is_block_compressed(sh_fmt) && !hina_format_is_block_compressed(dh_fmt),
                "hina_cmd_blit_texture: cannot blit compressed formats");
   HINA_ASSERTF(sh->texture_dim == dh->texture_dim, "hina_cmd_blit_texture: texture dimension mismatch");
@@ -20347,129 +19839,83 @@ static void hina_poll_lane_completions(hina_context* ctx)
 // - fast path: ready bit in hot data
 // - pending bitset: resource has an in-flight or staged upload
 // - global batch ring: maps submission tickets back to resource handles
-static bool hina_buffer_upload_ready_nonblocking(hina_context* ctx, uint16_t idx)
-{
-  hina_buffer_hot* hot = HINA_BUF_HOT(idx);
 
-  // Fast path: already marked ready
-  if (HINA_BUFFER_IS_UPLOAD_READY(hot->config.flags_packed))
-  {
-    return true;
-  }
-
-  if (!hina_buffer_upload_pending(ctx, idx))
-  {
-    hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
-    return true;
-  }
-
-  // Poll completion state without waiting.
-  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);
-  hina_poll_lane_completions(ctx);
-  hina_spin_lock(&ring->lock);
-  hina_upload_ring_retire_completed_locked(ctx, ring);
-  bool pending = hina_buffer_upload_pending(ctx, idx);
-  hina_spin_unlock(&ring->lock);
-  if (pending) return false;
-
-  hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT;
-  return true;
+/* Template: nonblocking upload readiness check (polls completion without waiting) */
+#define HINA_IMPL_UPLOAD_READY_NB(NAME, HOT_TYPE, HOT_MACRO, IS_READY, SET_READY, PENDING_FN) \
+static bool NAME(hina_context* ctx, uint16_t idx)                                              \
+{                                                                                               \
+  HOT_TYPE* hot = HOT_MACRO(idx);                                                              \
+  if (IS_READY) return true;                                                                    \
+  if (!PENDING_FN(ctx, idx))                                                                    \
+  {                                                                                             \
+    SET_READY;                                                                                  \
+    return true;                                                                                \
+  }                                                                                             \
+  /* Poll completion state without waiting. */                                                  \
+  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);                                    \
+  hina_poll_lane_completions(ctx);                                                              \
+  hina_spin_lock(&ring->lock);                                                                  \
+  hina_upload_ring_retire_completed_locked(ctx, ring);                                         \
+  bool pending = PENDING_FN(ctx, idx);                                                          \
+  hina_spin_unlock(&ring->lock);                                                                \
+  if (pending) return false;                                                                    \
+  SET_READY;                                                                                    \
+  return true;                                                                                  \
 }
 
-static bool hina_buffer_upload_ready(hina_context* ctx, uint16_t idx)
-{
-  if (hina_buffer_upload_ready_nonblocking(ctx, idx)) return true;
-
-  // Try local auto-flush (safe only when we're not recording in this context).
-  hina_staging_context* sc = &ctx->staging;
-  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
-  if (!is_recording && (sc->staged_buffers.count > 0 || sc->staged_textures.count > 0))
-  {
-    hina_auto_flush_staged(ctx);
-    if (hina_buffer_upload_ready_nonblocking(ctx, idx)) return true;
-  }
-
-  uint32_t handle_id = ((uint32_t)g_storage.buffer_pool.slots[idx].generation << 16) | idx;
-  uint64_t wait_ticket = 0;
-  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);
-  hina_poll_lane_completions(ctx);
-  hina_spin_lock(&ring->lock);
-  hina_upload_ring_retire_completed_locked(ctx, ring);
-  if (hina_buffer_upload_pending(ctx, idx))
-  {
-    wait_ticket = hina_upload_ring_find_ticket_locked(ring, handle_id, false);
-  }
-  hina_spin_unlock(&ring->lock);
-  if (!wait_ticket)
-  {
-    return hina_buffer_upload_ready_nonblocking(ctx, idx);
-  }
-
-  hina_staging_ctx_wait(ctx, wait_ticket);
-  return hina_buffer_upload_ready_nonblocking(ctx, idx);
+/* Template: blocking upload readiness check (auto-flushes staged + waits on ticket) */
+#define HINA_IMPL_UPLOAD_READY(NAME, NB_FN, PENDING_FN, POOL_EXPR, IS_TEXTURE)                 \
+static bool NAME(hina_context* ctx, uint16_t idx)                                              \
+{                                                                                               \
+  if (NB_FN(ctx, idx)) return true;                                                            \
+  /* Try local auto-flush (safe only when we're not recording in this context). */              \
+  hina_staging_context* sc = &ctx->staging;                                                    \
+  bool is_recording = sc->pending_cmd != NULL ||                                               \
+                      sc->gfx_pending_cmd != NULL ||                                           \
+                      sc->comp_pending_cmd != NULL;                                            \
+  if (!is_recording && (sc->staged_buffers.count > 0 || sc->staged_textures.count > 0))       \
+  {                                                                                             \
+    hina_auto_flush_staged(ctx);                                                               \
+    if (NB_FN(ctx, idx)) return true;                                                          \
+  }                                                                                             \
+  uint32_t handle_id = ((uint32_t)(POOL_EXPR).slots[idx].generation << 16) | idx;             \
+  uint64_t wait_ticket = 0;                                                                    \
+  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);                                    \
+  hina_poll_lane_completions(ctx);                                                              \
+  hina_spin_lock(&ring->lock);                                                                  \
+  hina_upload_ring_retire_completed_locked(ctx, ring);                                         \
+  if (PENDING_FN(ctx, idx))                                                                    \
+  {                                                                                             \
+    wait_ticket = hina_upload_ring_find_ticket_locked(ring, handle_id, IS_TEXTURE);            \
+  }                                                                                             \
+  hina_spin_unlock(&ring->lock);                                                                \
+  if (!wait_ticket) return NB_FN(ctx, idx);                                                    \
+  hina_staging_ctx_wait(ctx, wait_ticket);                                                     \
+  return NB_FN(ctx, idx);                                                                      \
 }
 
-static bool hina_texture_upload_ready_nonblocking(hina_context* ctx, uint16_t idx)
-{
-  hina_texture_hot* hot = HINA_TEX_HOT(idx);
+HINA_IMPL_UPLOAD_READY_NB(hina_buffer_upload_ready_nonblocking,
+  hina_buffer_hot, HINA_BUF_HOT,
+  HINA_BUFFER_IS_UPLOAD_READY(hot->config.flags_packed),
+  hot->config.flags_packed |= HINA_BUFFER_UPLOAD_READY_BIT,
+  hina_buffer_upload_pending)
 
-  // Fast path: already marked ready
-  if (HINA_TEXTURE_IS_UPLOAD_READY(hot->texture_dim))
-  {
-    return true;
-  }
+HINA_IMPL_UPLOAD_READY(hina_buffer_upload_ready,
+  hina_buffer_upload_ready_nonblocking, hina_buffer_upload_pending,
+  g_storage.buffer_pool, false)
 
-  if (!hina_texture_upload_pending(ctx, idx))
-  {
-    hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
-    return true;
-  }
+HINA_IMPL_UPLOAD_READY_NB(hina_texture_upload_ready_nonblocking,
+  hina_texture_hot, HINA_TEX_HOT,
+  HINA_TEXTURE_IS_UPLOAD_READY(hot->texture_dim),
+  hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT,
+  hina_texture_upload_pending)
 
-  // Poll completion state without waiting.
-  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);
-  hina_poll_lane_completions(ctx);
-  hina_spin_lock(&ring->lock);
-  hina_upload_ring_retire_completed_locked(ctx, ring);
-  bool pending = hina_texture_upload_pending(ctx, idx);
-  hina_spin_unlock(&ring->lock);
-  if (pending) return false;
+HINA_IMPL_UPLOAD_READY(hina_texture_upload_ready,
+  hina_texture_upload_ready_nonblocking, hina_texture_upload_pending,
+  g_storage.texture_pool, true)
 
-  hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
-  return true;
-}
-
-static bool hina_texture_upload_ready(hina_context* ctx, uint16_t idx)
-{
-  if (hina_texture_upload_ready_nonblocking(ctx, idx)) return true;
-
-  // Try local auto-flush (safe only when we're not recording in this context).
-  hina_staging_context* sc = &ctx->staging;
-  bool is_recording = sc->pending_cmd != NULL || sc->gfx_pending_cmd != NULL || sc->comp_pending_cmd != NULL;
-  if (!is_recording && (sc->staged_buffers.count > 0 || sc->staged_textures.count > 0))
-  {
-    hina_auto_flush_staged(ctx);
-    if (hina_texture_upload_ready_nonblocking(ctx, idx)) return true;
-  }
-
-  uint32_t handle_id = ((uint32_t)g_storage.texture_pool.slots[idx].generation << 16) | idx;
-  uint64_t wait_ticket = 0;
-  hina_upload_batch_ring* ring = hina_upload_ring_get(ctx);
-  hina_poll_lane_completions(ctx);
-  hina_spin_lock(&ring->lock);
-  hina_upload_ring_retire_completed_locked(ctx, ring);
-  if (hina_texture_upload_pending(ctx, idx))
-  {
-    wait_ticket = hina_upload_ring_find_ticket_locked(ring, handle_id, true);
-  }
-  hina_spin_unlock(&ring->lock);
-  if (!wait_ticket)
-  {
-    return hina_texture_upload_ready_nonblocking(ctx, idx);
-  }
-
-  hina_staging_ctx_wait(ctx, wait_ticket);
-  return hina_texture_upload_ready_nonblocking(ctx, idx);
-}
+#undef HINA_IMPL_UPLOAD_READY_NB
+#undef HINA_IMPL_UPLOAD_READY
 
 static void hina_flush_all_lane_zombies(hina_context* ctx)
 {
@@ -21686,22 +21132,25 @@ void hina_ctx_frame_end(hina_context* ctx)
     ctx->stats.completed.pipeline_binds = ctx->stats.pipeline_binds;
     ctx->stats.completed.descriptor_writes = ctx->stats.descriptor_writes;
     ctx->stats.completed.vertices_submitted = ctx->stats.vertices_submitted;
-    // Query VMA for memory stats
-    VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
-    vmaGetHeapBudgets(dev->allocator.vma, budgets);
-    uint64_t used = 0, bud = 0;
-    VkPhysicalDeviceMemoryProperties mem_props;
-    vkGetPhysicalDeviceMemoryProperties(dev->core.phys, &mem_props);
-    for (uint32_t i = 0; i < mem_props.memoryHeapCount; ++i)
+    // Query VMA for memory stats (throttled — budget query makes a DXGI kernel transition on Windows)
+    if (ctx->frame.frame_index % 60 == 0)
     {
-      if (mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+      VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+      vmaGetHeapBudgets(dev->allocator.vma, budgets);
+      const VkPhysicalDeviceMemoryProperties* mem_props = NULL;
+      vmaGetMemoryProperties(dev->allocator.vma, &mem_props);
+      uint64_t used = 0, bud = 0;
+      for (uint32_t i = 0; i < mem_props->memoryHeapCount; ++i)
       {
-        used += budgets[i].usage;
-        bud += budgets[i].budget;
+        if (mem_props->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+        {
+          used += budgets[i].usage;
+          bud += budgets[i].budget;
+        }
       }
+      ctx->stats.completed.gpu_memory_used = used;
+      ctx->stats.completed.gpu_memory_budget = bud;
     }
-    ctx->stats.completed.gpu_memory_used = used;
-    ctx->stats.completed.gpu_memory_budget = bud;
   }
   HINA_GPU_COLLECT(ctx->core.device, VK_NULL_HANDLE);
   hina_atomic_store32(&ctx->frame.frame_in_progress, 0);
@@ -21924,6 +21373,17 @@ static void hina_destroy_swapchain(hina_context* ctx)
   memset(&ctx->core.device->surface.swapchain, 0, sizeof(ctx->core.device->surface.swapchain));
 }
 
+static HINA_INLINE float hina_prerotation_degrees_from_transform(VkSurfaceTransformFlagBitsKHR t)
+{
+  switch (t)
+  {
+    case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:  return 90.0f;
+    case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: return 180.0f;
+    case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: return 270.0f;
+    default: return 0.0f;
+  }
+}
+
 static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* desc)
 {
   hina_destroy_swapchain(ctx);
@@ -22106,13 +21566,7 @@ static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* 
   {
     // User opted into prerotation - use currentTransform for power savings
     preTransform = caps.currentTransform;
-    switch (caps.currentTransform)
-    {
-      case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:  prerotation_degrees = 90.0f;  break;
-      case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: prerotation_degrees = 180.0f; break;
-      case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: prerotation_degrees = 270.0f; break;
-      default: prerotation_degrees = 0.0f; break;
-    }
+    prerotation_degrees = hina_prerotation_degrees_from_transform(caps.currentTransform);
     // For 90°/270° prerotation, swap extent to identity resolution
     // App renders to portrait buffer, display hardware rotates to landscape
     // See: https://developer.android.com/games/optimize/vulkan-prerotation
@@ -22138,13 +21592,7 @@ static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* 
     // Identity not supported (rare) - must use currentTransform
     // App MUST handle rotation when this happens (can't be avoided)
     preTransform = caps.currentTransform;
-    switch (caps.currentTransform)
-    {
-      case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR:  prerotation_degrees = 90.0f;  break;
-      case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: prerotation_degrees = 180.0f; break;
-      case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: prerotation_degrees = 270.0f; break;
-      default: prerotation_degrees = 0.0f; break;
-    }
+    prerotation_degrees = hina_prerotation_degrees_from_transform(caps.currentTransform);
     HINA_LOGW(ctx, "IDENTITY transform not supported - app must handle rotation (preTransform=%d, rotation=%.0f°)",
               (int)preTransform, prerotation_degrees);
   }
@@ -22685,31 +22133,10 @@ void hina_cmd_release_texture(hina_cmd* cmd, hina_texture tex, hina_queue dst_qu
   // Skip if same family (no transfer needed)
   if (dst_family == cmd->family_idx) return;
   VkImageAspectFlags aspect = hina_aspect_from_format(hot->dims.format);
-  if (vkCmdPipelineBarrier2)
-  {
-    VkImageMemoryBarrier2 barrier = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = hot->state.stages,
-      .srcAccessMask = hot->state.access, .dstStageMask = VK_PIPELINE_STAGE_2_NONE, .dstAccessMask = VK_ACCESS_2_NONE,
-      .oldLayout = hot->state.layout, .newLayout = hot->state.layout, // Keep same layout
-      .srcQueueFamilyIndex = cmd->family_idx, .dstQueueFamilyIndex = dst_family, .image = hot->vk.image,
-      .subresourceRange = {aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-    };
-    VkDependencyInfo dep = {
-      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier
-    };
-    vkCmdPipelineBarrier2(cmd->vk_cmd, &dep);
-  }
-  else
-  {
-    VkImageMemoryBarrier barrier = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = hot->state.access, .dstAccessMask = 0,
-      .oldLayout = hot->state.layout, .newLayout = hot->state.layout, .srcQueueFamilyIndex = cmd->family_idx,
-      .dstQueueFamilyIndex = dst_family, .image = hot->vk.image,
-      .subresourceRange = {aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-    };
-    vkCmdPipelineBarrier(cmd->vk_cmd, hot->state.stages, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1,
-                         &barrier);
-  }
+  VkImageSubresourceRange range = {aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+  HINA_IMAGE_BARRIER_QFOT(cmd->vk_cmd, hot->state.stages, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           hot->state.access, 0, hot->state.layout, hot->state.layout,
+                           cmd->family_idx, dst_family, hot->vk.image, range);
   HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   // Note: Do NOT update owning_family here - ownership transfers at acquire
 }
@@ -22736,31 +22163,9 @@ void hina_cmd_release_buffer(hina_cmd* cmd, hina_buffer buf, hina_queue dst_queu
   uint32_t dst_family = hina_queue_to_family(ctx, dst_queue);
   // Skip if same family (no transfer needed)
   if (dst_family == cmd->family_idx) return;
-  if (vkCmdPipelineBarrier2)
-  {
-    VkBufferMemoryBarrier2 barrier = {
-      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-      .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT,
-      .dstStageMask = VK_PIPELINE_STAGE_2_NONE, .dstAccessMask = VK_ACCESS_2_NONE,
-      .srcQueueFamilyIndex = cmd->family_idx, .dstQueueFamilyIndex = dst_family, .buffer = hot->vk.buffer, .offset = 0,
-      .size = VK_WHOLE_SIZE
-    };
-    VkDependencyInfo dep = {
-      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier
-    };
-    vkCmdPipelineBarrier2(cmd->vk_cmd, &dep);
-  }
-  else
-  {
-    VkBufferMemoryBarrier barrier = {
-      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, .dstAccessMask = 0,
-      .srcQueueFamilyIndex = cmd->family_idx, .dstQueueFamilyIndex = dst_family, .buffer = hot->vk.buffer, .offset = 0,
-      .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(cmd->vk_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
-                         NULL, 1, &barrier, 0, NULL);
-  }
+  HINA_BUFFER_BARRIER_QFOT(cmd->vk_cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, 0,
+                           cmd->family_idx, dst_family, hot->vk.buffer, 0, VK_WHOLE_SIZE);
   HINA_DEBUG_ADD_BARRIERS(ctx, 1);
 }
 
@@ -22780,31 +22185,10 @@ void hina_cmd_acquire_texture(hina_cmd* cmd, hina_texture tex, hina_queue src_qu
   }
   hina_layout_state target = hina_layout_for_hint(ctx, cmd->family_idx, new_state);
   VkImageAspectFlags aspect = hina_aspect_from_format(hot->dims.format);
-  if (vkCmdPipelineBarrier2)
-  {
-    VkImageMemoryBarrier2 barrier = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
-      .srcAccessMask = VK_ACCESS_2_NONE, .dstStageMask = target.stages, .dstAccessMask = target.access,
-      .oldLayout = hot->state.layout, .newLayout = target.layout, .srcQueueFamilyIndex = src_family,
-      .dstQueueFamilyIndex = cmd->family_idx, .image = hot->vk.image,
-      .subresourceRange = {aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-    };
-    VkDependencyInfo dep = {
-      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier
-    };
-    vkCmdPipelineBarrier2(cmd->vk_cmd, &dep);
-  }
-  else
-  {
-    VkImageMemoryBarrier barrier = {
-      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = target.access,
-      .oldLayout = hot->state.layout, .newLayout = target.layout, .srcQueueFamilyIndex = src_family,
-      .dstQueueFamilyIndex = cmd->family_idx, .image = hot->vk.image,
-      .subresourceRange = {aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}
-    };
-    vkCmdPipelineBarrier(cmd->vk_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, target.stages, 0, 0, NULL, 0, NULL, 1,
-                         &barrier);
-  }
+  VkImageSubresourceRange range = {aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+  HINA_IMAGE_BARRIER_QFOT(cmd->vk_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, target.stages,
+                           0, target.access, hot->state.layout, target.layout,
+                           src_family, cmd->family_idx, hot->vk.image, range);
   // Update ownership and state
   hot->owning_family = (uint8_t)cmd->family_idx;
   hot->state.layout = target.layout;
@@ -22835,29 +22219,9 @@ void hina_cmd_acquire_buffer(hina_cmd* cmd, hina_buffer buf, hina_queue src_queu
 #endif
   // Skip if same family (no transfer needed)
   if (src_family == cmd->family_idx) return;
-  if (vkCmdPipelineBarrier2)
-  {
-    VkBufferMemoryBarrier2 barrier = {
-      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
-      .srcAccessMask = VK_ACCESS_2_NONE, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-      .dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT, .srcQueueFamilyIndex = src_family,
-      .dstQueueFamilyIndex = cmd->family_idx, .buffer = hot->vk.buffer, .offset = 0, .size = VK_WHOLE_SIZE
-    };
-    VkDependencyInfo dep = {
-      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier
-    };
-    vkCmdPipelineBarrier2(cmd->vk_cmd, &dep);
-  }
-  else
-  {
-    VkBufferMemoryBarrier barrier = {
-      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, .srcAccessMask = 0,
-      .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, .srcQueueFamilyIndex = src_family,
-      .dstQueueFamilyIndex = cmd->family_idx, .buffer = hot->vk.buffer, .offset = 0, .size = VK_WHOLE_SIZE
-    };
-    vkCmdPipelineBarrier(cmd->vk_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL,
-                         1, &barrier, 0, NULL);
-  }
+  HINA_BUFFER_BARRIER_QFOT(cmd->vk_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           0, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
+                           src_family, cmd->family_idx, hot->vk.buffer, 0, VK_WHOLE_SIZE);
   // Ownership update is deferred to submit time (see ownership_debug tracking)
   HINA_DEBUG_ADD_BARRIERS(ctx, 1);
 }
@@ -27400,39 +26764,27 @@ static const char* hslc_get_glsl_preamble(void)
 }
 
 // Stage Macro
-static const char* hslc_hina_get_stage_macro(hina_shader_stage stage)
+static const char* const g_stage_macro_table[] = {
+  [HINA_SHADER_STAGE_VERTEX]       = "#define HINA_STAGE_VERTEX 1\n",
+  [HINA_SHADER_STAGE_TESS_CONTROL] = "#define HINA_STAGE_TESS_CONTROL 1\n",
+  [HINA_SHADER_STAGE_TESS_EVAL]    = "#define HINA_STAGE_TESS_EVAL 1\n",
+  [HINA_SHADER_STAGE_GEOMETRY]     = "#define HINA_STAGE_GEOMETRY 1\n",
+  [HINA_SHADER_STAGE_FRAGMENT]     = "#define HINA_STAGE_FRAGMENT 1\n",
+  [HINA_SHADER_STAGE_COMPUTE]      = "#define HINA_STAGE_COMPUTE 1\n",
+  [HINA_SHADER_STAGE_TASK]         = "#define HINA_STAGE_TASK 1\n",
+  [HINA_SHADER_STAGE_MESH]         = "#define HINA_STAGE_MESH 1\n",
+  [HINA_SHADER_STAGE_RAYGEN]       = "#define HINA_STAGE_RAYGEN 1\n",
+  [HINA_SHADER_STAGE_ANY_HIT]      = "#define HINA_STAGE_ANY_HIT 1\n",
+  [HINA_SHADER_STAGE_CLOSEST_HIT]  = "#define HINA_STAGE_CLOSEST_HIT 1\n",
+  [HINA_SHADER_STAGE_MISS]         = "#define HINA_STAGE_MISS 1\n",
+  [HINA_SHADER_STAGE_INTERSECTION] = "#define HINA_STAGE_INTERSECTION 1\n",
+  [HINA_SHADER_STAGE_CALLABLE]     = "#define HINA_STAGE_CALLABLE 1\n",
+};
+
+static HINA_INLINE const char* hslc_hina_get_stage_macro(hina_shader_stage stage)
 {
-  switch (stage)
-  {
-  case HINA_SHADER_STAGE_VERTEX:
-    return "#define HINA_STAGE_VERTEX 1\n";
-  case HINA_SHADER_STAGE_FRAGMENT:
-    return "#define HINA_STAGE_FRAGMENT 1\n";
-  case HINA_SHADER_STAGE_COMPUTE:
-    return "#define HINA_STAGE_COMPUTE 1\n";
-  case HINA_SHADER_STAGE_TESS_CONTROL:
-    return "#define HINA_STAGE_TESS_CONTROL 1\n";
-  case HINA_SHADER_STAGE_TESS_EVAL:
-    return "#define HINA_STAGE_TESS_EVAL 1\n";
-  case HINA_SHADER_STAGE_GEOMETRY:
-    return "#define HINA_STAGE_GEOMETRY 1\n";
-  case HINA_SHADER_STAGE_TASK:
-    return "#define HINA_STAGE_TASK 1\n";
-  case HINA_SHADER_STAGE_MESH:
-    return "#define HINA_STAGE_MESH 1\n";
-  case HINA_SHADER_STAGE_RAYGEN:
-    return "#define HINA_STAGE_RAYGEN 1\n";
-  case HINA_SHADER_STAGE_ANY_HIT:
-    return "#define HINA_STAGE_ANY_HIT 1\n";
-  case HINA_SHADER_STAGE_CLOSEST_HIT:
-    return "#define HINA_STAGE_CLOSEST_HIT 1\n";
-  case HINA_SHADER_STAGE_MISS:
-    return "#define HINA_STAGE_MISS 1\n";
-  case HINA_SHADER_STAGE_INTERSECTION:
-    return "#define HINA_STAGE_INTERSECTION 1\n";
-  case HINA_SHADER_STAGE_CALLABLE:
-    return "#define HINA_STAGE_CALLABLE 1\n";
-  }
+  if ((unsigned)stage < HINA_ARRAY_SIZE(g_stage_macro_table))
+    return g_stage_macro_table[stage];
   return "";
 }
 
@@ -27658,25 +27010,27 @@ static char* hslc_map_error_sources(const char* error_log, const hsl_source_map*
 }
 
 // glslang Stage Conversion
-static glslang_stage_t hslc_hina_to_glslang_stage(hina_shader_stage stage)
+static const glslang_stage_t g_glslang_stage_table[] = {
+  [HINA_SHADER_STAGE_VERTEX]       = GLSLANG_STAGE_VERTEX,
+  [HINA_SHADER_STAGE_TESS_CONTROL] = GLSLANG_STAGE_TESSCONTROL,
+  [HINA_SHADER_STAGE_TESS_EVAL]    = GLSLANG_STAGE_TESSEVALUATION,
+  [HINA_SHADER_STAGE_GEOMETRY]     = GLSLANG_STAGE_GEOMETRY,
+  [HINA_SHADER_STAGE_FRAGMENT]     = GLSLANG_STAGE_FRAGMENT,
+  [HINA_SHADER_STAGE_COMPUTE]      = GLSLANG_STAGE_COMPUTE,
+  [HINA_SHADER_STAGE_TASK]         = GLSLANG_STAGE_TASK,
+  [HINA_SHADER_STAGE_MESH]         = GLSLANG_STAGE_MESH,
+  [HINA_SHADER_STAGE_RAYGEN]       = GLSLANG_STAGE_RAYGEN,
+  [HINA_SHADER_STAGE_ANY_HIT]      = GLSLANG_STAGE_ANYHIT,
+  [HINA_SHADER_STAGE_CLOSEST_HIT]  = GLSLANG_STAGE_CLOSESTHIT,
+  [HINA_SHADER_STAGE_MISS]         = GLSLANG_STAGE_MISS,
+  [HINA_SHADER_STAGE_INTERSECTION] = GLSLANG_STAGE_INTERSECT,
+  [HINA_SHADER_STAGE_CALLABLE]     = GLSLANG_STAGE_CALLABLE,
+};
+
+static HINA_INLINE glslang_stage_t hslc_hina_to_glslang_stage(hina_shader_stage stage)
 {
-  switch (stage)
-  {
-  case HINA_SHADER_STAGE_VERTEX: return GLSLANG_STAGE_VERTEX;
-  case HINA_SHADER_STAGE_TESS_CONTROL: return GLSLANG_STAGE_TESSCONTROL;
-  case HINA_SHADER_STAGE_TESS_EVAL: return GLSLANG_STAGE_TESSEVALUATION;
-  case HINA_SHADER_STAGE_GEOMETRY: return GLSLANG_STAGE_GEOMETRY;
-  case HINA_SHADER_STAGE_FRAGMENT: return GLSLANG_STAGE_FRAGMENT;
-  case HINA_SHADER_STAGE_COMPUTE: return GLSLANG_STAGE_COMPUTE;
-  case HINA_SHADER_STAGE_TASK: return GLSLANG_STAGE_TASK;
-  case HINA_SHADER_STAGE_MESH: return GLSLANG_STAGE_MESH;
-  case HINA_SHADER_STAGE_RAYGEN: return GLSLANG_STAGE_RAYGEN;
-  case HINA_SHADER_STAGE_ANY_HIT: return GLSLANG_STAGE_ANYHIT;
-  case HINA_SHADER_STAGE_CLOSEST_HIT: return GLSLANG_STAGE_CLOSESTHIT;
-  case HINA_SHADER_STAGE_MISS: return GLSLANG_STAGE_MISS;
-  case HINA_SHADER_STAGE_INTERSECTION: return GLSLANG_STAGE_INTERSECT;
-  case HINA_SHADER_STAGE_CALLABLE: return GLSLANG_STAGE_CALLABLE;
-  }
+  if ((unsigned)stage < HINA_ARRAY_SIZE(g_glslang_stage_table))
+    return g_glslang_stage_table[stage];
   return GLSLANG_STAGE_VERTEX;
 }
 
@@ -28061,25 +27415,27 @@ static char* hslc_load_shader_file(const char* filename)
 }
 
 // Stage name for logging
-static const char* hslc_hina_stage_name(hina_shader_stage stage)
+static const char* const g_stage_name_table[] = {
+  [HINA_SHADER_STAGE_VERTEX]       = "vertex",
+  [HINA_SHADER_STAGE_TESS_CONTROL] = "tess_control",
+  [HINA_SHADER_STAGE_TESS_EVAL]    = "tess_eval",
+  [HINA_SHADER_STAGE_GEOMETRY]     = "geometry",
+  [HINA_SHADER_STAGE_FRAGMENT]     = "fragment",
+  [HINA_SHADER_STAGE_COMPUTE]      = "compute",
+  [HINA_SHADER_STAGE_TASK]         = "task",
+  [HINA_SHADER_STAGE_MESH]         = "mesh",
+  [HINA_SHADER_STAGE_RAYGEN]       = "raygen",
+  [HINA_SHADER_STAGE_ANY_HIT]      = "any_hit",
+  [HINA_SHADER_STAGE_CLOSEST_HIT]  = "closest_hit",
+  [HINA_SHADER_STAGE_MISS]         = "miss",
+  [HINA_SHADER_STAGE_INTERSECTION] = "intersection",
+  [HINA_SHADER_STAGE_CALLABLE]     = "callable",
+};
+
+static HINA_INLINE const char* hslc_hina_stage_name(hina_shader_stage stage)
 {
-  switch (stage)
-  {
-  case HINA_SHADER_STAGE_VERTEX: return "vertex";
-  case HINA_SHADER_STAGE_FRAGMENT: return "fragment";
-  case HINA_SHADER_STAGE_COMPUTE: return "compute";
-  case HINA_SHADER_STAGE_GEOMETRY: return "geometry";
-  case HINA_SHADER_STAGE_TESS_CONTROL: return "tess_control";
-  case HINA_SHADER_STAGE_TESS_EVAL: return "tess_eval";
-  case HINA_SHADER_STAGE_TASK: return "task";
-  case HINA_SHADER_STAGE_MESH: return "mesh";
-  case HINA_SHADER_STAGE_RAYGEN: return "raygen";
-  case HINA_SHADER_STAGE_ANY_HIT: return "any_hit";
-  case HINA_SHADER_STAGE_CLOSEST_HIT: return "closest_hit";
-  case HINA_SHADER_STAGE_MISS: return "miss";
-  case HINA_SHADER_STAGE_INTERSECTION: return "intersection";
-  case HINA_SHADER_STAGE_CALLABLE: return "callable";
-  }
+  if ((unsigned)stage < HINA_ARRAY_SIZE(g_stage_name_table))
+    return g_stage_name_table[stage];
   return "unknown";
 }
 
@@ -29020,48 +28376,19 @@ hina_hsl_module* hslc_compile_hsl_module_ex(const hslc_hsl_module_desc* desc, ch
   }
   else
   {
-    if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_VERTEX, defines, define_count, load_fn, user_data, &module->vs,
-                               out_error))
+    // Table-driven compilation of graphics stages
+    struct { hina_shader_stage stage; hina_shader_stage_data* target; bool enabled; } compile_stages[] = {
+      {HINA_SHADER_STAGE_VERTEX,       &module->vs,  true        },
+      {HINA_SHADER_STAGE_TESS_CONTROL, &module->tcs, has_tcs     },
+      {HINA_SHADER_STAGE_TESS_EVAL,    &module->tes, has_tes     },
+      {HINA_SHADER_STAGE_GEOMETRY,     &module->gs,  has_gs      },
+      {HINA_SHADER_STAGE_FRAGMENT,     &module->fs,  has_fragment},
+    };
+    for (size_t i = 0; i < sizeof(compile_stages) / sizeof(compile_stages[0]); ++i)
     {
-      shader_free(expanded);
-      hslc_hsl_module_free(module);
-      return NULL;
-    }
-    if (has_tcs)
-    {
-      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_TESS_CONTROL, defines, define_count, load_fn, user_data, &module->tcs,
-                                 out_error))
-      {
-        shader_free(expanded);
-        hslc_hsl_module_free(module);
-        return NULL;
-      }
-    }
-    if (has_tes)
-    {
-      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_TESS_EVAL, defines, define_count, load_fn, user_data, &module->tes,
-                                 out_error))
-      {
-        shader_free(expanded);
-        hslc_hsl_module_free(module);
-        return NULL;
-      }
-    }
-    if (has_gs)
-    {
-      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_GEOMETRY, defines, define_count, load_fn, user_data, &module->gs,
-                                 out_error))
-      {
-        shader_free(expanded);
-        hslc_hsl_module_free(module);
-        return NULL;
-      }
-    }
-    // Fragment shader (optional for vertex-only pipelines like depth pre-pass)
-    if (has_fragment)
-    {
-      if (!hslc_compile_stage_ex(source, source_name, HINA_SHADER_STAGE_FRAGMENT, defines, define_count, load_fn, user_data, &module->fs,
-                                 out_error))
+      if (!compile_stages[i].enabled) continue;
+      if (!hslc_compile_stage_ex(source, source_name, compile_stages[i].stage, defines, define_count,
+                                 load_fn, user_data, compile_stages[i].target, out_error))
       {
         shader_free(expanded);
         hslc_hsl_module_free(module);
@@ -29126,12 +28453,13 @@ hina_hsl_module* hslc_compile_hsl_source(const char* source, const char* source_
 void hslc_hsl_module_free(hina_hsl_module* module)
 {
   if (!module) return;
-  hslc_free_stage_data(&module->vs);
-  hslc_free_stage_data(&module->tcs);
-  hslc_free_stage_data(&module->tes);
-  hslc_free_stage_data(&module->gs);
-  hslc_free_stage_data(&module->fs);
-  hslc_free_stage_data(&module->cs);
+  {
+    hina_shader_stage_data* stages[] = {
+      &module->vs, &module->tcs, &module->tes,
+      &module->gs, &module->fs, &module->cs
+    };
+    for (uint32_t si = 0; si < 6; ++si) hslc_free_stage_data(stages[si]);
+  }
   if (module->vertex_inputs)
   {
     for (uint32_t i = 0; i < module->vertex_input_count; i++)
@@ -29229,18 +28557,16 @@ bool hslc_hsl_module_serialize(const hina_hsl_module* module, void** out_data, s
   if (!hslc_wb_write_u32(&wb, version)) goto fail;
   if (!hslc_wb_write_u32(&wb, flags)) goto fail;
   if (!hslc_wb_write_string(&wb, module->source_name)) goto fail;
-  // Vertex stage
-  if (!hslc_serialize_stage(&wb, &module->vs)) goto fail;
-  // Tessellation control stage
-  if (!hslc_serialize_stage(&wb, &module->tcs)) goto fail;
-  // Tessellation evaluation stage
-  if (!hslc_serialize_stage(&wb, &module->tes)) goto fail;
-  // Geometry stage
-  if (!hslc_serialize_stage(&wb, &module->gs)) goto fail;
-  // Fragment stage
-  if (!hslc_serialize_stage(&wb, &module->fs)) goto fail;
-  // Compute stage
-  if (!hslc_serialize_stage(&wb, &module->cs)) goto fail;
+  {
+    const hina_shader_stage_data* stages[] = {
+      &module->vs, &module->tcs, &module->tes,
+      &module->gs, &module->fs, &module->cs
+    };
+    for (uint32_t si = 0; si < 6; ++si)
+    {
+      if (!hslc_serialize_stage(&wb, stages[si])) goto fail;
+    }
+  }
   // Vertex inputs
   if (!hslc_wb_write_u32(&wb, module->vertex_input_count)) goto fail;
   for (uint32_t i = 0; i < module->vertex_input_count; i++)
