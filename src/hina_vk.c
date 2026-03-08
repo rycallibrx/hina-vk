@@ -89,6 +89,10 @@ static void hina_assert_log(const char* file, int line, const char* fmt, ...);
 #ifndef HINA_DEBUG
 #define HINA_DEBUG_INC_PASS(ctx) do { (void)(ctx); } while (0)
 #define HINA_DEBUG_ADD_BARRIERS(ctx, count) do { (void)(ctx); (void)(count); } while (0)
+#define HINA_DEBUG_ONLY(expr) ((void)0)
+#endif
+#ifdef HINA_DEBUG
+#define HINA_DEBUG_ONLY(expr) (expr)
 #endif
 #if defined(VK_USE_PLATFORM_XLIB_KHR)
 #include <X11/Xlib.h>
@@ -1556,6 +1560,87 @@ HINA_STATIC_ASSERT(sizeof(hina_alloc_header) == 16, hina_alloc_header_must_be_16
 // Uncomment to trace all host allocations (debug only; compiles out in release)
 // #define HINA_TRACE_ALLOCS 1
 
+// ---- Leak tracker (debug only) ----
+// Records caller info for every live allocation; reports unfreed at shutdown.
+#ifdef HINA_DEBUG
+#define HINA_LEAK_TRACK 1
+#define HINA_LEAK_TRACK_MAX 1024
+typedef struct hina_leak_entry
+{
+  void* ptr;        // user pointer (NULL = slot free)
+  uint32_t user_size;
+  uint32_t alloc_size;
+  const char* file;
+  int line;
+  const char* func;
+} hina_leak_entry;
+static hina_leak_entry s_leak_table[HINA_LEAK_TRACK_MAX];
+static uint32_t s_leak_count = 0;
+
+static void hina_leak_track_alloc(void* ptr, uint32_t user_size, uint32_t alloc_size,
+                                  const char* file, int line, const char* func)
+{
+  if (!ptr) return;
+  for (uint32_t i = 0; i < HINA_LEAK_TRACK_MAX; i++)
+  {
+    uint32_t idx = (s_leak_count + i) % HINA_LEAK_TRACK_MAX;
+    if (s_leak_table[idx].ptr == NULL)
+    {
+      s_leak_table[idx].ptr = ptr;
+      s_leak_table[idx].user_size = user_size;
+      s_leak_table[idx].alloc_size = alloc_size;
+      s_leak_table[idx].file = file;
+      s_leak_table[idx].line = line;
+      s_leak_table[idx].func = func;
+      s_leak_count = idx + 1;
+      return;
+    }
+  }
+  fprintf(stderr, "[LEAK-TRACK] table full, cannot track alloc of %u bytes\n", user_size);
+}
+
+static void hina_leak_track_free(void* ptr)
+{
+  if (!ptr) return;
+  for (uint32_t i = 0; i < HINA_LEAK_TRACK_MAX; i++)
+  {
+    if (s_leak_table[i].ptr == ptr)
+    {
+      s_leak_table[i].ptr = NULL;
+      return;
+    }
+  }
+}
+
+static void hina_leak_track_dump(void)
+{
+  fprintf(stderr, "\n=== Leak Tracker: Unfreed Allocations ===\n");
+  uint32_t found = 0;
+  for (uint32_t i = 0; i < HINA_LEAK_TRACK_MAX; i++)
+  {
+    if (s_leak_table[i].ptr != NULL)
+    {
+      found++;
+      fprintf(stderr, "  LEAKED %u bytes (alloc_size=%u) @ %s:%d (%s)\n",
+              s_leak_table[i].user_size,
+              s_leak_table[i].alloc_size,
+              s_leak_table[i].file ? s_leak_table[i].file : "?",
+              s_leak_table[i].line,
+              s_leak_table[i].func ? s_leak_table[i].func : "?");
+    }
+  }
+  if (found == 0) fprintf(stderr, "  (none)\n");
+  fprintf(stderr, "=========================================\n\n");
+}
+
+static void hina_leak_track_reset(void)
+{
+  memset(s_leak_table, 0, sizeof(s_leak_table));
+  s_leak_count = 0;
+}
+#endif // HINA_DEBUG
+// ---- End leak tracker ----
+
 static void hina_storage_init(void);
 
 static void hina_persistent_ensure_committed(uint32_t end_offset)
@@ -1618,28 +1703,33 @@ static void* hina_calloc_host_base(size_t count, size_t size)
   return ptr;
 }
 
-#define hina_alloc_host(size) hina_alloc_host_base((size))
-#define hina_calloc_host(count, size) hina_calloc_host_base((count), (size))
-
-#if defined(HINA_DEBUG) && defined(HINA_TRACE_ALLOCS)
-static void* hina_alloc_host_trace(size_t size, const char* file, int line, const char* func)
+#ifdef HINA_LEAK_TRACK
+// Leak-tracked versions: record caller info for every allocation
+static void* hina_alloc_host_tracked(size_t size, const char* file, int line, const char* func)
 {
   void* ptr = hina_alloc_host_base(size);
-  fprintf(stderr, "[ALLOC] %zu bytes @ %s:%d (%s)\n", size, file, line, func);
+  if (ptr)
+  {
+    hina_alloc_header* h = (hina_alloc_header*)((uint8_t*)ptr - sizeof(hina_alloc_header));
+    hina_leak_track_alloc(ptr, h->user_size, h->alloc_size, file, line, func);
+  }
   return ptr;
 }
-
-static void* hina_calloc_host_trace(size_t count, size_t size, const char* file, int line, const char* func)
+static void* hina_calloc_host_tracked(size_t count, size_t size, const char* file, int line, const char* func)
 {
-  size_t total = count * size;
   void* ptr = hina_calloc_host_base(count, size);
-  fprintf(stderr, "[ALLOC] %zu bytes @ %s:%d (%s)\n", total, file, line, func);
+  if (ptr)
+  {
+    hina_alloc_header* h = (hina_alloc_header*)((uint8_t*)ptr - sizeof(hina_alloc_header));
+    hina_leak_track_alloc(ptr, h->user_size, h->alloc_size, file, line, func);
+  }
   return ptr;
 }
-#undef hina_alloc_host
-#undef hina_calloc_host
-#define hina_alloc_host(size) hina_alloc_host_trace((size), __FILE__, __LINE__, __func__)
-#define hina_calloc_host(count, size) hina_calloc_host_trace((count), (size), __FILE__, __LINE__, __func__)
+#define hina_alloc_host(size) hina_alloc_host_tracked((size), __FILE__, __LINE__, __func__)
+#define hina_calloc_host(count, size) hina_calloc_host_tracked((count), (size), __FILE__, __LINE__, __func__)
+#else
+#define hina_alloc_host(size) hina_alloc_host_base((size))
+#define hina_calloc_host(count, size) hina_calloc_host_base((count), (size))
 #endif
 
 static void hina_free_host(void* ptr)
@@ -1650,6 +1740,9 @@ static void hina_free_host(void* ptr)
   HINA_ASSERTF(header->magic == HINA_ALLOC_MAGIC, "hina_free_host: invalid pointer");
   uint32_t offset = (uint32_t)(base - g_storage.persistent_data);
   HINA_ASSERTF(offset < HINA_PERSISTENT_ARENA_SIZE, "hina_free_host: pointer out of arena");
+#ifdef HINA_LEAK_TRACK
+  hina_leak_track_free(ptr);
+#endif
   hina_spin_lock(&g_storage.persistent_lock);
 #ifdef HINA_DEBUG
   HINA_ASSERTF(g_storage.persistent_bytes_in_use >= header->alloc_size,
@@ -1693,6 +1786,9 @@ static void hina_alloc_dump_stats(void)
   fprintf(stderr, "  Bytes in use: %llu\n", (unsigned long long)in_use);
   fprintf(stderr, "  Peak bytes:   %llu\n", (unsigned long long)peak);
   fprintf(stderr, "====================================\n\n");
+#ifdef HINA_LEAK_TRACK
+  hina_leak_track_dump();
+#endif
 #endif
 }
 
@@ -4299,6 +4395,9 @@ static void hina_storage_init(void)
   g_storage.persistent_bytes_peak = 0;
   g_storage.persistent_alloc_count = 0;
   g_storage.persistent_free_count = 0;
+#ifdef HINA_LEAK_TRACK
+  hina_leak_track_reset();
+#endif
   hina_debug_name_init();
 #endif
   g_storage.validation_level = HINA_DEFAULT_VALIDATION_LEVEL;
@@ -9012,7 +9111,10 @@ static void hina_destroy_context_resources(hina_context* ctx)
 // NOTE: If you modify any of these functions, update the corresponding defaults comment in hina_vk.h
 hina_desc hina_desc_default(void)
 {
-  return (hina_desc){.staging_buffer_size = 16ull * 1024ull * 1024ull,};
+  return (hina_desc){
+    .staging_buffer_size = 16ull * 1024ull * 1024ull,
+    .gpu_block_size = 64ull * 1024ull * 1024ull,
+  };
 }
 
 hina_buffer_desc hina_buffer_desc_default(void)
@@ -9083,6 +9185,13 @@ hina_hsl_pipeline_desc hina_hsl_pipeline_desc_default(void)
 
 // Forward declaration (defined later in swapchain section)
 static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* desc);
+
+static void hina_trim_working_set(void)
+{
+#ifdef _WIN32
+  SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+#endif
+}
 
 bool hina_init(const hina_desc* desc)
 {
@@ -9158,6 +9267,8 @@ bool hina_init(const hina_desc* desc)
   if (g_debug_caps.has_maintenance4) vma_flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE4_BIT;
   if (g_debug_caps.has_maintenance5) vma_flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE5_BIT;
   vma_info.flags = vma_flags;
+  // Use configured block size (default 64MB), fall back if user passed 0
+  vma_info.preferredLargeHeapBlockSize = desc->gpu_block_size ? desc->gpu_block_size : (64ull * 1024ull * 1024ull);
   VmaVulkanFunctions vfuncs = {0};
   HINA_VK_CHECK_MSG_RET(ctx, vmaImportVulkanFunctionsFromVolk(&vma_info, &vfuncs), false,
                         "importing Vulkan functions for VMA");
@@ -9272,6 +9383,9 @@ bool hina_init(const hina_desc* desc)
     (void)hina_create_swapchain(ctx, &dev->surface.swapchain_desc);
   }
   dev->core.initialized = true;
+  // Trim one-time init pages from the working set. The Vulkan loader, ICD, and
+  // driver initialization touch many pages that are never needed again.
+  hina_trim_working_set();
   return true;
 }
 
@@ -9664,73 +9778,72 @@ static void hina_page_pool_shutdown(hina_context* ctx)
   mtx_destroy(&pool->lock);
 }
 
+// Compact-in-place scan: release completed pages, shift pending pages down.
+// IS_DONE_EXPR must evaluate to bool using `fence` (the ticket for the current page).
+#define HINA_IMPL_PROCESS_RETIRED(ctx, IS_DONE_EXPR) \
+  do { \
+    hina_staging_context* sc = &(ctx)->staging; \
+    uint32_t count = sc->retired.count; \
+    uint32_t pending_start = sc->retired.pending_start; \
+    hina_staging_page* to_release[32]; \
+    uint32_t release_count = 0; \
+    uint32_t write = 0; \
+    uint32_t new_pending_start = 0; \
+    hina_staging_page** pages = sc->retired.heap_pages; \
+    uint64_t* fences = sc->retired.heap_fences; \
+    for (uint32_t i = 0; i < count; ++i) \
+    { \
+      uint64_t fence = fences[i]; \
+      bool done = (IS_DONE_EXPR); \
+      if (done) \
+      { \
+        to_release[release_count++] = pages[i]; \
+        if (release_count == 32) \
+        { \
+          hina_page_pool_release_batch((ctx), to_release, release_count); \
+          release_count = 0; \
+        } \
+      } \
+      else \
+      { \
+        if (write != i) \
+        { \
+          pages[write] = pages[i]; \
+          fences[write] = fence; \
+        } \
+        if (i < pending_start) new_pending_start++; \
+        write++; \
+      } \
+    } \
+    if (release_count > 0) hina_page_pool_release_batch((ctx), to_release, release_count); \
+    sc->retired.count = write; \
+    sc->retired.pending_start = new_pending_start; \
+    HINA_DEBUG_ONLY((ctx)->debug.staging_retired += (count - write)); \
+  } while (0)
+
 static void hina_process_retired_timeline(hina_context* ctx)
 {
-  hina_staging_context* sc = &ctx->staging;
-  uint32_t count = sc->retired.count;
-  uint32_t pending_start = sc->retired.pending_start;
   hina_poll_lane_completions(ctx);
   // Snapshot lane completion values ONCE (4 loads vs N*4 in-loop)
   uint64_t lane_completed[HINA_MAX_QUEUE_LANES];
   hina_queue_lanes* lanes = &ctx->core.device->queue.lanes;
   for (uint32_t i = 0; i < HINA_MAX_QUEUE_LANES; ++i)
     lane_completed[i] = lanes->lanes[i].valid ? (uint64_t)hina_atomic_load64(&lanes->lanes[i].completed_value) : 0;
-  hina_staging_page* to_release[32];
-  uint32_t release_count = 0;
-  uint32_t write = 0;
-  uint32_t new_pending_start = 0;
-  hina_staging_page** pages = sc->retired.heap_pages;
-  uint64_t* fences = sc->retired.heap_fences;
-  for (uint32_t i = 0; i < count; ++i)
-  {
-    uint64_t fence = fences[i];
-    bool done = false;
-    if (fence != HINA_TICKET_PENDING)
-    {
-      uint8_t lane_idx = hina_ticket_lane(fence);
-      uint64_t raw_value = hina_ticket_value(fence);
-      done = (raw_value > 0 && lane_idx < HINA_MAX_QUEUE_LANES) ? (lane_completed[lane_idx] >= raw_value) : false;
-    }
-    if (done)
-    {
-      to_release[release_count++] = pages[i];
-      if (release_count == 32)
-      {
-        hina_page_pool_release_batch(ctx, to_release, release_count);
-        release_count = 0;
-      }
-    }
-    else
-    {
-      if (write != i)
-      {
-        pages[write] = pages[i];
-        fences[write] = fence;
-      }
-      if (i < pending_start) new_pending_start++;
-      write++;
-    }
-  }
-  if (release_count > 0) hina_page_pool_release_batch(ctx, to_release, release_count);
-  sc->retired.count = write;
-  sc->retired.pending_start = new_pending_start;
-#ifdef HINA_DEBUG
-  ctx->debug.staging_retired += (count - write);
-#endif
+  HINA_IMPL_PROCESS_RETIRED(ctx,
+    fence != HINA_TICKET_PENDING &&
+    (hina_ticket_value(fence) > 0 && hina_ticket_lane(fence) < HINA_MAX_QUEUE_LANES) &&
+    lane_completed[hina_ticket_lane(fence)] >= hina_ticket_value(fence));
 }
 
 static void hina_process_retired_legacy(hina_context* ctx)
 {
-  hina_staging_context* sc = &ctx->staging;
-  uint32_t count = sc->retired.count;
-  uint32_t pending_start = sc->retired.pending_start;
   uint64_t completed = (uint64_t)hina_atomic_load64(&ctx->core.device->sync.last_completed_ticket);
-  if (sc->last_submit_ticket > 0)
+  if (ctx->staging.last_submit_ticket > 0)
   {
     int32_t busy = hina_atomic_load32(&ctx->core.device->sync.fence.staging_busy);
     if (!busy)
     {
-      if (sc->last_submit_ticket > completed) completed = sc->last_submit_ticket;
+      if (ctx->staging.last_submit_ticket > completed) completed = ctx->staging.last_submit_ticket;
     }
     else
     {
@@ -9738,7 +9851,7 @@ static void hina_process_retired_legacy(hina_context* ctx)
       if (status == VK_SUCCESS)
       {
         hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 0);
-        if (sc->last_submit_ticket > completed) completed = sc->last_submit_ticket;
+        if (ctx->staging.last_submit_ticket > completed) completed = ctx->staging.last_submit_ticket;
       }
     }
   }
@@ -9753,42 +9866,8 @@ static void hina_process_retired_legacy(hina_context* ctx)
       prev = (uint64_t)observed;
     }
   }
-  hina_staging_page* to_release[32];
-  uint32_t release_count = 0;
-  uint32_t write = 0;
-  uint32_t new_pending_start = 0;
-  hina_staging_page** pages = sc->retired.heap_pages;
-  uint64_t* fences = sc->retired.heap_fences;
-  for (uint32_t i = 0; i < count; ++i)
-  {
-    uint64_t fence = fences[i];
-    bool done = (fence != HINA_TICKET_PENDING) && (fence <= completed);
-    if (done)
-    {
-      to_release[release_count++] = pages[i];
-      if (release_count == 32)
-      {
-        hina_page_pool_release_batch(ctx, to_release, release_count);
-        release_count = 0;
-      }
-    }
-    else
-    {
-      if (write != i)
-      {
-        pages[write] = pages[i];
-        fences[write] = fence;
-      }
-      if (i < pending_start) new_pending_start++;
-      write++;
-    }
-  }
-  if (release_count > 0) hina_page_pool_release_batch(ctx, to_release, release_count);
-  sc->retired.count = write;
-  sc->retired.pending_start = new_pending_start;
-#ifdef HINA_DEBUG
-  ctx->debug.staging_retired += (count - write);
-#endif
+  HINA_IMPL_PROCESS_RETIRED(ctx,
+    (fence != HINA_TICKET_PENDING) && (fence <= completed));
 }
 
 static void hina_staging_ctx_process_retired(hina_context* ctx)
@@ -16576,7 +16655,18 @@ HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_##SUFFIX( \
     hina_texture_hot* hot = HINA_TEX_HOT(color_view_slot->parent_idx); \
     if (!hot->owns_image) cmd->uses_swapchain = true; \
     hina_layout_state target = hina_layout_for_hint(cmd->ctx, cmd->family_idx, HINA_TEXSTATE_COLOR_ATTACHMENT); \
-    if (hot->state.layout != target.layout || hot->state.access != target.access || hot->state.stages != target.stages) \
+    /* WAW hazard: if the image is already in COLOR_ATTACHMENT state (written by a previous */ \
+    /* render pass) and this pass uses LOAD_OP_LOAD, we still need an execution barrier to */ \
+    /* ensure the previous writes are visible. Without this, the GPU may reorder or overlap */ \
+    /* the previous pass's writes with this pass's load — especially on TBDR GPUs where */ \
+    /* tile resolve is asynchronous. */ \
+    bool needs_waw_barrier = \
+      (hot->state.layout == target.layout && hot->state.access == target.access && \
+       hot->state.stages == target.stages && \
+       (hot->state.access & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) != 0 && \
+       action->colors[i].load_op == HINA_LOAD_OP_LOAD); \
+    if (hot->state.layout != target.layout || hot->state.access != target.access || \
+        hot->state.stages != target.stages || needs_waw_barrier) \
     { \
       FILL_BARRIER(hot, target, VK_IMAGE_ASPECT_COLOR_BIT); \
       hot->state.layout = target.layout; \
@@ -16654,7 +16744,13 @@ HINA_NOINLINE static void hina_cmd_begin_pass_dynamic_##SUFFIX( \
   { \
     hina_texture_hot* dh = HINA_TEX_HOT(depth_view_slot->parent_idx); \
     hina_layout_state target = hina_layout_for_hint(cmd->ctx, cmd->family_idx, HINA_TEXSTATE_DEPTH_ATTACHMENT); \
-    if (dh->state.layout != target.layout || dh->state.access != target.access || dh->state.stages != target.stages) \
+    bool depth_needs_waw = \
+      (dh->state.layout == target.layout && dh->state.access == target.access && \
+       dh->state.stages == target.stages && \
+       (dh->state.access & VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) != 0 && \
+       action->depth.load_op == HINA_LOAD_OP_LOAD); \
+    if (dh->state.layout != target.layout || dh->state.access != target.access || \
+        dh->state.stages != target.stages || depth_needs_waw) \
     { \
       VkImageAspectFlags depth_aspect = hina_aspect_from_format(dh->dims.format); \
       FILL_BARRIER(dh, target, depth_aspect); \

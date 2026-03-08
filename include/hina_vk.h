@@ -756,6 +756,9 @@ typedef struct hina_desc
   hina_log_fn log_fn;
   // Settings (8B)
   uint64_t staging_buffer_size; // Default: 16MB. Used for internal upload buffers.
+  uint64_t gpu_block_size;      // Default: 64MB. VMA preferred block size for large heaps (>1GB).
+                                // Controls granularity of VkDeviceMemory allocations.
+                                // Smaller = less wasted memory, larger = fewer allocations.
   // 4-byte fields grouped together (no padding between them)
   uint32_t instance_ext_count;
   uint32_t device_ext_count;
@@ -767,7 +770,7 @@ typedef struct hina_desc
   hina_vk_version max_api_version;
 } hina_desc;
 
-// Defaults: .staging_buffer_size = 16 * 1024 * 1024 (16MB)
+// Defaults: .staging_buffer_size = 16MB, .gpu_block_size = 64MB
 HINA_API hina_desc hina_desc_default(void);
 
 /**
