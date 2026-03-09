@@ -3149,6 +3149,11 @@ HINA_API void hina_cmd_copy_buffer_to_texture(hina_cmd* cmd, hina_buffer src, hi
 HINA_API void hina_cmd_copy_texture_to_buffer(hina_cmd* cmd, hina_texture src, hina_buffer dst, uint32_t mip_level,
                                               uint32_t array_layer, uint64_t buffer_offset);
 
+HINA_API void hina_cmd_copy_texture_to_buffer_region(hina_cmd* cmd, hina_texture src, hina_buffer dst,
+                                                     uint32_t mip_level, uint32_t array_layer, uint32_t x,
+                                                     uint32_t y, uint32_t width, uint32_t height,
+                                                     uint64_t buffer_offset);
+
 HINA_API void hina_cmd_copy_buffer_to_texture_3d(hina_cmd* cmd, hina_buffer src, hina_texture dst,
                                                  uint64_t buffer_offset, uint32_t mip_level, uint32_t z_offset,
                                                  uint32_t depth);
