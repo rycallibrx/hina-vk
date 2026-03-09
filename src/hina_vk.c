@@ -249,22 +249,14 @@ void  hina_tracy_vk_context_name(void* ctx, const char* name);
 // - GCC/Clang on Linux/macOS: Available with glibc 2.28+ / recent libc++
 //
 // Provide a minimal compatibility layer for platforms without <threads.h>.
-#if defined(__MINGW32__) || defined(__MINGW64__)
-// MinGW doesn't have C11 threads - use Windows APIs instead
-#define HINA_HAS_C11_THREADS 0
-#elif defined(_MSC_VER) && _MSC_VER >= 1938
+#if defined(_MSC_VER) && _MSC_VER >= 1938
 // MSVC 17.8+ has C11 threads
 #include <threads.h>
 #define HINA_HAS_C11_THREADS 1
-#elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 28))
-// glibc 2.28+ has C11 threads
-#include <threads.h>
-#define HINA_HAS_C11_THREADS 1
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__) && !defined(_WIN32)
-// C11 compiler claims threads support (but not on Windows without explicit check)
-#include <threads.h>
-#define HINA_HAS_C11_THREADS 1
 #else
+// All other platforms: use POSIX pthreads or Win32 APIs directly.
+// This avoids fragile C11 <threads.h> detection and Android Bionic quirks
+// (mtx_init with mtx_recursive fails on some devices).
 #define HINA_HAS_C11_THREADS 0
 #endif
 #if !HINA_HAS_C11_THREADS
@@ -285,6 +277,8 @@ static int mtx_unlock(mtx_t* mtx) { LeaveCriticalSection(mtx); return 0; }
 static void mtx_destroy(mtx_t* mtx) { DeleteCriticalSection(mtx); }
 
 static thrd_t thrd_current(void) { return GetCurrentThreadId(); }
+
+static int thrd_equal(thrd_t a, thrd_t b) { return a == b; }
 
 #elif defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 // POSIX: Use pthread_mutex_t for mtx_t
@@ -315,6 +309,8 @@ static int mtx_unlock(mtx_t* mtx) { return pthread_mutex_unlock(mtx) == 0 ? 0 : 
 static void mtx_destroy(mtx_t* mtx) { pthread_mutex_destroy(mtx); }
 
 static thrd_t thrd_current(void) { return pthread_self(); }
+
+static int thrd_equal(thrd_t a, thrd_t b) { return pthread_equal(a, b); }
 
 #else
 #error "Wow, that can't be good"
