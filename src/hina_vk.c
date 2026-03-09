@@ -4340,6 +4340,136 @@ static const char* hina_debug_get_label(uint32_t handle, VkObjectType type)
   return hina_debug_name_auto(handle, type);
 }
 
+// Shadow-copy bind group entries so layout-mismatch logs can include resource labels.
+typedef struct hina_debug_bg_binding
+{
+  uint32_t handle_a; // Primary: buffer.id, view.id, or sampler.id
+  uint32_t handle_b; // Combined: sampler.id (0 otherwise)
+  uint64_t buf_offset; // Buffer bindings: offset
+  uint64_t buf_size; // Buffer bindings: size (0 = VK_WHOLE_SIZE)
+  uint8_t binding;
+  uint8_t type; // hina_desc_type
+  uint8_t pad_[6];
+} hina_debug_bg_binding;
+
+typedef struct hina_debug_bg_record
+{
+  uint32_t group_handle; // hina_bind_group handle id
+  uint8_t count;
+  uint8_t pad_[3];
+  hina_debug_bg_binding entries[HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES];
+} hina_debug_bg_record;
+
+#define HINA_DEBUG_BG_INIT_CAP 64
+
+static hina_spinlock g_debug_bg_lock;
+static hina_debug_bg_record* g_debug_bg_records;
+static uint32_t g_debug_bg_capacity;
+static uint32_t g_debug_bg_count;
+
+static void hina_debug_bg_init(void)
+{
+  g_debug_bg_lock.val = 0;
+  g_debug_bg_records = NULL;
+  g_debug_bg_capacity = 0;
+  g_debug_bg_count = 0;
+}
+
+static void hina_debug_bg_shutdown(void)
+{
+  if (g_debug_bg_records) hina_free_host(g_debug_bg_records);
+  g_debug_bg_records = NULL;
+  g_debug_bg_capacity = 0;
+  g_debug_bg_count = 0;
+}
+
+static void hina_debug_bg_track(uint32_t group_handle, const hina_bind_group_entry* entries, uint32_t entry_count)
+{
+  if (!entry_count) return;
+  hina_spin_lock(&g_debug_bg_lock);
+  if (g_debug_bg_count >= g_debug_bg_capacity)
+  {
+    uint32_t new_cap = g_debug_bg_capacity ? g_debug_bg_capacity * 2 : HINA_DEBUG_BG_INIT_CAP;
+    hina_debug_bg_record* new_arr = hina_alloc_host(new_cap * sizeof(hina_debug_bg_record));
+    if (g_debug_bg_records)
+    {
+      memcpy(new_arr, g_debug_bg_records, g_debug_bg_count * sizeof(hina_debug_bg_record));
+      hina_free_host(g_debug_bg_records);
+    }
+    g_debug_bg_records = new_arr;
+    g_debug_bg_capacity = new_cap;
+  }
+  hina_debug_bg_record* rec = &g_debug_bg_records[g_debug_bg_count];
+  rec->group_handle = group_handle;
+  rec->count = (uint8_t)(entry_count > HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES
+                           ? HINA_MAX_BIND_GROUP_LAYOUT_ENTRIES : entry_count);
+  memset(rec->entries, 0, sizeof(rec->entries));
+  for (uint8_t i = 0; i < rec->count; ++i)
+  {
+    const hina_bind_group_entry* e = &entries[i];
+    hina_debug_bg_binding* b = &rec->entries[i];
+    b->binding = (uint8_t)e->binding;
+    b->type = (uint8_t)e->type;
+    switch (e->type)
+    {
+    case HINA_DESC_TYPE_UNIFORM_BUFFER:
+    case HINA_DESC_TYPE_STORAGE_BUFFER:
+      b->handle_a = e->buffer.buffer.id;
+      b->buf_offset = e->buffer.offset;
+      b->buf_size = e->buffer.size;
+      break;
+    case HINA_DESC_TYPE_SAMPLED_IMAGE:
+    case HINA_DESC_TYPE_STORAGE_IMAGE:
+    case HINA_DESC_TYPE_INPUT_ATTACHMENT:
+      b->handle_a = e->view.id;
+      break;
+    case HINA_DESC_TYPE_SAMPLER:
+      b->handle_a = e->sampler.id;
+      break;
+    case HINA_DESC_TYPE_COMBINED_IMAGE_SAMPLER:
+      b->handle_a = e->combined.view.id;
+      b->handle_b = e->combined.sampler.id;
+      break;
+    default:
+      break;
+    }
+  }
+  g_debug_bg_count++;
+  hina_spin_unlock(&g_debug_bg_lock);
+}
+
+static void hina_debug_bg_untrack(uint32_t group_handle)
+{
+  hina_spin_lock(&g_debug_bg_lock);
+  for (uint32_t i = 0; i < g_debug_bg_count; ++i)
+  {
+    if (g_debug_bg_records[i].group_handle == group_handle)
+    {
+      g_debug_bg_records[i] = g_debug_bg_records[g_debug_bg_count - 1]; // Swap-remove
+      g_debug_bg_count--;
+      break;
+    }
+  }
+  hina_spin_unlock(&g_debug_bg_lock);
+}
+
+static bool hina_debug_bg_copy(uint32_t group_handle, hina_debug_bg_record* out)
+{
+  bool found = false;
+  hina_spin_lock(&g_debug_bg_lock);
+  for (uint32_t i = 0; i < g_debug_bg_count; ++i)
+  {
+    if (g_debug_bg_records[i].group_handle == group_handle)
+    {
+      *out = g_debug_bg_records[i];
+      found = true;
+      break;
+    }
+  }
+  hina_spin_unlock(&g_debug_bg_lock);
+  return found;
+}
+
 #endif // HINA_DEBUG
 
 // Convert hina_vk_version enum to raw Vulkan API version
@@ -4395,6 +4525,7 @@ static void hina_storage_init(void)
   hina_leak_track_reset();
 #endif
   hina_debug_name_init();
+  hina_debug_bg_init();
 #endif
   g_storage.validation_level = HINA_DEFAULT_VALIDATION_LEVEL;
 }
@@ -4500,6 +4631,7 @@ static void hina_storage_shutdown(void)
 {
   if (g_storage.initialized != HINA_STORAGE_INITIALIZED) return;
 #ifdef HINA_DEBUG
+  hina_debug_bg_shutdown();
   hina_debug_name_shutdown();  // Must be before persistent_vm release (uses hina_free_host)
 #endif
   HINA_POOL_LIST(HINA_POOL_RELEASE_ONE);
@@ -13773,6 +13905,7 @@ static hina_bind_group hina_ctx_create_bind_group_internal(hina_context* ctx, co
   }
 #ifdef HINA_DEBUG
   if (desc->label) hina_debug_name_add(internal_handle.id, VK_OBJECT_TYPE_DESCRIPTOR_SET, desc->label);
+  hina_debug_bg_track(internal_handle.id, desc->entries, desc->entry_count);
 #endif
   return (hina_bind_group){internal_handle.id};
 }
@@ -13799,6 +13932,7 @@ void hina_ctx_destroy_bind_group(hina_context* ctx, hina_bind_group group)
   if (!hina_desc_set_slot_valid((hina_desc_set){group.id})) return;
 #ifdef HINA_DEBUG
   hina_debug_name_remove(group.id, VK_OBJECT_TYPE_DESCRIPTOR_SET);
+  hina_debug_bg_untrack(group.id);
 #endif
   uint16_t idx = hina_id_index(group.id);
   hina_desc_set_slot* slot = HINA_DESC_SET_ENTRY(idx);
@@ -17987,9 +18121,29 @@ void hina_cmd_bind_pipeline(hina_cmd* cmd, hina_pipeline pip)
   // When layout changes, mark bound descriptor sets as dirty so they get rebound
   // with the new layout. Only mark sets that exist in the new pipeline's layout.
   // This follows SDL's pattern of layout-change detection.
-  if (cmd->current_layout != e->layout)
+  if (cmd->current_layout != VK_NULL_HANDLE && cmd->current_layout != e->layout)
   {
+    // Real layout switch (not the first pipeline bind). Mark/invalidate bound descriptor sets.
     uint32_t max_set = e->set_layout_count < HINA_MAX_DESCRIPTOR_SETS ? e->set_layout_count : HINA_MAX_DESCRIPTOR_SETS;
+    // Invalidate transient sets within the new layout range. Transient VkDescriptorSets
+    // were allocated from the OLD pipeline's VkDescriptorSetLayout - they cannot be
+    // rebound under an incompatible layout (Vulkan spec 13.2.5). Unlike persistent sets,
+    // which can be marked dirty and rebound, transient sets must be fully cleared so the
+    // user is forced to allocate fresh ones for the new pipeline.
+    uint32_t transient_in_range = cmd->transient_sets_mask & ((1u << max_set) - 1);
+    if (transient_in_range)
+    {
+      for (uint32_t i = 0; i < max_set; ++i)
+      {
+        if (transient_in_range & (1u << i))
+        {
+          cmd->transient_sets[i] = VK_NULL_HANDLE;
+          cmd->bound_sets[i] = VK_NULL_HANDLE; // Prevent gap-fill from reusing stale handle
+        }
+      }
+      cmd->transient_sets_mask &= ~transient_in_range;
+    }
+    // Mark persistent sets dirty so they get rebound with the new layout
     for (uint32_t i = 0; i < max_set; ++i)
     {
       if (cmd->bound_groups[i].id != HINA_INVALID_HANDLE) cmd->groups_dirty_mask |= 1u << i;
@@ -17999,9 +18153,24 @@ void hina_cmd_bind_pipeline(hina_cmd* cmd, hina_pipeline pip)
     {
       cmd->bound_groups[i].id = HINA_INVALID_HANDLE;
       cmd->transient_sets[i] = VK_NULL_HANDLE;
+      cmd->bound_sets[i] = VK_NULL_HANDLE;
     }
-    cmd->groups_dirty_mask &= (1u << max_set) - 1; // Mask off bits beyond new layout
+    cmd->groups_dirty_mask &= (1u << max_set) - 1;
     cmd->transient_sets_mask &= (1u << max_set) - 1;
+  }
+  else if (cmd->bound_pipeline_kind != (uint8_t)e->kind)
+  {
+    // Same layout, different bind point (graphics <-> compute). Vulkan tracks descriptor
+    // set bindings per bind point (spec 14.2.7), so sets bound under the old bind point
+    // are invisible to the new one. Re-dirty all bound sets so they get re-issued.
+    // Unlike a layout change, transient sets are NOT invalidated — the VkDescriptorSetLayout
+    // is compatible, so the same VkDescriptorSet handles can be rebound under the new bind point.
+    uint32_t max_set = e->set_layout_count < HINA_MAX_DESCRIPTOR_SETS ? e->set_layout_count : HINA_MAX_DESCRIPTOR_SETS;
+    for (uint32_t i = 0; i < max_set; ++i)
+    {
+      if ((cmd->transient_sets_mask & (1u << i)) || cmd->bound_groups[i].id != HINA_INVALID_HANDLE)
+        cmd->groups_dirty_mask |= 1u << i;
+    }
   }
   cmd->bound_pipeline_kind = e->kind;
   cmd->current_layout = e->layout;
@@ -18206,7 +18375,7 @@ static const hina_reflected_binding* hina_find_reflected_binding(const hina_pipe
 
 // Validate a bind group against the currently bound pipeline's reflection data
 // Returns true if validation passes (or validation is disabled)
-static bool hina_validate_bind_group_internal(hina_cmd* cmd, uint32_t set, hina_bind_group group)
+static bool hina_validate_bind_group_internal(hina_cmd* cmd, uint32_t set, hina_bind_group group, const char* caller)
 {
   // Skip validation if disabled
   if (g_storage.validation_level == HINA_VALIDATION_NONE) return true;
@@ -18223,14 +18392,14 @@ static bool hina_validate_bind_group_internal(hina_cmd* cmd, uint32_t set, hina_
   uint16_t group_idx = hina_id_index(group.id);
   if (!hina_desc_set_slot_valid((hina_desc_set){group.id}))
   {
-    HINA_LOGW(ctx, "hina_cmd_bind_group: invalid bind group handle at set %u", set);
+    HINA_LOGW(ctx, "%s: invalid bind group handle at set %u", caller, set);
     return g_storage.validation_level < HINA_VALIDATION_ERROR;
   }
   hina_desc_set_slot* group_slot = HINA_DESC_SET_ENTRY(group_idx);
   uint16_t layout_idx = hina_id_index(group_slot->layout.id);
   if (!hina_desc_layout_slot_valid(group_slot->layout))
   {
-    HINA_LOGW(ctx, "hina_cmd_bind_group: bind group at set %u has invalid layout", set);
+    HINA_LOGW(ctx, "%s: bind group at set %u has invalid layout", caller, set);
     return g_storage.validation_level < HINA_VALIDATION_ERROR;
   }
   hina_desc_layout_slot* layout = HINA_DESC_LAYOUT_ENTRY(layout_idx);
@@ -18323,7 +18492,7 @@ void hina_cmd_bind_group(hina_cmd* cmd, uint32_t set, hina_bind_group group)
                HINA_MAX_DESCRIPTOR_SETS);
   // Validate bind group against pipeline reflection (if enabled and pipeline is bound)
 #ifdef HINA_DEBUG
-  hina_validate_bind_group_internal(cmd, set, group);
+  hina_validate_bind_group_internal(cmd, set, group, "hina_cmd_bind_group");
 #endif
   if (cmd->bound_groups[set].id == group.id)
   {
@@ -18333,6 +18502,7 @@ void hina_cmd_bind_group(hina_cmd* cmd, uint32_t set, hina_bind_group group)
   cmd->bound_groups[set] = group;
   cmd->groups_dirty_mask |= 1u << set;
   cmd->transient_sets_mask &= ~(1u << set); // Clear transient flag - persistent takes precedence now
+  cmd->transient_sets[set] = VK_NULL_HANDLE; // Clear stale transient handle
   cmd->group_dynamic_counts[set] = 0; // Clear dynamic offsets when binding without offsets
   ++cmd->ctx->stats.descriptor_writes;
   // Clear legacy slot-based bindings for this set (mutually exclusive paths)
@@ -18349,8 +18519,11 @@ void hina_cmd_bind_group_with_offsets(hina_cmd* cmd, uint32_t set, hina_bind_gro
   HINA_ASSERT(cmd);
   HINA_ASSERTF(set < HINA_MAX_DESCRIPTOR_SETS, "hina_cmd_bind_group_with_offsets: set %u exceeds max %u", set,
                HINA_MAX_DESCRIPTOR_SETS);
+  HINA_ASSERTF(offset_count == 0 || offsets,
+               "hina_cmd_bind_group_with_offsets: offsets is NULL but offset_count is %u at set %u",
+               offset_count, set);
 #ifdef HINA_DEBUG
-  hina_validate_bind_group_internal(cmd, set, group);
+  hina_validate_bind_group_internal(cmd, set, group, "hina_cmd_bind_group_with_offsets");
 #endif
   // Store dynamic offsets
   if (offsets && offset_count > 0)
@@ -18407,6 +18580,7 @@ void hina_cmd_bind_group_with_offsets(hina_cmd* cmd, uint32_t set, hina_bind_gro
     cmd->bound_groups[set] = group;
     cmd->groups_dirty_mask |= 1u << set;
     cmd->transient_sets_mask &= ~(1u << set); // Clear transient flag - persistent takes precedence now
+    cmd->transient_sets[set] = VK_NULL_HANDLE; // Clear stale transient handle
     memcpy(cmd->group_dynamic_offsets[set], offsets, offset_count * sizeof(uint32_t));
     cmd->group_dynamic_counts[set] = (uint8_t)offset_count;
     ++cmd->ctx->stats.descriptor_writes;
@@ -18423,6 +18597,7 @@ void hina_cmd_bind_group_with_offsets(hina_cmd* cmd, uint32_t set, hina_bind_gro
     cmd->bound_groups[set] = group;
     cmd->groups_dirty_mask |= 1u << set;
     cmd->transient_sets_mask &= ~(1u << set); // Clear transient flag - persistent takes precedence now
+    cmd->transient_sets[set] = VK_NULL_HANDLE; // Clear stale transient handle
     cmd->group_dynamic_counts[set] = 0;
     ++cmd->ctx->stats.descriptor_writes;
   }
@@ -18445,6 +18620,12 @@ hina_transient_bind_group hina_ctx_alloc_transient_bind_group(hina_context* ctx,
   }
   uint16_t layout_idx = hina_id_index(layout.id);
   hina_desc_layout_slot* layout_slot = HINA_DESC_LAYOUT_ENTRY(layout_idx);
+#ifdef HINA_DEBUG
+  HINA_ASSERTF(layout_slot->dynamic_count == 0,
+               "hina_alloc_transient_bind_group: layout has %u dynamic offset bindings. "
+               "Transient bind groups do not support dynamic offsets - use hina_create_bind_group instead.",
+               layout_slot->dynamic_count);
+#endif
   VkDescriptorSetLayout vk_layout = layout_slot->layout;
   // Get linear allocator for current frame
   uint32_t frame_slot = (uint32_t)(ctx->frame.frame_index % HINA_MAX_FRAMES_IN_FLIGHT);
@@ -18600,12 +18781,11 @@ void hina_cmd_bind_transient_group(hina_cmd* cmd, uint32_t set, hina_transient_b
 #endif
   VkDescriptorSet vk_set = tbg.internal.set;
   cmd->group_dynamic_counts[set] = 0; // Transient groups don't support dynamic offsets
-  // Store for later binding during flush
-  // We use a special marker to indicate this is a transient group (direct VkDescriptorSet)
-  // By setting bound_groups to an invalid handle but storing the VkDescriptorSet separately,
-  // we can detect and handle transient groups during flush.
-  //
-  // Alternative approach: bind immediately if pipeline is already bound
+  // Clear any stale persistent bind group at this slot. Without this, the layout-change
+  // handler (hina_cmd_bind_pipeline) would find the old persistent handle, mark it dirty,
+  // and resubmit it under the new pipeline's layout - a silent Vulkan spec violation.
+  cmd->bound_groups[set].id = HINA_INVALID_HANDLE;
+  // Bind immediately if pipeline is already bound, otherwise defer to flush
   if (cmd->current_layout != VK_NULL_HANDLE)
   {
     // Pipeline already bound - can bind descriptor set immediately
@@ -18623,7 +18803,6 @@ void hina_cmd_bind_transient_group(hina_cmd* cmd, uint32_t set, hina_transient_b
   else
   {
     // Pipeline not bound yet - store for deferred binding
-    // Use a special slot in the command buffer to track transient sets
     cmd->transient_sets[set] = vk_set;
     cmd->transient_sets_mask |= 1u << set;
     cmd->groups_dirty_mask |= 1u << set;
@@ -18661,6 +18840,11 @@ static void hina_flush_explicit_groups(hina_cmd* cmd)
                cmd->group_dynamic_counts[i] * sizeof(uint32_t));
         total_offsets += cmd->group_dynamic_counts[i];
       }
+      else if (cmd->group_dynamic_counts[i] > 0)
+      {
+        HINA_LOGW(cmd->ctx, "hina_flush_bind_groups: dynamic offset overflow at set %u "
+                  "(%u + %u > 32), offsets dropped", i, total_offsets, cmd->group_dynamic_counts[i]);
+      }
       if (i < first_set) first_set = i;
       if (i > last_set) last_set = i;
       continue;
@@ -18677,6 +18861,11 @@ static void hina_flush_explicit_groups(hina_cmd* cmd)
       memcpy(all_offsets + total_offsets, cmd->group_dynamic_offsets[i],
              cmd->group_dynamic_counts[i] * sizeof(uint32_t));
       total_offsets += cmd->group_dynamic_counts[i];
+    }
+    else if (cmd->group_dynamic_counts[i] > 0)
+    {
+      HINA_LOGW(cmd->ctx, "hina_flush_bind_groups: dynamic offset overflow at set %u "
+                "(%u + %u > 32), offsets dropped", i, total_offsets, cmd->group_dynamic_counts[i]);
     }
     if (i < first_set) first_set = i;
     if (i > last_set) last_set = i;
@@ -18713,7 +18902,11 @@ static void hina_flush_explicit_groups(hina_cmd* cmd)
     }
   }
   cmd->groups_dirty_mask = 0;
-  cmd->transient_sets_mask = 0; // Clear transient sets after binding
+  // NOTE: Do NOT clear transient_sets_mask here. It must persist across flushes
+  // so that subsequent validation calls (which run every draw) know a transient
+  // set is bound and skip the stale persistent bind group check. The mask is
+  // properly cleared when a persistent bind group replaces the transient
+  // (see hina_cmd_bind_group / hina_cmd_bind_group_offsets).
 }
 
 // Demo Path: Slot-based bindings (NOINLINE to avoid I-cache pollution)
@@ -19011,92 +19204,198 @@ static const char* hina_stage_mask_to_short_string(uint8_t mask, char* out, size
   return out;
 }
 
-static void hina_log_layout_mismatch_slots(hina_context* ctx, const char* op_name, uint32_t set,
-                                           const hina_desc_layout_slot* actual, const hina_desc_layout_slot* expected)
+// Get the VkObjectType for looking up debug names of resources in a binding
+static VkObjectType hina_desc_type_to_resource_object_type(hina_desc_type type, bool secondary)
 {
-  if (!actual || !expected)
+  switch (type)
   {
-    HINA_LOGW(ctx, "%s: Bind group layout mismatch at set %u (missing layout metadata)", op_name, set);
+  case HINA_DESC_TYPE_UNIFORM_BUFFER:
+  case HINA_DESC_TYPE_STORAGE_BUFFER:
+    return VK_OBJECT_TYPE_BUFFER;
+  case HINA_DESC_TYPE_SAMPLED_IMAGE:
+  case HINA_DESC_TYPE_STORAGE_IMAGE:
+  case HINA_DESC_TYPE_INPUT_ATTACHMENT:
+    return VK_OBJECT_TYPE_IMAGE_VIEW;
+  case HINA_DESC_TYPE_SAMPLER:
+    return VK_OBJECT_TYPE_SAMPLER;
+  case HINA_DESC_TYPE_COMBINED_IMAGE_SAMPLER:
+    return secondary ? VK_OBJECT_TYPE_SAMPLER : VK_OBJECT_TYPE_IMAGE_VIEW;
+  default:
+    return VK_OBJECT_TYPE_UNKNOWN;
+  }
+}
+
+static void hina_dump_layout_slot(hina_context* ctx, const char* op_name,
+                                  const char* side_label, const hina_desc_layout_slot* slot,
+                                  uint32_t group_handle)
+{
+  if (!slot) { HINA_LOGW(ctx, "%s:   %s: (null)", op_name, side_label); return; }
+  HINA_LOGW(ctx, "%s:   %s (%u entries, %u dynamic):", op_name, side_label, slot->entry_count, slot->dynamic_count);
+  hina_debug_bg_record rec_copy;
+  const hina_debug_bg_record* rec = NULL;
+  if (group_handle != HINA_INVALID_HANDLE && hina_debug_bg_copy(group_handle, &rec_copy)) rec = &rec_copy;
+  for (uint32_t i = 0; i < slot->entry_count; ++i)
+  {
+    const hina_desc_type type = (hina_desc_type)slot->entries[i].type;
+    const uint32_t count = slot->entries[i].count ? slot->entries[i].count : 1u;
+    uint8_t stage_raw = hina_layout_entry_stage_flags_raw(slot->entries[i].flags);
+    if (!stage_raw) stage_raw = HINA_STAGE_ALL;
+    char stage_str[4];
+    const hina_debug_bg_binding* tracked = NULL;
+    if (rec)
+    {
+      for (uint8_t j = 0; j < rec->count; ++j)
+      {
+        if (rec->entries[j].binding == slot->entries[i].binding)
+        {
+          tracked = &rec->entries[j];
+          break;
+        }
+      }
+    }
+    if (tracked && tracked->handle_a != HINA_INVALID_HANDLE)
+    {
+      VkObjectType obj_type = hina_desc_type_to_resource_object_type(type, false);
+      char res_label[64];
+      snprintf(res_label, sizeof(res_label), "%s", hina_debug_get_label(tracked->handle_a, obj_type));
+      if (type == HINA_DESC_TYPE_UNIFORM_BUFFER || type == HINA_DESC_TYPE_STORAGE_BUFFER)
+      {
+        HINA_LOGW(ctx, "%s:     binding %u: %s x%u, stages %s [resource: '%s' +%" PRIu64 " size=%" PRIu64 "]",
+                  op_name, slot->entries[i].binding, hina_desc_type_name(type), count,
+                  hina_stage_mask_to_short_string(stage_raw, stage_str, sizeof(stage_str)),
+                  res_label, tracked->buf_offset, tracked->buf_size);
+      }
+      else if (type == HINA_DESC_TYPE_COMBINED_IMAGE_SAMPLER && tracked->handle_b != HINA_INVALID_HANDLE)
+      {
+        char samp_label[64];
+        snprintf(samp_label, sizeof(samp_label), "%s",
+                 hina_debug_get_label(tracked->handle_b, VK_OBJECT_TYPE_SAMPLER));
+        HINA_LOGW(ctx, "%s:     binding %u: %s x%u, stages %s [view: '%s', sampler: '%s']",
+                  op_name, slot->entries[i].binding, hina_desc_type_name(type), count,
+                  hina_stage_mask_to_short_string(stage_raw, stage_str, sizeof(stage_str)),
+                  res_label, samp_label);
+      }
+      else
+      {
+        HINA_LOGW(ctx, "%s:     binding %u: %s x%u, stages %s [resource: '%s']",
+                  op_name, slot->entries[i].binding, hina_desc_type_name(type), count,
+                  hina_stage_mask_to_short_string(stage_raw, stage_str, sizeof(stage_str)),
+                  res_label);
+      }
+    }
+    else
+    {
+      HINA_LOGW(ctx, "%s:     binding %u: %s x%u, stages %s", op_name,
+                slot->entries[i].binding, hina_desc_type_name(type), count,
+                hina_stage_mask_to_short_string(stage_raw, stage_str, sizeof(stage_str)));
+    }
+  }
+}
+
+// Dump what the pipeline expects at a given set from reflection data
+static void hina_dump_pipeline_expected(hina_context* ctx, const char* op_name, uint32_t set,
+                                        const hina_pipeline_reflection* refl)
+{
+  if (!refl) { HINA_LOGW(ctx, "%s:   pipeline expects: (no reflection)", op_name); return; }
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < refl->binding_count; ++i)
+    if (refl->bindings[i].set == set) count++;
+  HINA_LOGW(ctx, "%s:   pipeline expects (%u bindings):", op_name, count);
+  for (uint32_t i = 0; i < refl->binding_count; ++i)
+  {
+    const hina_reflected_binding* rb = &refl->bindings[i];
+    if (rb->set != set) continue;
+    uint8_t stage_raw = (uint8_t)hina_vk_stage_flags_to_hina(rb->stages);
+    if (!stage_raw) stage_raw = HINA_STAGE_ALL;
+    char stage_str[4];
+    const uint32_t cnt = rb->count ? rb->count : 1u;
+    HINA_LOGW(ctx, "%s:     binding %u: %s x%u, stages %s", op_name,
+              rb->binding, hina_desc_type_name(rb->type), cnt,
+              hina_stage_mask_to_short_string(stage_raw, stage_str, sizeof(stage_str)));
+  }
+}
+
+static void hina_log_layout_mismatch_slots(hina_context* ctx, const char* op_name, uint32_t set,
+                                           const hina_desc_layout_slot* bound, const hina_desc_layout_slot* pipeline)
+{
+  if (!bound || !pipeline)
+  {
+    HINA_LOGW(ctx, "%s:   set %u: missing layout metadata for comparison", op_name, set);
     return;
   }
-  if (actual->entry_count != expected->entry_count)
+  if (bound->entry_count != pipeline->entry_count)
   {
-    HINA_LOGW(ctx, "%s: Bind group layout mismatch at set %u (entry_count %u != expected %u)", op_name, set,
-              actual->entry_count, expected->entry_count);
+    HINA_LOGW(ctx, "%s:   set %u: bound group has %u entries, pipeline expects %u", op_name, set,
+              bound->entry_count, pipeline->entry_count);
   }
-  if (actual->dynamic_count != expected->dynamic_count)
+  if (bound->dynamic_count != pipeline->dynamic_count)
   {
-    HINA_LOGW(ctx, "%s: Bind group layout mismatch at set %u (dynamic_count %u != expected %u)", op_name, set,
-              actual->dynamic_count, expected->dynamic_count);
+    HINA_LOGW(ctx, "%s:   set %u: bound group has %u dynamic offsets, pipeline expects %u", op_name, set,
+              bound->dynamic_count, pipeline->dynamic_count);
   }
-  for (uint32_t i = 0; i < expected->entry_count; ++i)
+  for (uint32_t i = 0; i < pipeline->entry_count; ++i)
   {
-    const uint8_t binding = expected->entries[i].binding;
-    const hina_desc_type expected_type = (hina_desc_type)expected->entries[i].type;
-    const uint32_t expected_count = expected->entries[i].count ? expected->entries[i].count : 1u;
-    const uint8_t expected_flags = hina_layout_entry_binding_flags(expected->entries[i].flags);
-    uint8_t expected_stage_raw = hina_layout_entry_stage_flags_raw(expected->entries[i].flags);
-    if (!expected_stage_raw) expected_stage_raw = HINA_STAGE_ALL;
+    const uint8_t binding = pipeline->entries[i].binding;
+    const hina_desc_type pip_type = (hina_desc_type)pipeline->entries[i].type;
+    const uint32_t pip_count = pipeline->entries[i].count ? pipeline->entries[i].count : 1u;
+    const uint8_t pip_flags = hina_layout_entry_binding_flags(pipeline->entries[i].flags);
+    uint8_t pip_stage_raw = hina_layout_entry_stage_flags_raw(pipeline->entries[i].flags);
+    if (!pip_stage_raw) pip_stage_raw = HINA_STAGE_ALL;
     bool found = false;
-    for (uint32_t j = 0; j < actual->entry_count; ++j)
+    for (uint32_t j = 0; j < bound->entry_count; ++j)
     {
-      if (actual->entries[j].binding != binding) continue;
+      if (bound->entries[j].binding != binding) continue;
       found = true;
-      const hina_desc_type actual_type = (hina_desc_type)actual->entries[j].type;
-      const uint32_t actual_count = actual->entries[j].count ? actual->entries[j].count : 1u;
-      const uint8_t actual_flags = hina_layout_entry_binding_flags(actual->entries[j].flags);
-      uint8_t actual_stage_raw = hina_layout_entry_stage_flags_raw(actual->entries[j].flags);
-      if (!actual_stage_raw) actual_stage_raw = HINA_STAGE_ALL;
-      if (actual_type != expected_type)
+      const hina_desc_type bound_type = (hina_desc_type)bound->entries[j].type;
+      const uint32_t bound_count = bound->entries[j].count ? bound->entries[j].count : 1u;
+      const uint8_t bound_flags = hina_layout_entry_binding_flags(bound->entries[j].flags);
+      uint8_t bound_stage_raw = hina_layout_entry_stage_flags_raw(bound->entries[j].flags);
+      if (!bound_stage_raw) bound_stage_raw = HINA_STAGE_ALL;
+      if (bound_type != pip_type)
       {
-        HINA_LOGW(ctx, "%s: Bind group mismatch at set %u binding %u (type %s != expected %s)", op_name, set, binding,
-                  hina_desc_type_name(actual_type), hina_desc_type_name(expected_type));
+        HINA_LOGW(ctx, "%s:   set %u binding %u: bound type %s, pipeline expects %s", op_name, set, binding,
+                  hina_desc_type_name(bound_type), hina_desc_type_name(pip_type));
         return;
       }
-      if (actual_count != expected_count)
+      if (bound_count != pip_count)
       {
-        HINA_LOGW(ctx, "%s: Bind group mismatch at set %u binding %u (count %u != expected %u)", op_name, set, binding,
-                  actual_count, expected_count);
+        HINA_LOGW(ctx, "%s:   set %u binding %u: bound count %u, pipeline expects %u", op_name, set, binding,
+                  bound_count, pip_count);
         return;
       }
-      if (actual_flags != expected_flags)
+      if (bound_flags != pip_flags)
       {
-        HINA_LOGW(ctx, "%s: Bind group mismatch at set %u binding %u (flags 0x%02x != expected 0x%02x)", op_name, set,
-                  binding, actual_flags, expected_flags);
+        HINA_LOGW(ctx, "%s:   set %u binding %u: bound flags 0x%02x, pipeline expects 0x%02x", op_name, set,
+                  binding, bound_flags, pip_flags);
         return;
       }
-      if (actual_stage_raw != expected_stage_raw)
+      if (bound_stage_raw != pip_stage_raw)
       {
-        char actual_stage_str[4];
-        char expected_stage_str[4];
-        HINA_LOGW(ctx, "%s: Bind group mismatch at set %u binding %u (stages %s/0x%02x != expected %s/0x%02x)", op_name,
-                  set, binding,
-                  hina_stage_mask_to_short_string(actual_stage_raw, actual_stage_str, sizeof(actual_stage_str)),
-                  actual_stage_raw,
-                  hina_stage_mask_to_short_string(expected_stage_raw, expected_stage_str, sizeof(expected_stage_str)),
-                  expected_stage_raw);
+        char bound_stage_str[4];
+        char pip_stage_str[4];
+        HINA_LOGW(ctx, "%s:   set %u binding %u: bound stages %s, pipeline expects %s", op_name, set, binding,
+                  hina_stage_mask_to_short_string(bound_stage_raw, bound_stage_str, sizeof(bound_stage_str)),
+                  hina_stage_mask_to_short_string(pip_stage_raw, pip_stage_str, sizeof(pip_stage_str)));
         return;
       }
       break;
     }
     if (!found)
     {
-      char expected_stage_str[4];
-      HINA_LOGW(
-        ctx, "%s: Bind group mismatch at set %u missing binding %u (type %s, count %u, stages %s/0x%02x, flags 0x%02x)",
-        op_name, set, binding, hina_desc_type_name(expected_type), expected_count,
-        hina_stage_mask_to_short_string(expected_stage_raw, expected_stage_str, sizeof(expected_stage_str)),
-        expected_stage_raw, expected_flags);
+      char pip_stage_str[4];
+      HINA_LOGW(ctx, "%s:   set %u binding %u: missing from bound group (pipeline expects %s x%u, stages %s)",
+                op_name, set, binding, hina_desc_type_name(pip_type), pip_count,
+                hina_stage_mask_to_short_string(pip_stage_raw, pip_stage_str, sizeof(pip_stage_str)));
       return;
     }
   }
-  for (uint32_t j = 0; j < actual->entry_count; ++j)
+  for (uint32_t j = 0; j < bound->entry_count; ++j)
   {
-    const uint8_t binding = actual->entries[j].binding;
+    const uint8_t binding = bound->entries[j].binding;
     bool found = false;
-    for (uint32_t i = 0; i < expected->entry_count; ++i)
+    for (uint32_t i = 0; i < pipeline->entry_count; ++i)
     {
-      if (expected->entries[i].binding == binding)
+      if (pipeline->entries[i].binding == binding)
       {
         found = true;
         break;
@@ -19104,99 +19403,94 @@ static void hina_log_layout_mismatch_slots(hina_context* ctx, const char* op_nam
     }
     if (!found)
     {
-      const hina_desc_type actual_type = (hina_desc_type)actual->entries[j].type;
-      const uint32_t actual_count = actual->entries[j].count ? actual->entries[j].count : 1u;
-      uint8_t actual_stage_raw = hina_layout_entry_stage_flags_raw(actual->entries[j].flags);
-      if (!actual_stage_raw) actual_stage_raw = HINA_STAGE_ALL;
-      char actual_stage_str[4];
-      HINA_LOGW(ctx, "%s: Bind group mismatch at set %u has extra binding %u (type %s, count %u, stages %s/0x%02x)",
-                op_name, set, binding, hina_desc_type_name(actual_type), actual_count,
-                hina_stage_mask_to_short_string(actual_stage_raw, actual_stage_str, sizeof(actual_stage_str)),
-                actual_stage_raw);
+      const hina_desc_type bound_type = (hina_desc_type)bound->entries[j].type;
+      const uint32_t bound_count = bound->entries[j].count ? bound->entries[j].count : 1u;
+      uint8_t bound_stage_raw = hina_layout_entry_stage_flags_raw(bound->entries[j].flags);
+      if (!bound_stage_raw) bound_stage_raw = HINA_STAGE_ALL;
+      char bound_stage_str[4];
+      HINA_LOGW(ctx, "%s:   set %u binding %u: extra in bound group (%s x%u, stages %s) not expected by pipeline",
+                op_name, set, binding, hina_desc_type_name(bound_type), bound_count,
+                hina_stage_mask_to_short_string(bound_stage_raw, bound_stage_str, sizeof(bound_stage_str)));
       return;
     }
   }
 }
 
 static void hina_log_layout_mismatch_reflection(hina_context* ctx, const char* op_name, uint32_t set,
-                                                const hina_desc_layout_slot* actual,
+                                                const hina_desc_layout_slot* bound,
                                                 const hina_pipeline_reflection* refl)
 {
-  if (!actual || !refl)
+  if (!bound || !refl)
   {
-    HINA_LOGW(ctx, "%s: Bind group layout mismatch at set %u (missing reflection)", op_name, set);
+    HINA_LOGW(ctx, "%s:   set %u: missing reflection data for comparison", op_name, set);
     return;
   }
-  if (actual->dynamic_count != 0)
+  if (bound->dynamic_count != 0)
   {
-    HINA_LOGW(ctx, "%s: Bind group layout mismatch at set %u (dynamic_count %u != expected 0)", op_name, set,
-              actual->dynamic_count);
+    HINA_LOGW(ctx, "%s:   set %u: bound group has %u dynamic offsets, pipeline expects 0", op_name, set,
+              bound->dynamic_count);
   }
-  uint32_t expected_count = 0;
+  uint32_t pip_entry_count = 0;
   for (uint32_t i = 0; i < refl->binding_count; ++i)
   {
-    if (refl->bindings[i].set == set) expected_count++;
+    if (refl->bindings[i].set == set) pip_entry_count++;
   }
-  if (expected_count != actual->entry_count)
+  if (pip_entry_count != bound->entry_count)
   {
-    HINA_LOGW(ctx, "%s: Bind group layout mismatch at set %u (entry_count %u != expected %u)", op_name, set,
-              actual->entry_count, expected_count);
+    HINA_LOGW(ctx, "%s:   set %u: bound group has %u entries, pipeline expects %u", op_name, set,
+              bound->entry_count, pip_entry_count);
   }
   for (uint32_t i = 0; i < refl->binding_count; ++i)
   {
     const hina_reflected_binding* rb = &refl->bindings[i];
     if (rb->set != set) continue;
-    const uint32_t expected_count_binding = rb->count ? rb->count : 1u;
-    uint8_t expected_stage_raw = (uint8_t)hina_vk_stage_flags_to_hina(rb->stages);
-    if (!expected_stage_raw) expected_stage_raw = HINA_STAGE_ALL;
+    const uint32_t pip_count = rb->count ? rb->count : 1u;
+    uint8_t pip_stage_raw = (uint8_t)hina_vk_stage_flags_to_hina(rb->stages);
+    if (!pip_stage_raw) pip_stage_raw = HINA_STAGE_ALL;
     bool found = false;
-    for (uint32_t j = 0; j < actual->entry_count; ++j)
+    for (uint32_t j = 0; j < bound->entry_count; ++j)
     {
-      if (actual->entries[j].binding != rb->binding) continue;
+      if (bound->entries[j].binding != rb->binding) continue;
       found = true;
-      const hina_desc_type actual_type = (hina_desc_type)actual->entries[j].type;
-      const uint32_t actual_count = actual->entries[j].count ? actual->entries[j].count : 1u;
-      uint8_t actual_stage_raw = hina_layout_entry_stage_flags_raw(actual->entries[j].flags);
-      if (!actual_stage_raw) actual_stage_raw = HINA_STAGE_ALL;
-      if (actual_type != rb->type)
+      const hina_desc_type bound_type = (hina_desc_type)bound->entries[j].type;
+      const uint32_t bound_count = bound->entries[j].count ? bound->entries[j].count : 1u;
+      uint8_t bound_stage_raw = hina_layout_entry_stage_flags_raw(bound->entries[j].flags);
+      if (!bound_stage_raw) bound_stage_raw = HINA_STAGE_ALL;
+      if (bound_type != rb->type)
       {
-        HINA_LOGW(ctx, "%s: Bind group mismatch at set %u binding %u (type %s != expected %s)", op_name, set,
-                  rb->binding, hina_desc_type_name(actual_type), hina_desc_type_name(rb->type));
+        HINA_LOGW(ctx, "%s:   set %u binding %u: bound type %s, pipeline expects %s", op_name, set,
+                  rb->binding, hina_desc_type_name(bound_type), hina_desc_type_name(rb->type));
         return;
       }
-      if (actual_count != expected_count_binding)
+      if (bound_count != pip_count)
       {
-        HINA_LOGW(ctx, "%s: Bind group mismatch at set %u binding %u (count %u != expected %u)", op_name, set,
-                  rb->binding, actual_count, expected_count_binding);
+        HINA_LOGW(ctx, "%s:   set %u binding %u: bound count %u, pipeline expects %u", op_name, set,
+                  rb->binding, bound_count, pip_count);
         return;
       }
-      if (actual_stage_raw != expected_stage_raw)
+      if (bound_stage_raw != pip_stage_raw)
       {
-        char actual_stage_str[4];
-        char expected_stage_str[4];
-        HINA_LOGW(ctx, "%s: Bind group mismatch at set %u binding %u (stages %s/0x%02x != expected %s/0x%02x)", op_name,
-                  set, rb->binding,
-                  hina_stage_mask_to_short_string(actual_stage_raw, actual_stage_str, sizeof(actual_stage_str)),
-                  actual_stage_raw,
-                  hina_stage_mask_to_short_string(expected_stage_raw, expected_stage_str, sizeof(expected_stage_str)),
-                  expected_stage_raw);
+        char bound_stage_str[4];
+        char pip_stage_str[4];
+        HINA_LOGW(ctx, "%s:   set %u binding %u: bound stages %s, pipeline expects %s", op_name, set, rb->binding,
+                  hina_stage_mask_to_short_string(bound_stage_raw, bound_stage_str, sizeof(bound_stage_str)),
+                  hina_stage_mask_to_short_string(pip_stage_raw, pip_stage_str, sizeof(pip_stage_str)));
         return;
       }
       break;
     }
     if (!found)
     {
-      char expected_stage_str[4];
-      HINA_LOGW(ctx, "%s: Bind group mismatch at set %u missing binding %u (type %s, count %u, stages %s/0x%02x)",
-                op_name, set, rb->binding, hina_desc_type_name(rb->type), expected_count_binding,
-                hina_stage_mask_to_short_string(expected_stage_raw, expected_stage_str, sizeof(expected_stage_str)),
-                expected_stage_raw);
+      char pip_stage_str[4];
+      HINA_LOGW(ctx, "%s:   set %u binding %u: missing from bound group (pipeline expects %s x%u, stages %s)",
+                op_name, set, rb->binding, hina_desc_type_name(rb->type), pip_count,
+                hina_stage_mask_to_short_string(pip_stage_raw, pip_stage_str, sizeof(pip_stage_str)));
       return;
     }
   }
-  for (uint32_t j = 0; j < actual->entry_count; ++j)
+  for (uint32_t j = 0; j < bound->entry_count; ++j)
   {
-    const uint8_t binding = actual->entries[j].binding;
+    const uint8_t binding = bound->entries[j].binding;
     bool found = false;
     for (uint32_t i = 0; i < refl->binding_count; ++i)
     {
@@ -19208,15 +19502,14 @@ static void hina_log_layout_mismatch_reflection(hina_context* ctx, const char* o
     }
     if (!found)
     {
-      const hina_desc_type actual_type = (hina_desc_type)actual->entries[j].type;
-      const uint32_t actual_count = actual->entries[j].count ? actual->entries[j].count : 1u;
-      uint8_t actual_stage_raw = hina_layout_entry_stage_flags_raw(actual->entries[j].flags);
-      if (!actual_stage_raw) actual_stage_raw = HINA_STAGE_ALL;
-      char actual_stage_str[4];
-      HINA_LOGW(ctx, "%s: Bind group mismatch at set %u has extra binding %u (type %s, count %u, stages %s/0x%02x)",
-                op_name, set, binding, hina_desc_type_name(actual_type), actual_count,
-                hina_stage_mask_to_short_string(actual_stage_raw, actual_stage_str, sizeof(actual_stage_str)),
-                actual_stage_raw);
+      const hina_desc_type bound_type = (hina_desc_type)bound->entries[j].type;
+      const uint32_t bound_count = bound->entries[j].count ? bound->entries[j].count : 1u;
+      uint8_t bound_stage_raw = hina_layout_entry_stage_flags_raw(bound->entries[j].flags);
+      if (!bound_stage_raw) bound_stage_raw = HINA_STAGE_ALL;
+      char bound_stage_str[4];
+      HINA_LOGW(ctx, "%s:   set %u binding %u: extra in bound group (%s x%u, stages %s) not expected by pipeline",
+                op_name, set, binding, hina_desc_type_name(bound_type), bound_count,
+                hina_stage_mask_to_short_string(bound_stage_raw, bound_stage_str, sizeof(bound_stage_str)));
       return;
     }
   }
@@ -19253,8 +19546,16 @@ static void hina_validate_bindings(hina_cmd* cmd, const char* op_name)
     hina_bind_group bound_group = cmd->bound_groups[set];
     if (bound_group.id == HINA_INVALID_HANDLE)
     {
-      // No bind group bound - check if we're using slot-based bindings for this set
-      // (Slot-based bindings will be validated separately below)
+      // Slot-based (legacy/demo) bindings are validated separately below.
+      // Skip warning if the legacy path already flushed a valid descriptor set for this slot
+      // (bindings_dirty is false after the first flush, but the set remains active in bound_sets).
+      if (!legacy && cmd->bound_sets[set] == VK_NULL_HANDLE)
+      {
+        HINA_LOGW(ctx, "%s: No bind group bound at set %u (pipeline '%s' expects bindings here). "
+                  "If a transient group was previously bound, it was invalidated by a pipeline layout change "
+                  "- call hina_cmd_bind_transient_group() or hina_cmd_bind_group() for set %u before drawing.",
+                  op_name, set, hina_debug_get_label(cmd->current_pipeline.id, VK_OBJECT_TYPE_PIPELINE), set);
+      }
       continue;
     }
     // Get the bound group's layout
@@ -19289,14 +19590,23 @@ static void hina_validate_bindings(hina_cmd* cmd, const char* op_name)
       }
       if (!compatible)
       {
-        HINA_LOGW(ctx, "%s: Bind group at set %u has incompatible layout (expected=%p, got=%p). "
-                  "Did you bind the wrong bind group?", op_name, set, (void*)expected_layout, (void*)actual_layout);
+        // Copy debug labels into local buffers (hina_debug_get_label uses a shared TLS buffer)
+        char pip_label[64], group_label[64], layout_label[64];
+        snprintf(pip_label, sizeof(pip_label), "%s", hina_debug_get_label(cmd->current_pipeline.id, VK_OBJECT_TYPE_PIPELINE));
+        snprintf(group_label, sizeof(group_label), "%s", hina_debug_get_label(bound_group.id, VK_OBJECT_TYPE_DESCRIPTOR_SET));
+        snprintf(layout_label, sizeof(layout_label), "%s", hina_debug_get_label(group_slot->layout.id, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT));
+        HINA_LOGW(ctx, "%s: Bind group layout mismatch at set %u - pipeline '%s' expects a different layout than "
+                  "what bind group '%s' (layout: '%s') provides:", op_name, set, pip_label, group_label, layout_label);
+        // Dump full layout contents for both sides so the user can identify the bind group
+        hina_dump_layout_slot(ctx, op_name, "bound group provides", layout_slot, bound_group.id);
         if (expected_slot && expected_slot->entry_count > 0)
         {
+          hina_dump_layout_slot(ctx, op_name, "pipeline expects", expected_slot, HINA_INVALID_HANDLE);
           hina_log_layout_mismatch_slots(ctx, op_name, set, layout_slot, expected_slot);
         }
         else
         {
+          hina_dump_pipeline_expected(ctx, op_name, set, refl);
           hina_log_layout_mismatch_reflection(ctx, op_name, set, layout_slot, refl);
         }
       }
@@ -21596,7 +21906,25 @@ static bool hina_create_swapchain(hina_context* ctx, const hina_swapchain_desc* 
     break;
   default: break;
   }
-  HINA_LOGI(ctx, "chosen present mode: %d (requested=%d)", (int)mode, (int)requested);
+  {
+    const char* mode_str = "FIFO";
+    switch (mode)
+    {
+    case VK_PRESENT_MODE_MAILBOX_KHR: mode_str = "MAILBOX"; break;
+    case VK_PRESENT_MODE_IMMEDIATE_KHR: mode_str = "IMMEDIATE"; break;
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR: mode_str = "FIFO_RELAXED"; break;
+    default: break;
+    }
+    const char* req_str = "FIFO";
+    switch (requested)
+    {
+    case HINA_PRESENT_MODE_MAILBOX: req_str = "MAILBOX"; break;
+    case HINA_PRESENT_MODE_IMMEDIATE: req_str = "IMMEDIATE"; break;
+    default: break;
+    }
+    HINA_LOGI(ctx, "present mode: %s (requested %s, available: mailbox=%s immediate=%s)",
+              mode_str, req_str, has_mailbox ? "yes" : "no", has_immediate ? "yes" : "no");
+  }
   if (pmodes_allocated) hina_free_host(pmodes);
   VkExtent2D extent = caps.currentExtent;
   if (extent.width == UINT32_MAX)
@@ -24834,6 +25162,14 @@ static void hslc_parse_struct(hsl_parser* p)
   }
   hslc_parser_consume(p, HSL_TOK_RBRACE, "Expected '}' after struct fields");
   hslc_parser_consume(p, HSL_TOK_SEMICOLON, "Expected ';' after struct definition");
+  if (s->field_count == 0 && s->io_kind != HSL_IO_CUSTOM)
+  {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+             "IO struct '%s' has no fields. Remove it if no inter-stage data is needed", s->name);
+    hslc_parser_error(p, msg);
+    return;
+  }
   // Assign auto-locations
   uint32_t next_loc = 0;
   for (uint32_t i = 0; i < s->field_count; i++)

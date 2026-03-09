@@ -363,7 +363,7 @@ Max locations: 16 (Vulkan 1.0 minimum)
 Beginner notes:
 - The names `VertexIn`, `Varyings`, and `FragOut` are fixed and are used by the compiler to generate interface variables.
 - `VertexIn` is optional: omit it for procedural vertex shaders that use only `gl_VertexIndex` (e.g., fullscreen triangles).
-- `Varyings` is optional: omit it for shaders that don't need inter-stage communication (e.g., depth-only or shadow passes).
+- `Varyings` is optional: omit it when shaders don't need inter-stage communication (e.g., depth-only or shadow passes). Do not declare `struct Varyings {};`: GLSL does not support empty structs.
 - Any other struct name is treated as a custom data struct and can be used in resource blocks or stage code.
 - **Tessellation/geometry modules:** Do not declare `VertexIn`, `Varyings`, or `FragOut` when tessellation or geometry stages are present. Use raw GLSL `layout(location = N) in/out` declarations in each stage body instead. See §5.2.1.
 
@@ -903,6 +903,7 @@ For errors in generated code (the `main()` wrapper), the fallback output shows t
 - Shared declarations require a compute stage.
 - Tessellation control/eval pairing is enforced at pipeline creation (HSL compilation does not check this).
 - Using `VertexIn`/`Varyings`/`FragOut` structs with tessellation or geometry stages will cause GLSL compile errors due to non-arrayed TCS output generation. Use raw GLSL IO declarations instead (see §5.2.1).
+- Empty IO structs such as `struct Varyings {};` are rejected at parse time. Omit the declaration instead.
 
 ---
 
