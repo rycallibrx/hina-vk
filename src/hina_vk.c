@@ -732,6 +732,9 @@ static uint8_t hina_ticket_lane(uint64_t ticket) { return (uint8_t)(ticket >> HI
 static uint64_t hina_ticket_value(uint64_t ticket) { return ticket & HINA_TICKET_VALUE_MASK; }
 
 #define HINA_MAX_QUEUE_LANES 4
+#ifndef HINA_MAX_FRAMES_IN_FLIGHT
+#define HINA_MAX_FRAMES_IN_FLIGHT 3
+#endif
 typedef struct hina_queue_lanes
 {
   hina_queue_lane lanes[HINA_MAX_QUEUE_LANES]; // 512B (4 x 128B)
@@ -744,6 +747,105 @@ typedef struct hina_queue_lanes
   } indices;
   uint32_t lane_count;
 } hina_queue_lanes;
+
+#ifdef HINA_DEBUG
+#define HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE   256u
+#define HINA_GPU_DIAG_MAX_EVENTS_PER_LANE   2048u
+#define HINA_GPU_DIAG_TEXT_BYTES_PER_LANE   8192u
+#define HINA_GPU_DIAG_MAX_SCOPE_DEPTH         64u
+#define HINA_GPU_DIAG_CMD_EVENT_BLOCK_CAP     32u
+#define HINA_GPU_DIAG_MAX_NV_CHECKPOINTS      16u
+#define HINA_GPU_DIAG_MAX_FAULT_ADDRS         16u
+#define HINA_GPU_DIAG_MAX_FAULT_VENDORS       16u
+
+typedef enum hina_gpu_diag_event_kind
+{
+  HINA_GPU_DIAG_EVENT_SUBMIT_ROOT = 0,
+  HINA_GPU_DIAG_EVENT_SCOPE_BEGIN = 1,
+  HINA_GPU_DIAG_EVENT_SCOPE_END = 2,
+  HINA_GPU_DIAG_EVENT_MARKER = 3,
+} hina_gpu_diag_event_kind;
+
+typedef struct hina_gpu_diag_cmd_event
+{
+  uint64_t ticket;
+  uint32_t text_off;
+  uint16_t depth;
+  uint8_t kind;
+  uint8_t pad_;
+} hina_gpu_diag_cmd_event;
+
+typedef struct hina_gpu_diag_cmd_event_block
+{
+  struct hina_gpu_diag_cmd_event_block* next;
+  uint16_t count;
+  uint16_t pad_;
+  hina_gpu_diag_cmd_event events[HINA_GPU_DIAG_CMD_EVENT_BLOCK_CAP];
+} hina_gpu_diag_cmd_event_block;
+
+typedef struct hina_gpu_diag_event
+{
+  uint64_t ticket;
+  uint64_t sequence;
+  uint32_t text_off;
+  uint16_t depth;
+  uint8_t kind;
+  uint8_t queue;
+  bool active;
+  uint8_t pad_;
+} hina_gpu_diag_event;
+
+typedef struct hina_gpu_diag_submit
+{
+  uint64_t ticket;
+  uint64_t completion_value;
+  uint64_t sequence;
+  uint64_t frame_index;
+  hina_gpu_diag_cmd_event_block* cmd_blocks;
+  uint16_t event_count;
+  uint8_t queue;
+  bool immediate;
+  bool uses_swapchain;
+  bool active;
+  uint8_t pad_;
+} hina_gpu_diag_submit;
+
+typedef struct hina_gpu_diag_lane
+{
+  hina_spinlock lock;
+  hina_gpu_diag_submit* submits;
+  hina_gpu_diag_event* events;
+  char* text_pool;
+  uint32_t submit_cursor;
+  uint32_t event_cursor;
+  uint32_t text_head;
+  uint64_t next_sequence;
+} hina_gpu_diag_lane;
+
+typedef struct hina_gpu_diagnostics
+{
+  bool enabled;
+  bool enable_nv_checkpoints;
+  bool enable_nv_auto;
+  bool overflow_reported;
+  hina_atomic32_t crash_reported;
+  hina_spinlock tracked_cmd_locks[HINA_MAX_FRAMES_IN_FLIGHT];
+  struct hina_cmd* tracked_cmd_heads[HINA_MAX_FRAMES_IN_FLIGHT];
+  hina_gpu_diag_lane lanes[HINA_MAX_QUEUE_LANES];
+  VkDeviceFaultAddressInfoEXT fault_addresses[HINA_GPU_DIAG_MAX_FAULT_ADDRS];
+  VkDeviceFaultVendorInfoEXT fault_vendors[HINA_GPU_DIAG_MAX_FAULT_VENDORS];
+} hina_gpu_diagnostics;
+#else
+typedef struct hina_gpu_diag_cmd_event_block
+{
+  uint8_t dummy;
+} hina_gpu_diag_cmd_event_block;
+
+typedef struct hina_gpu_diagnostics
+{
+  bool enabled;
+} hina_gpu_diagnostics;
+#endif
 
 typedef struct { uint32_t id; } hina_desc_set_layout;
 
@@ -771,9 +873,6 @@ HINA_STATIC_ASSERT(sizeof(hina_depth_stencil_state) == 8, hina_depth_stencil_sta
 HINA_STATIC_ASSERT(sizeof(hina_depth_bias_state) == 16, hina_depth_bias_state_size_must_be_16_bytes);
 // Host memory allocation functions defined after hina_global_storage (see below)
 
-#ifndef HINA_MAX_FRAMES_IN_FLIGHT
-#define HINA_MAX_FRAMES_IN_FLIGHT 3
-#endif
 #define HINA_MAIN_STAGING_SIZE    (4ull * 1024ull * 1024ull)
 #define HINA_MAX_RESOURCE_SLOTS     32u
 #define HINA_ZOMBIE_LIST_CAPACITY   256u   // Fixed capacity per-frame zombie list (no growth)
@@ -2742,6 +2841,14 @@ typedef struct hina_staging_context
   uint64_t last_gfx_submit_ticket;
   // Last compute submission ticket - wait before reusing comp_vk_cmd
   uint64_t last_comp_submit_ticket;
+#ifdef HINA_DEBUG
+  uint64_t last_submit_diag_ticket;
+  uint64_t last_submit_diag_complete_ticket;
+  uint64_t last_gfx_submit_diag_ticket;
+  uint64_t last_gfx_submit_diag_complete_ticket;
+  uint64_t last_comp_submit_diag_ticket;
+  uint64_t last_comp_submit_diag_complete_ticket;
+#endif
   // Persistent staging buffer for texture/buffer downloads (reused, grows as needed)
   VkBuffer download_staging_buf;
   VkDeviceMemory download_staging_mem;
@@ -2939,6 +3046,9 @@ typedef struct hina_device
     hina_deferred_payload_block* payload_free; // 8
   } deferred;
 
+  // Debug-only GPU diagnostics and breadcrumb storage
+  hina_gpu_diagnostics diagnostics;
+
   // Allocator
   struct
   {
@@ -2968,7 +3078,10 @@ typedef struct hina_device
     bool prefer_integrated; // 1  Prefer integrated GPU for power savings
     bool force_separate_families; // 1  Force compute to separate queue family (tests ownership)
     bool force_legacy_tile_pass; // 1  Force legacy multi-subpass tile pass (tests VK 1.0-1.3)
+    bool gpu_breadcrumbs; // 1  Debug-only GPU breadcrumb diagnostics
+    bool gpu_breadcrumbs_auto; // 1  Extra GPU breadcrumb detail and vendor auto-checkpoints
     bool has_debug_utils; // 1  VK_EXT_debug_utils enabled on instance (see extension guard policy)
+    uint32_t frames_in_flight; // 4  Active frame pipeline depth (2 or 3)
   } config;
 
   // Locks (pools use internal spinlocks, these are for other subsystems)
@@ -3228,6 +3341,20 @@ struct hina_cmd
     } ops[32]; // Small inline stack (most frames have few transfers)
     uint8_t count; // Number of ops recorded
   } ownership_debug;
+
+  struct
+  {
+    hina_gpu_diag_cmd_event_block* head;
+    hina_gpu_diag_cmd_event_block* tail;
+    struct hina_cmd* next_tracked;
+    uint32_t event_count;
+    uint32_t scope_stack[HINA_GPU_DIAG_MAX_SCOPE_DEPTH];
+    uint8_t scope_depth;
+    uint8_t scope_stack_count;
+    bool tracked;
+    bool overflowed;
+    bool pass_scope_active;
+  } gpu_diag;
 #endif
 };
 
@@ -3606,7 +3733,7 @@ static void* hina_frame_alloc(hina_frame_arena* a, size_t size, uint32_t align)
 
 static hina_frame_arena* hina_current_frame_arena(hina_context* ctx)
 {
-  uint32_t slot = ctx->frame.current_slot % HINA_MAX_FRAMES_IN_FLIGHT;
+  uint32_t slot = ctx->frame.current_slot % ctx->core.device->config.frames_in_flight;
   return &ctx->alloc.frame_arenas[slot];
 }
 
@@ -4097,8 +4224,8 @@ static void hina_defer_destroy_fast(hina_context* ctx, hina_zombie_kind kind, ui
     }
   }
   // Fence fallback
-  uint32_t frame_slot = (uint32_t)(ctx->frame.frame_index % HINA_MAX_FRAMES_IN_FLIGHT);
-  if (ctx->frame.current_slot < HINA_MAX_FRAMES_IN_FLIGHT)
+  uint32_t frame_slot = (uint32_t)(ctx->frame.frame_index % ctx->core.device->config.frames_in_flight);
+  if (ctx->frame.current_slot < ctx->core.device->config.frames_in_flight)
   {
     frame_slot = ctx->frame.current_slot;
   }
@@ -4194,8 +4321,8 @@ static void hina_defer_destroy_ex(hina_context* ctx, uint64_t ticket, void (*des
     }
   }
   // Fence fallback
-  uint32_t frame_slot = (uint32_t)(ctx->frame.frame_index % HINA_MAX_FRAMES_IN_FLIGHT);
-  if (ctx->frame.current_slot < HINA_MAX_FRAMES_IN_FLIGHT)
+  uint32_t frame_slot = (uint32_t)(ctx->frame.frame_index % ctx->core.device->config.frames_in_flight);
+  if (ctx->frame.current_slot < ctx->core.device->config.frames_in_flight)
   {
     frame_slot = ctx->frame.current_slot;
   }
@@ -4490,7 +4617,868 @@ static bool hina_debug_bg_copy(uint32_t group_handle, hina_debug_bg_record* out)
   return found;
 }
 
+static uint64_t hina_lane_completed_value(hina_context* ctx, uint8_t lane_idx);
+static void hina_poll_lane_completions(hina_context* ctx);
+static void hina_gpu_diag_shutdown(hina_device* dev);
+static const char* hina_fault_address_type_name(VkDeviceFaultAddressTypeEXT type);
+
+static const char* hina_queue_debug_name(hina_queue queue)
+{
+  switch (queue)
+  {
+  case HINA_QUEUE_GRAPHICS: return "graphics";
+  case HINA_QUEUE_COMPUTE: return "compute";
+  case HINA_QUEUE_TRANSFER: return "transfer";
+  default: return "unknown";
+  }
+}
+
+static hina_queue hina_gpu_diag_queue_from_label(const char* label)
+{
+  if (label && strcmp(label, "compute") == 0) return HINA_QUEUE_COMPUTE;
+  if (label && strcmp(label, "transfer") == 0) return HINA_QUEUE_TRANSFER;
+  return HINA_QUEUE_GRAPHICS;
+}
+
+static const char* hina_lane_debug_name(const hina_context* ctx, uint8_t lane_idx)
+{
+  if (!ctx || !ctx->core.device) return "unknown";
+  const hina_queue_lanes* lanes = &ctx->core.device->queue.lanes;
+  if (lane_idx == (uint8_t)lanes->indices.graphics_idx) return "graphics";
+  if (lane_idx == (uint8_t)lanes->indices.transfer_idx) return "transfer";
+  if (lane_idx == (uint8_t)lanes->indices.compute_idx) return "compute";
+  return "unknown";
+}
+
+static HINA_INLINE bool hina_gpu_diag_enabled(const hina_context* ctx)
+{
+  return ctx && ctx->core.device && ctx->core.device->diagnostics.enabled;
+}
+
+static HINA_INLINE bool hina_gpu_diag_auto_scope_begin(hina_cmd* cmd, const char* text, bool auto_only)
+{
+  if (!cmd || !hina_gpu_diag_enabled(cmd->ctx)) return false;
+  if (auto_only && !cmd->ctx->core.device->config.gpu_breadcrumbs_auto) return false;
+  hina_cmd_begin_label(cmd, text, NULL);
+  return true;
+}
+
+static HINA_INLINE void hina_gpu_diag_auto_scope_end(hina_cmd* cmd, bool active)
+{
+  if (!cmd || !active) return;
+  hina_cmd_end_label(cmd);
+}
+
+static void hina_gpu_diag_cmd_track(hina_cmd* cmd)
+{
+  if (!cmd || !hina_gpu_diag_enabled(cmd->ctx) || cmd->gpu_diag.tracked) return;
+  uint32_t slot = cmd->slot;
+  if (slot >= cmd->ctx->core.device->config.frames_in_flight) slot %= cmd->ctx->core.device->config.frames_in_flight;
+  hina_gpu_diagnostics* diag = &cmd->ctx->core.device->diagnostics;
+  hina_spin_lock(&diag->tracked_cmd_locks[slot]);
+  cmd->gpu_diag.next_tracked = diag->tracked_cmd_heads[slot];
+  diag->tracked_cmd_heads[slot] = cmd;
+  cmd->gpu_diag.tracked = true;
+  hina_spin_unlock(&diag->tracked_cmd_locks[slot]);
+}
+
+static void hina_gpu_diag_cmd_untrack(hina_cmd* cmd)
+{
+  if (!cmd || !hina_gpu_diag_enabled(cmd->ctx) || !cmd->gpu_diag.tracked) return;
+  uint32_t slot = cmd->slot;
+  if (slot >= cmd->ctx->core.device->config.frames_in_flight) slot %= cmd->ctx->core.device->config.frames_in_flight;
+  hina_gpu_diagnostics* diag = &cmd->ctx->core.device->diagnostics;
+  hina_spin_lock(&diag->tracked_cmd_locks[slot]);
+  struct hina_cmd** link = &diag->tracked_cmd_heads[slot];
+  while (*link)
+  {
+    if (*link == cmd)
+    {
+      *link = cmd->gpu_diag.next_tracked;
+      break;
+    }
+    link = &(*link)->gpu_diag.next_tracked;
+  }
+  cmd->gpu_diag.next_tracked = NULL;
+  cmd->gpu_diag.tracked = false;
+  hina_spin_unlock(&diag->tracked_cmd_locks[slot]);
+}
+
+static void hina_gpu_diag_reset_text_pool(hina_gpu_diag_lane* lane)
+{
+  static const char overflow_text[] = "<breadcrumb-text-overflow>";
+  if (!lane || !lane->text_pool) return;
+  memcpy(lane->text_pool, overflow_text, sizeof(overflow_text));
+  lane->text_head = (uint32_t)sizeof(overflow_text);
+}
+
+static void hina_gpu_diag_free_cmd_blocks(hina_gpu_diag_cmd_event_block* block)
+{
+  while (block)
+  {
+    hina_gpu_diag_cmd_event_block* next = block->next;
+    hina_free_host(block);
+    block = next;
+  }
+}
+
+static void hina_gpu_diag_cleanup_slot(hina_context* ctx, uint32_t slot)
+{
+  if (!hina_gpu_diag_enabled(ctx)) return;
+  if (slot >= ctx->core.device->config.frames_in_flight) slot %= ctx->core.device->config.frames_in_flight;
+  hina_gpu_diagnostics* diag = &ctx->core.device->diagnostics;
+  hina_spin_lock(&diag->tracked_cmd_locks[slot]);
+  struct hina_cmd* cmd = diag->tracked_cmd_heads[slot];
+  diag->tracked_cmd_heads[slot] = NULL;
+  hina_spin_unlock(&diag->tracked_cmd_locks[slot]);
+  while (cmd)
+  {
+    struct hina_cmd* next = cmd->gpu_diag.next_tracked;
+    hina_gpu_diag_free_cmd_blocks(cmd->gpu_diag.head);
+    cmd->gpu_diag.head = NULL;
+    cmd->gpu_diag.tail = NULL;
+    cmd->gpu_diag.next_tracked = NULL;
+    cmd->gpu_diag.event_count = 0;
+    cmd->gpu_diag.scope_depth = 0;
+    cmd->gpu_diag.scope_stack_count = 0;
+    cmd->gpu_diag.tracked = false;
+    cmd->gpu_diag.overflowed = false;
+    cmd->gpu_diag.pass_scope_active = false;
+    cmd = next;
+  }
+}
+
+static bool hina_gpu_diag_init(hina_context* ctx)
+{
+  hina_gpu_diagnostics* diag = &ctx->core.device->diagnostics;
+  memset(diag, 0, sizeof(*diag));
+  if (!ctx->core.device->config.gpu_breadcrumbs) return true;
+  diag->enabled = true;
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+  diag->enable_nv_checkpoints = g_debug_caps.has_nv_checkpoints && vkCmdSetCheckpointNV && vkGetQueueCheckpointDataNV;
+#endif
+  diag->enable_nv_auto = ctx->core.device->config.gpu_breadcrumbs_auto && g_debug_caps.has_nv_diagnostics_config;
+  hina_atomic_store32(&diag->crash_reported, 0);
+  for (uint32_t i = 0; i < HINA_MAX_QUEUE_LANES; ++i)
+  {
+    hina_gpu_diag_lane* lane = &diag->lanes[i];
+    lane->lock.val = 0;
+    lane->submits = hina_calloc_host(HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE, sizeof(hina_gpu_diag_submit));
+    lane->events = hina_calloc_host(HINA_GPU_DIAG_MAX_EVENTS_PER_LANE, sizeof(hina_gpu_diag_event));
+    lane->text_pool = hina_calloc_host(HINA_GPU_DIAG_TEXT_BYTES_PER_LANE, sizeof(char));
+    if (!lane->submits || !lane->events || !lane->text_pool)
+    {
+      hina_gpu_diag_shutdown(ctx->core.device);
+      return false;
+    }
+    hina_gpu_diag_reset_text_pool(lane);
+  }
+  return true;
+}
+
+static void hina_gpu_diag_shutdown(hina_device* dev)
+{
+  hina_gpu_diagnostics* diag = &dev->diagnostics;
+  if (!diag->enabled) return;
+  for (uint32_t i = 0; i < HINA_MAX_FRAMES_IN_FLIGHT; ++i)
+  {
+    hina_context* ctx = &g_hina_ctx;
+    if (ctx->core.device == dev) hina_gpu_diag_cleanup_slot(ctx, i);
+  }
+  for (uint32_t i = 0; i < HINA_MAX_QUEUE_LANES; ++i)
+  {
+    hina_gpu_diag_lane* lane = &diag->lanes[i];
+    if (lane->submits)
+    {
+      for (uint32_t j = 0; j < HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE; ++j)
+      {
+        hina_gpu_diag_free_cmd_blocks(lane->submits[j].cmd_blocks);
+        lane->submits[j].cmd_blocks = NULL;
+      }
+    }
+    if (lane->submits) hina_free_host(lane->submits);
+    if (lane->events) hina_free_host(lane->events);
+    if (lane->text_pool) hina_free_host(lane->text_pool);
+    lane->submits = NULL;
+    lane->events = NULL;
+    lane->text_pool = NULL;
+    lane->submit_cursor = 0;
+    lane->event_cursor = 0;
+    lane->text_head = 0;
+    lane->next_sequence = 0;
+  }
+  memset(diag, 0, sizeof(*diag));
+}
+
+static uint32_t hina_gpu_diag_copy_text(hina_context* ctx, uint8_t lane_idx, const char* text)
+{
+  if (!hina_gpu_diag_enabled(ctx) || !text || text[0] == '\0') return UINT32_MAX;
+  HINA_ASSERTF(lane_idx < HINA_MAX_QUEUE_LANES, "invalid breadcrumb lane %u", lane_idx);
+  hina_gpu_diag_lane* lane = &ctx->core.device->diagnostics.lanes[lane_idx];
+  uint32_t len = (uint32_t)strlen(text) + 1u;
+  if (len > HINA_GPU_DIAG_TEXT_BYTES_PER_LANE) return 0;
+  hina_spin_lock(&lane->lock);
+  if (lane->text_head + len > HINA_GPU_DIAG_TEXT_BYTES_PER_LANE)
+  {
+    hina_spin_unlock(&lane->lock);
+    return 0;
+  }
+  uint32_t text_off = lane->text_head;
+  memcpy(lane->text_pool + text_off, text, len);
+  lane->text_head += len;
+  hina_spin_unlock(&lane->lock);
+  return text_off;
+}
+
+static const char* hina_gpu_diag_text(const hina_context* ctx, uint8_t lane_idx, uint32_t text_off)
+{
+  if (!hina_gpu_diag_enabled(ctx) || lane_idx >= HINA_MAX_QUEUE_LANES) return NULL;
+  const hina_gpu_diag_lane* lane = &ctx->core.device->diagnostics.lanes[lane_idx];
+  if (!lane->text_pool || text_off == UINT32_MAX || text_off >= HINA_GPU_DIAG_TEXT_BYTES_PER_LANE) return NULL;
+  return lane->text_pool + text_off;
+}
+
+static bool hina_gpu_diag_submit_complete(hina_context* ctx, const hina_gpu_diag_submit* submit)
+{
+  if (!submit->active) return false;
+  uint8_t lane_idx = hina_ticket_lane(submit->ticket);
+  if (lane_idx >= HINA_MAX_QUEUE_LANES) return false;
+  return hina_lane_completed_value(ctx, lane_idx) >= submit->completion_value;
+}
+
+static void hina_gpu_diag_reclaim_lane(hina_context* ctx, uint8_t lane_idx)
+{
+  if (!hina_gpu_diag_enabled(ctx) || lane_idx >= HINA_MAX_QUEUE_LANES) return;
+  hina_poll_lane_completions(ctx);
+  hina_gpu_diag_lane* lane = &ctx->core.device->diagnostics.lanes[lane_idx];
+  bool any_active = false;
+  hina_spin_lock(&lane->lock);
+  for (uint32_t i = 0; i < HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE; ++i)
+  {
+    hina_gpu_diag_submit* submit = &lane->submits[i];
+    if (!submit->active) continue;
+    if (hina_gpu_diag_submit_complete(ctx, submit))
+    {
+      hina_gpu_diag_free_cmd_blocks(submit->cmd_blocks);
+      submit->cmd_blocks = NULL;
+      submit->active = false;
+      for (uint32_t j = 0; j < HINA_GPU_DIAG_MAX_EVENTS_PER_LANE; ++j)
+      {
+        hina_gpu_diag_event* event = &lane->events[j];
+        if (event->active && event->ticket == submit->ticket) event->active = false;
+      }
+    }
+    else
+    {
+      any_active = true;
+    }
+  }
+  if (!any_active) hina_gpu_diag_reset_text_pool(lane);
+  hina_spin_unlock(&lane->lock);
+}
+
+static hina_gpu_diag_submit* hina_gpu_diag_alloc_submit(hina_context* ctx, uint8_t lane_idx)
+{
+  if (!hina_gpu_diag_enabled(ctx) || lane_idx >= HINA_MAX_QUEUE_LANES) return NULL;
+  hina_gpu_diag_reclaim_lane(ctx, lane_idx);
+  hina_gpu_diag_lane* lane = &ctx->core.device->diagnostics.lanes[lane_idx];
+  hina_spin_lock(&lane->lock);
+  for (uint32_t attempt = 0; attempt < HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE; ++attempt)
+  {
+    uint32_t idx = (lane->submit_cursor + attempt) & (HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE - 1u);
+    hina_gpu_diag_submit* submit = &lane->submits[idx];
+    if (submit->active) continue;
+    memset(submit, 0, sizeof(*submit));
+    submit->active = true;
+    submit->sequence = ++lane->next_sequence;
+    lane->submit_cursor = (idx + 1u) & (HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE - 1u);
+    hina_spin_unlock(&lane->lock);
+    return submit;
+  }
+  hina_spin_unlock(&lane->lock);
+  if (!ctx->core.device->diagnostics.overflow_reported)
+  {
+    ctx->core.device->diagnostics.overflow_reported = true;
+    HINA_LOGW(ctx, "GPU breadcrumb submit ring overflow on lane %u (%s)", lane_idx, hina_lane_debug_name(ctx, lane_idx));
+  }
+  return NULL;
+}
+
+static hina_gpu_diag_event* hina_gpu_diag_alloc_event(hina_context* ctx, uint8_t lane_idx)
+{
+  if (!hina_gpu_diag_enabled(ctx) || lane_idx >= HINA_MAX_QUEUE_LANES) return NULL;
+  hina_gpu_diag_reclaim_lane(ctx, lane_idx);
+  hina_gpu_diag_lane* lane = &ctx->core.device->diagnostics.lanes[lane_idx];
+  hina_spin_lock(&lane->lock);
+  for (uint32_t attempt = 0; attempt < HINA_GPU_DIAG_MAX_EVENTS_PER_LANE; ++attempt)
+  {
+    uint32_t idx = (lane->event_cursor + attempt) & (HINA_GPU_DIAG_MAX_EVENTS_PER_LANE - 1u);
+    hina_gpu_diag_event* event = &lane->events[idx];
+    if (event->active) continue;
+    memset(event, 0, sizeof(*event));
+    event->active = true;
+    event->sequence = ++lane->next_sequence;
+    lane->event_cursor = (idx + 1u) & (HINA_GPU_DIAG_MAX_EVENTS_PER_LANE - 1u);
+    hina_spin_unlock(&lane->lock);
+    return event;
+  }
+  hina_spin_unlock(&lane->lock);
+  if (!ctx->core.device->diagnostics.overflow_reported)
+  {
+    ctx->core.device->diagnostics.overflow_reported = true;
+    HINA_LOGW(ctx, "GPU breadcrumb event ring overflow on lane %u (%s)", lane_idx, hina_lane_debug_name(ctx, lane_idx));
+  }
+  return NULL;
+}
+
+static void hina_gpu_diag_discard_ticket(hina_context* ctx, uint64_t ticket)
+{
+  if (!hina_gpu_diag_enabled(ctx) || ticket == 0) return;
+  uint8_t lane_idx = hina_ticket_lane(ticket);
+  if (lane_idx >= HINA_MAX_QUEUE_LANES) return;
+  hina_gpu_diag_lane* lane = &ctx->core.device->diagnostics.lanes[lane_idx];
+  hina_spin_lock(&lane->lock);
+  for (uint32_t i = 0; i < HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE; ++i)
+  {
+    if (lane->submits[i].active && lane->submits[i].ticket == ticket)
+    {
+      hina_gpu_diag_free_cmd_blocks(lane->submits[i].cmd_blocks);
+      lane->submits[i].cmd_blocks = NULL;
+      lane->submits[i].active = false;
+    }
+  }
+  for (uint32_t i = 0; i < HINA_GPU_DIAG_MAX_EVENTS_PER_LANE; ++i)
+  {
+    if (lane->events[i].active && lane->events[i].ticket == ticket) lane->events[i].active = false;
+  }
+  hina_spin_unlock(&lane->lock);
+}
+
+static hina_gpu_diag_cmd_event* hina_gpu_diag_cmd_event_alloc(hina_cmd* cmd)
+{
+  if (!cmd || !hina_gpu_diag_enabled(cmd->ctx) || cmd->gpu_diag.overflowed) return NULL;
+  if (cmd->gpu_diag.event_count >= HINA_GPU_DIAG_MAX_EVENTS_PER_LANE)
+  {
+    cmd->gpu_diag.overflowed = true;
+    HINA_LOGW(cmd->ctx, "GPU breadcrumb command event limit reached on lane %u (%s)", cmd->lane_idx, hina_lane_debug_name(cmd->ctx, cmd->lane_idx));
+    return NULL;
+  }
+  if (!cmd->gpu_diag.tail || cmd->gpu_diag.tail->count >= HINA_GPU_DIAG_CMD_EVENT_BLOCK_CAP)
+  {
+    hina_gpu_diag_cmd_event_block* block =
+      hina_alloc_host(sizeof(hina_gpu_diag_cmd_event_block));
+    if (!block)
+    {
+      cmd->gpu_diag.overflowed = true;
+      HINA_LOGW(cmd->ctx, "GPU breadcrumb command block allocation failed on lane %u (%s)", cmd->lane_idx, hina_lane_debug_name(cmd->ctx, cmd->lane_idx));
+      return NULL;
+    }
+    memset(block, 0, sizeof(*block));
+    hina_gpu_diag_cmd_track(cmd);
+    if (!cmd->gpu_diag.head) cmd->gpu_diag.head = block;
+    else cmd->gpu_diag.tail->next = block;
+    cmd->gpu_diag.tail = block;
+  }
+  hina_gpu_diag_cmd_event* event = &cmd->gpu_diag.tail->events[cmd->gpu_diag.tail->count++];
+  memset(event, 0, sizeof(*event));
+  cmd->gpu_diag.event_count++;
+  return event;
+}
+
+static void hina_gpu_diag_cmd_emit_checkpoint(hina_cmd* cmd, const hina_gpu_diag_cmd_event* event)
+{
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+  if (!cmd || !event || !hina_gpu_diag_enabled(cmd->ctx)) return;
+  if (!cmd->ctx->core.device->diagnostics.enable_nv_checkpoints || !vkCmdSetCheckpointNV) return;
+  vkCmdSetCheckpointNV(cmd->vk_cmd, (void*)event);
+#else
+  (void)cmd;
+  (void)event;
+#endif
+}
+
+static void hina_gpu_diag_cmd_record(hina_cmd* cmd, hina_gpu_diag_event_kind kind, const char* text)
+{
+  if (!cmd || !hina_gpu_diag_enabled(cmd->ctx)) return;
+  hina_gpu_diag_cmd_event* event = hina_gpu_diag_cmd_event_alloc(cmd);
+  if (!event) return;
+  uint16_t depth = cmd->gpu_diag.scope_depth;
+  uint32_t text_off = UINT32_MAX;
+  if (kind == HINA_GPU_DIAG_EVENT_SCOPE_END)
+  {
+    if (cmd->gpu_diag.scope_depth > 0) cmd->gpu_diag.scope_depth--;
+    depth = cmd->gpu_diag.scope_depth;
+    if (cmd->gpu_diag.scope_stack_count > 0)
+    {
+      text_off = cmd->gpu_diag.scope_stack[--cmd->gpu_diag.scope_stack_count];
+    }
+  }
+  else
+  {
+    text_off = hina_gpu_diag_copy_text(cmd->ctx, cmd->lane_idx, text);
+  }
+  event->depth = depth;
+  event->kind = (uint8_t)kind;
+  event->text_off = text_off;
+  if (kind == HINA_GPU_DIAG_EVENT_SCOPE_BEGIN)
+  {
+    if (cmd->gpu_diag.scope_stack_count < HINA_GPU_DIAG_MAX_SCOPE_DEPTH)
+    {
+      cmd->gpu_diag.scope_stack[cmd->gpu_diag.scope_stack_count++] = text_off;
+    }
+    if (cmd->gpu_diag.scope_depth < UINT8_MAX) cmd->gpu_diag.scope_depth++;
+  }
+  hina_gpu_diag_cmd_emit_checkpoint(cmd, event);
+}
+
+static void hina_gpu_diag_cmd_set_ticket(hina_cmd* cmd, uint64_t ticket)
+{
+  if (!cmd || !hina_gpu_diag_enabled(cmd->ctx)) return;
+  for (hina_gpu_diag_cmd_event_block* block = cmd->gpu_diag.head; block; block = block->next)
+  {
+    for (uint32_t i = 0; i < block->count; ++i) block->events[i].ticket = ticket;
+  }
+}
+
+static void hina_gpu_diag_cmd_clear(hina_cmd* cmd)
+{
+  if (!cmd) return;
+  cmd->gpu_diag.head = NULL;
+  cmd->gpu_diag.tail = NULL;
+  cmd->gpu_diag.next_tracked = NULL;
+  cmd->gpu_diag.event_count = 0;
+  cmd->gpu_diag.scope_depth = 0;
+  cmd->gpu_diag.scope_stack_count = 0;
+  cmd->gpu_diag.tracked = false;
+  cmd->gpu_diag.overflowed = false;
+  cmd->gpu_diag.pass_scope_active = false;
+}
+
+static uint16_t hina_gpu_diag_publish_cmd_events(hina_context* ctx, hina_cmd* cmd, uint64_t ticket, hina_queue queue)
+{
+  if (!cmd || !hina_gpu_diag_enabled(ctx)) return 0;
+  uint16_t published = 0;
+  for (hina_gpu_diag_cmd_event_block* block = cmd->gpu_diag.head; block; block = block->next)
+  {
+    for (uint32_t i = 0; i < block->count; ++i)
+    {
+      const hina_gpu_diag_cmd_event* src = &block->events[i];
+      hina_gpu_diag_event* dst = hina_gpu_diag_alloc_event(ctx, cmd->lane_idx);
+      if (!dst) return published;
+      dst->ticket = ticket;
+      dst->text_off = src->text_off;
+      dst->depth = src->depth;
+      dst->kind = src->kind;
+      dst->queue = (uint8_t)queue;
+      published++;
+    }
+  }
+  return published;
+}
+
+static void hina_gpu_diag_publish_submit(
+    hina_context* ctx, hina_cmd* cmd, uint8_t lane_idx, hina_queue queue, uint64_t ticket, uint64_t completion_value,
+    const char* root_label, bool immediate, bool uses_swapchain)
+{
+  if (!hina_gpu_diag_enabled(ctx) || lane_idx >= HINA_MAX_QUEUE_LANES || ticket == 0) return;
+  hina_gpu_diag_submit* submit = hina_gpu_diag_alloc_submit(ctx, lane_idx);
+  if (!submit)
+  {
+    if (cmd)
+    {
+      hina_gpu_diag_cmd_untrack(cmd);
+      hina_gpu_diag_free_cmd_blocks(cmd->gpu_diag.head);
+      hina_gpu_diag_cmd_clear(cmd);
+    }
+    return;
+  }
+  submit->ticket = ticket;
+  submit->completion_value = completion_value;
+  submit->frame_index = ctx->frame.frame_index;
+  submit->queue = (uint8_t)queue;
+  submit->immediate = immediate;
+  submit->uses_swapchain = uses_swapchain;
+
+  hina_gpu_diag_event* root = hina_gpu_diag_alloc_event(ctx, lane_idx);
+  if (root)
+  {
+    root->ticket = ticket;
+    root->text_off = hina_gpu_diag_copy_text(ctx, lane_idx, root_label);
+    root->depth = 0;
+    root->kind = HINA_GPU_DIAG_EVENT_SUBMIT_ROOT;
+    root->queue = (uint8_t)queue;
+    submit->event_count = 1;
+  }
+  if (cmd)
+  {
+    hina_gpu_diag_cmd_set_ticket(cmd, ticket);
+    hina_gpu_diag_cmd_untrack(cmd);
+    submit->cmd_blocks = cmd->gpu_diag.head;
+    submit->event_count = (uint16_t)(submit->event_count + hina_gpu_diag_publish_cmd_events(ctx, cmd, ticket, queue));
+    hina_gpu_diag_cmd_clear(cmd);
+  }
+}
+
+static void hina_staging_diag_complete_ticket(hina_context* ctx, hina_ticket ticket)
+{
+  if (!ctx || !ticket || !ctx->core.device->config.gpu_breadcrumbs) return;
+  hina_staging_context* sc = &ctx->staging;
+#define HINA_COMPLETE_STAGING_DIAG(diag_field, complete_field) \
+  do                                                           \
+  {                                                            \
+    if (sc->complete_field == ticket && sc->diag_field)        \
+    {                                                          \
+      hina_gpu_diag_discard_ticket(ctx, sc->diag_field);       \
+      sc->diag_field = 0;                                      \
+      sc->complete_field = 0;                                  \
+    }                                                          \
+  } while (0)
+  HINA_COMPLETE_STAGING_DIAG(last_submit_diag_ticket, last_submit_diag_complete_ticket);
+  HINA_COMPLETE_STAGING_DIAG(last_gfx_submit_diag_ticket, last_gfx_submit_diag_complete_ticket);
+  HINA_COMPLETE_STAGING_DIAG(last_comp_submit_diag_ticket, last_comp_submit_diag_complete_ticket);
+#undef HINA_COMPLETE_STAGING_DIAG
+}
+
+static const char* hina_pipeline_stage_name(VkPipelineStageFlagBits stage)
+{
+  switch (stage)
+  {
+  case VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: return "TOP_OF_PIPE";
+  case VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT: return "DRAW_INDIRECT";
+  case VK_PIPELINE_STAGE_VERTEX_INPUT_BIT: return "VERTEX_INPUT";
+  case VK_PIPELINE_STAGE_VERTEX_SHADER_BIT: return "VERTEX_SHADER";
+  case VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT: return "TESS_CONTROL";
+  case VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT: return "TESS_EVAL";
+  case VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT: return "GEOMETRY_SHADER";
+  case VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: return "FRAGMENT_SHADER";
+  case VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT: return "EARLY_FRAGMENT_TESTS";
+  case VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT: return "LATE_FRAGMENT_TESTS";
+  case VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: return "COLOR_ATTACHMENT_OUTPUT";
+  case VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT: return "COMPUTE_SHADER";
+  case VK_PIPELINE_STAGE_TRANSFER_BIT: return "TRANSFER";
+  case VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: return "BOTTOM_OF_PIPE";
+  case VK_PIPELINE_STAGE_HOST_BIT: return "HOST";
+  case VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT: return "ALL_GRAPHICS";
+  case VK_PIPELINE_STAGE_ALL_COMMANDS_BIT: return "ALL_COMMANDS";
+  default: return NULL;
+  }
+}
+
+static void hina_gpu_diag_log_lane_report(hina_context* ctx, uint8_t lane_idx)
+{
+  if (!hina_gpu_diag_enabled(ctx) || lane_idx >= HINA_MAX_QUEUE_LANES) return;
+  hina_gpu_diag_lane* lane = &ctx->core.device->diagnostics.lanes[lane_idx];
+  uint32_t submit_count = 0;
+  uint32_t event_count = 0;
+  uint16_t submit_indices[HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE];
+  uint16_t event_indices[HINA_GPU_DIAG_MAX_EVENTS_PER_LANE];
+  hina_spin_lock(&lane->lock);
+  for (uint32_t i = 0; i < HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE; ++i)
+  {
+    if (lane->submits[i].active) submit_indices[submit_count++] = (uint16_t)i;
+  }
+  for (uint32_t i = 1; i < submit_count; ++i)
+  {
+    uint16_t idx = submit_indices[i];
+    uint32_t j = i;
+    while (j > 0 && lane->submits[submit_indices[j - 1]].sequence > lane->submits[idx].sequence)
+    {
+      submit_indices[j] = submit_indices[j - 1];
+      --j;
+    }
+    submit_indices[j] = idx;
+  }
+  for (uint32_t i = 0; i < submit_count; ++i)
+  {
+    const hina_gpu_diag_submit* submit = &lane->submits[submit_indices[i]];
+    HINA_LOGE(ctx,
+              "GPU breadcrumbs lane=%u (%s) frame=%" PRIu64 " timeline=%" PRIu64 "%s%s events=%u",
+              lane_idx, hina_queue_debug_name((hina_queue)submit->queue),
+              submit->frame_index, hina_ticket_value(submit->ticket),
+              submit->immediate ? " immediate" : "", submit->uses_swapchain ? " swapchain" : "",
+              (uint32_t)submit->event_count);
+    event_count = 0;
+    for (uint32_t j = 0; j < HINA_GPU_DIAG_MAX_EVENTS_PER_LANE; ++j)
+    {
+      if (lane->events[j].active && lane->events[j].ticket == submit->ticket) event_indices[event_count++] = (uint16_t)j;
+    }
+    for (uint32_t j = 1; j < event_count; ++j)
+    {
+      uint16_t idx = event_indices[j];
+      uint32_t k = j;
+      while (k > 0 && lane->events[event_indices[k - 1]].sequence > lane->events[idx].sequence)
+      {
+        event_indices[k] = event_indices[k - 1];
+        --k;
+      }
+      event_indices[k] = idx;
+    }
+    for (uint32_t j = 0; j < event_count; ++j)
+    {
+      const hina_gpu_diag_event* event = &lane->events[event_indices[j]];
+      const char* text = hina_gpu_diag_text(ctx, lane_idx, event->text_off);
+      char indent[2 * HINA_GPU_DIAG_MAX_SCOPE_DEPTH + 1];
+      uint32_t indent_count = event->depth * 2u;
+      if (indent_count >= sizeof(indent)) indent_count = sizeof(indent) - 1u;
+      memset(indent, ' ', indent_count);
+      indent[indent_count] = '\0';
+      switch ((hina_gpu_diag_event_kind)event->kind)
+      {
+      case HINA_GPU_DIAG_EVENT_SUBMIT_ROOT:
+        HINA_LOGE(ctx, "  %s[submit] %s", indent, text ? text : "(unnamed)");
+        break;
+      case HINA_GPU_DIAG_EVENT_SCOPE_BEGIN:
+        HINA_LOGE(ctx, "  %s[begin] %s", indent, text ? text : "(unnamed)");
+        break;
+      case HINA_GPU_DIAG_EVENT_SCOPE_END:
+        HINA_LOGE(ctx, "  %s[end] %s", indent, text ? text : "(unnamed)");
+        break;
+      case HINA_GPU_DIAG_EVENT_MARKER:
+        HINA_LOGE(ctx, "  %s[mark] %s", indent, text ? text : "(unnamed)");
+        break;
+      default:
+        HINA_LOGE(ctx, "  %s[unknown_event_kind_%u] %s", indent, (uint32_t)event->kind, text ? text : "(unnamed)");
+        break;
+      }
+    }
+  }
+  hina_spin_unlock(&lane->lock);
+}
+
+static void hina_gpu_diag_log_device_fault(
+    hina_context* ctx, const char* origin, VkResult result, const VkDeviceFaultInfoEXT* info,
+    uint32_t address_count, uint32_t vendor_count)
+{
+  HINA_LOGE(ctx, "GPU device loss during %s: %s", origin ? origin : "unknown", hina_vk_result_string(result));
+  if (info && info->description[0])
+  {
+    HINA_LOGE(ctx, "Device fault description: %s", info->description);
+  }
+  for (uint32_t i = 0; i < address_count; ++i)
+  {
+    const VkDeviceFaultAddressInfoEXT* addr = &ctx->core.device->diagnostics.fault_addresses[i];
+    const char* type_name = hina_fault_address_type_name(addr->addressType);
+    char type_buf[32];
+    if (!type_name) { snprintf(type_buf, sizeof(type_buf), "TYPE(%u)", (uint32_t)addr->addressType); type_name = type_buf; }
+    HINA_LOGE(ctx, "Fault address[%u]: %s addr=0x%" PRIx64 " precision=0x%" PRIx64,
+              i, type_name, addr->reportedAddress, addr->addressPrecision);
+  }
+  for (uint32_t i = 0; i < vendor_count; ++i)
+  {
+    const VkDeviceFaultVendorInfoEXT* vendor = &ctx->core.device->diagnostics.fault_vendors[i];
+    HINA_LOGE(ctx, "Fault vendor[%u]: %s code=0x%" PRIx64 " data=0x%" PRIx64,
+              i, vendor->description, vendor->vendorFaultCode, vendor->vendorFaultData);
+  }
+  for (uint32_t lane_idx = 0; lane_idx < ctx->core.device->queue.lanes.lane_count; ++lane_idx)
+  {
+    hina_gpu_diag_log_lane_report(ctx, (uint8_t)lane_idx);
+  }
+}
+
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+static const hina_gpu_diag_cmd_event* hina_gpu_diag_find_cmd_event(hina_context* ctx, uint8_t lane_idx,
+                                                                   const void* marker)
+{
+  if (!marker || !hina_gpu_diag_enabled(ctx) || lane_idx >= HINA_MAX_QUEUE_LANES) return NULL;
+  const hina_gpu_diag_lane* lane = &ctx->core.device->diagnostics.lanes[lane_idx];
+  for (uint32_t i = 0; i < HINA_GPU_DIAG_MAX_SUBMITS_PER_LANE; ++i)
+  {
+    const hina_gpu_diag_submit* submit = &lane->submits[i];
+    if (!submit->active) continue;
+    for (const hina_gpu_diag_cmd_event_block* block = submit->cmd_blocks; block; block = block->next)
+    {
+      const hina_gpu_diag_cmd_event* begin = &block->events[0];
+      const hina_gpu_diag_cmd_event* end = begin + block->count;
+      if ((const hina_gpu_diag_cmd_event*)marker >= begin && (const hina_gpu_diag_cmd_event*)marker < end)
+      {
+        return (const hina_gpu_diag_cmd_event*)marker;
+      }
+    }
+  }
+  return NULL;
+}
+
+static void hina_gpu_diag_log_nv_checkpoints(hina_context* ctx)
+{
+  hina_gpu_diagnostics* diag = &ctx->core.device->diagnostics;
+  if (!diag->enable_nv_checkpoints || !vkGetQueueCheckpointDataNV) return;
+  for (uint32_t lane_idx = 0; lane_idx < ctx->core.device->queue.lanes.lane_count; ++lane_idx)
+  {
+    hina_queue_lane* lane = &ctx->core.device->queue.lanes.lanes[lane_idx];
+    if (!lane->valid) continue;
+    uint32_t count = 0;
+    vkGetQueueCheckpointDataNV(lane->queue, &count, NULL);
+    if (count == 0) continue;
+    VkCheckpointDataNV data[HINA_GPU_DIAG_MAX_NV_CHECKPOINTS] = {{.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV}};
+    if (count > HINA_ARRAY_SIZE(data))
+    {
+      HINA_LOGW(ctx, "NV checkpoint data clamped on lane %u (%s): %u checkpoints, max %u", lane_idx, hina_lane_debug_name(ctx, (uint8_t)lane_idx), count, (uint32_t)HINA_ARRAY_SIZE(data));
+      count = HINA_ARRAY_SIZE(data);
+    }
+    for (uint32_t i = 0; i < count; ++i) data[i].sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+    vkGetQueueCheckpointDataNV(lane->queue, &count, data);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+      const hina_gpu_diag_cmd_event* event =
+        hina_gpu_diag_find_cmd_event(ctx, (uint8_t)lane_idx, data[i].pCheckpointMarker);
+      const char* text = event ? hina_gpu_diag_text(ctx, (uint8_t)lane_idx, event->text_off) : NULL;
+      const char* stage_name = hina_pipeline_stage_name((VkPipelineStageFlagBits)data[i].stage);
+      char stage_buf[32];
+      if (!stage_name) { snprintf(stage_buf, sizeof(stage_buf), "STAGE(0x%x)", (uint32_t)data[i].stage); stage_name = stage_buf; }
+      if (event)
+      {
+        HINA_LOGE(ctx, "NV checkpoint lane=%u (%s) stage=%s: %s",
+                  lane_idx, hina_lane_debug_name(ctx, (uint8_t)lane_idx), stage_name, text ? text : "(unnamed)");
+      }
+      else
+      {
+        HINA_LOGE(ctx, "NV checkpoint lane=%u (%s) stage=%s: (driver-injected automatic checkpoint)",
+                  lane_idx, hina_lane_debug_name(ctx, (uint8_t)lane_idx), stage_name);
+      }
+    }
+  }
+}
+#else
+static void hina_gpu_diag_log_nv_checkpoints(hina_context* ctx)
+{
+  (void)ctx;
+}
+#endif
+
+static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* origin, VkResult result)
+{
+  if (!ctx || !ctx->core.device)
+  {
+    HINA_FATAL("GPU device lost");
+  }
+  hina_gpu_diagnostics* diag = &ctx->core.device->diagnostics;
+  if (hina_atomic_cas32(&diag->crash_reported, 0, 1) == 0)
+  {
+    VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    uint32_t address_count = 0;
+    uint32_t vendor_count = 0;
+    if (g_debug_caps.has_device_fault && vkGetDeviceFaultInfoEXT)
+    {
+      VkDeviceFaultCountsEXT counts = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+      if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, NULL) == VK_SUCCESS)
+      {
+        if (counts.addressInfoCount > HINA_GPU_DIAG_MAX_FAULT_ADDRS) counts.addressInfoCount = HINA_GPU_DIAG_MAX_FAULT_ADDRS;
+        if (counts.vendorInfoCount > HINA_GPU_DIAG_MAX_FAULT_VENDORS) counts.vendorInfoCount = HINA_GPU_DIAG_MAX_FAULT_VENDORS;
+        counts.vendorBinarySize = 0;
+        info.pAddressInfos = diag->fault_addresses;
+        info.pVendorInfos = diag->fault_vendors;
+        info.pVendorBinaryData = NULL;
+        if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, &info) == VK_SUCCESS)
+        {
+          address_count = counts.addressInfoCount;
+          vendor_count = counts.vendorInfoCount;
+        }
+      }
+    }
+    if (hina_gpu_diag_enabled(ctx))
+    {
+      hina_gpu_diag_log_nv_checkpoints(ctx);
+      hina_gpu_diag_log_device_fault(ctx, origin, result, &info, address_count, vendor_count);
+    }
+    else
+    {
+      HINA_LOGE(ctx, "GPU device loss during %s: %s", origin ? origin : "unknown", hina_vk_result_string(result));
+      if (info.description[0])
+      {
+        HINA_LOGE(ctx, "Device fault description: %s", info.description);
+      }
+    }
+  }
+  fflush(NULL); // Flush all streams before abort - log_fn may write to any stream
+  HINA_FATAL("VK_ERROR_DEVICE_LOST");
+}
+
 #endif // HINA_DEBUG
+
+static const char* hina_fault_address_type_name(VkDeviceFaultAddressTypeEXT type)
+{
+  switch (type)
+  {
+  case VK_DEVICE_FAULT_ADDRESS_TYPE_NONE_EXT: return "NONE";
+  case VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT: return "READ_INVALID";
+  case VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT: return "WRITE_INVALID";
+  case VK_DEVICE_FAULT_ADDRESS_TYPE_EXECUTE_INVALID_EXT: return "EXECUTE_INVALID";
+  case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_UNKNOWN_EXT: return "IP_UNKNOWN";
+  case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_INVALID_EXT: return "IP_INVALID";
+  case VK_DEVICE_FAULT_ADDRESS_TYPE_INSTRUCTION_POINTER_FAULT_EXT: return "IP_FAULT";
+  default: return NULL;
+  }
+}
+
+#ifndef HINA_DEBUG
+static bool hina_gpu_diag_init(hina_context* ctx)
+{
+  (void)ctx;
+  return true;
+}
+
+static void hina_gpu_diag_shutdown(hina_device* dev)
+{
+  (void)dev;
+}
+
+static void hina_staging_diag_complete_ticket(hina_context* ctx, hina_ticket ticket)
+{
+  (void)ctx;
+  (void)ticket;
+}
+
+static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* origin, VkResult result)
+{
+  if (ctx && ctx->core.device)
+  {
+    HINA_LOGE(ctx, "GPU device loss during %s: %s", origin ? origin : "unknown", hina_vk_result_string(result));
+    if (g_debug_caps.has_device_fault && vkGetDeviceFaultInfoEXT)
+    {
+      enum { HINA_RELEASE_FAULT_MAX_ADDRS = 16, HINA_RELEASE_FAULT_MAX_VENDORS = 16 };
+      VkDeviceFaultAddressInfoEXT addresses[HINA_RELEASE_FAULT_MAX_ADDRS];
+      VkDeviceFaultVendorInfoEXT vendors[HINA_RELEASE_FAULT_MAX_VENDORS];
+      memset(addresses, 0, sizeof(addresses));
+      memset(vendors, 0, sizeof(vendors));
+      VkDeviceFaultCountsEXT counts = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+      if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, NULL) == VK_SUCCESS)
+      {
+        VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+        if (counts.addressInfoCount > HINA_RELEASE_FAULT_MAX_ADDRS) counts.addressInfoCount = HINA_RELEASE_FAULT_MAX_ADDRS;
+        if (counts.vendorInfoCount > HINA_RELEASE_FAULT_MAX_VENDORS) counts.vendorInfoCount = HINA_RELEASE_FAULT_MAX_VENDORS;
+        counts.vendorBinarySize = 0;
+        info.pAddressInfos = addresses;
+        info.pVendorInfos = vendors;
+        info.pVendorBinaryData = NULL;
+        if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, &info) == VK_SUCCESS)
+        {
+          if (info.description[0])
+          {
+            HINA_LOGE(ctx, "Device fault description: %s", info.description);
+          }
+          for (uint32_t i = 0; i < counts.addressInfoCount; ++i)
+          {
+            const VkDeviceFaultAddressInfoEXT* addr = &addresses[i];
+            const char* type_name = hina_fault_address_type_name(addr->addressType);
+            char type_buf[32];
+            if (!type_name) { snprintf(type_buf, sizeof(type_buf), "TYPE(%u)", (uint32_t)addr->addressType); type_name = type_buf; }
+            HINA_LOGE(ctx, "Fault address[%u]: %s addr=0x%" PRIx64 " precision=0x%" PRIx64,
+                      i, type_name, addr->reportedAddress, addr->addressPrecision);
+          }
+          for (uint32_t i = 0; i < counts.vendorInfoCount; ++i)
+          {
+            const VkDeviceFaultVendorInfoEXT* vendor = &vendors[i];
+            HINA_LOGE(ctx, "Fault vendor[%u]: %s code=0x%" PRIx64 " data=0x%" PRIx64,
+                      i, vendor->description, vendor->vendorFaultCode, vendor->vendorFaultData);
+          }
+        }
+      }
+    }
+  }
+  fflush(NULL); // Flush all streams before abort - log_fn may write to any stream
+  HINA_FATAL("VK_ERROR_DEVICE_LOST");
+}
+#endif
 
 // Convert hina_vk_version enum to raw Vulkan API version
 static uint32_t hina_vk_version_to_api(hina_vk_version v)
@@ -5247,9 +6235,11 @@ static VkFence hina_lane_fence_acquire(hina_context* ctx, hina_queue_lane* lane,
   if (prev_value != 0)
   {
     VkResult status = vkGetFenceStatus(dev, ring->fences[slot]);
+    if (status == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "lane_fence_status", status);
     if (status == VK_NOT_READY)
     {
-      vkWaitForFences(dev, 1, &ring->fences[slot], VK_TRUE, UINT64_MAX);
+      VkResult wait_result = vkWaitForFences(dev, 1, &ring->fences[slot], VK_TRUE, UINT64_MAX);
+      if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "lane_fence_wait", wait_result);
     }
     uint64_t curr_completed = (uint64_t)hina_atomic_load64(&lane->completed_value);
     if (prev_value > curr_completed)
@@ -5257,7 +6247,8 @@ static VkFence hina_lane_fence_acquire(hina_context* ctx, hina_queue_lane* lane,
       hina_atomic_store64(&lane->completed_value, (int64_t)prev_value);
     }
   }
-  vkResetFences(dev, 1, &ring->fences[slot]);
+  VkResult reset_result = vkResetFences(dev, 1, &ring->fences[slot]);
+  if (reset_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "lane_fence_reset", reset_result);
   ring->tickets[slot] = value;
   ring->head = slot + 1;
   return ring->fences[slot];
@@ -7527,6 +8518,9 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
   const bool wants_surface = desc->native_window != NULL;
   const char* default_exts[8];
   uint32_t ext_count = 0;
+#ifdef HINA_DEBUG
+  bool has_debug_utils = false;
+#endif
   // Surface extensions - these are required if we want a surface
   if (wants_surface)
   {
@@ -7572,9 +8566,9 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
   }
   // Optional debug utils extension - only add if available
 #ifdef HINA_DEBUG
-  bool has_debug_utils = false;
-  if ((ctx->core.device->config.enable_validation || ctx->core.device->config.log_fn || ctx->core.device->config.
-                                                                                             enable_debug_names) &&
+  const bool wants_debug_utils = ctx->core.device->config.enable_validation || ctx->core.device->config.log_fn ||
+    ctx->core.device->config.enable_debug_names || ctx->core.device->config.gpu_breadcrumbs;
+  if (wants_debug_utils &&
     ext_count < HINA_ARRAY_SIZE(default_exts))
   {
     if (hina_has_instance_extension(available_exts, available_ext_count, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
@@ -7589,7 +8583,6 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
     }
   }
 #endif
-  if (heap_alloc && available_exts) hina_free_host(available_exts);
   // Query the highest supported instance API version
   uint32_t instance_api_version = VK_API_VERSION_1_0;
   if (vkEnumerateInstanceVersion)
@@ -7650,6 +8643,10 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
         break;
       }
     }
+    if (ctx->core.device->config.gpu_breadcrumbs && !has_debug_utils)
+    {
+      HINA_LOGW(ctx, "GPU breadcrumbs requested without VK_EXT_debug_utils in user instance extensions; using CPU-only breadcrumbs");
+    }
 #endif
   }
   else
@@ -7658,6 +8655,7 @@ static bool hina_create_instance(hina_context* ctx, const hina_desc* desc)
     ici.ppEnabledExtensionNames = default_exts;
     HINA_LOGI(ctx, "using %u default instance extensions", ext_count);
   }
+  if (heap_alloc && available_exts) hina_free_host(available_exts);
 #ifdef HINA_DEBUG
   ctx->core.device->config.has_debug_utils = has_debug_utils;
   // Only attach debug messenger if VK_EXT_debug_utils is enabled
@@ -8204,6 +9202,19 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   {
     HINA_PUSH_DEFAULT_EXT(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
   }
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+  if (ctx->core.device->config.gpu_breadcrumbs && g_debug_caps.has_nv_checkpoints)
+  {
+    HINA_PUSH_DEFAULT_EXT(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+  }
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+  if (ctx->core.device->config.gpu_breadcrumbs_auto && g_debug_caps.has_nv_checkpoints &&
+    g_debug_caps.has_nv_diagnostics_config)
+  {
+    HINA_PUSH_DEFAULT_EXT(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+  }
+#endif
   // Timeline semaphore extension for Vulkan 1.1 (core in 1.2+)
   if (g_device_caps.has_timeline_semaphore && !is_vk13_plus && !is_vk12)
   {
@@ -8338,6 +9349,19 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
                                           VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME));
   const bool enable_dyn_unused_attach_feat = g_device_caps.has_dynamic_rendering_unused_attachments &&
     hina_is_extension_enabled(dev_exts, dev_ext_count, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+  const bool enable_nv_checkpoints_ext = ctx->core.device->config.gpu_breadcrumbs && g_debug_caps.has_nv_checkpoints &&
+    hina_is_extension_enabled(dev_exts, dev_ext_count, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+#else
+  const bool enable_nv_checkpoints_ext = false;
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+  const bool enable_nv_diag_config_feat = enable_nv_checkpoints_ext && ctx->core.device->config.gpu_breadcrumbs_auto &&
+    g_debug_caps.has_nv_diagnostics_config && hina_is_extension_enabled(
+      dev_exts, dev_ext_count, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+#else
+  const bool enable_nv_diag_config_feat = false;
+#endif
   // Log enabled device extensions
   HINA_LOGI(ctx, "Enabling %u device extensions:", dev_ext_count);
   for (uint32_t i = 0; i < dev_ext_count; ++i)
@@ -8402,6 +9426,19 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT,
     .dynamicRenderingUnusedAttachments = enable_dyn_unused_attach_feat ? VK_TRUE : VK_FALSE
   };
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+  VkPhysicalDeviceDiagnosticsConfigFeaturesNV nv_diag_config_feat = {
+    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV,
+    .diagnosticsConfig = enable_nv_diag_config_feat ? VK_TRUE : VK_FALSE
+  };
+  VkDeviceDiagnosticsConfigCreateInfoNV nv_diag_config_ci = {
+    .sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV,
+    .flags = enable_nv_diag_config_feat
+               ? VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV |
+                   VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV
+               : 0u
+  };
+#endif
   // Build pNext chain conditionally based on Vulkan version
   // - Vulkan 1.0: No pNext chaining, use pEnabledFeatures instead
   // - VkPhysicalDeviceVulkan12Features is only valid for 1.2+
@@ -8442,6 +9479,9 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
     if (enable_timeline_feat) HINA_APPEND_PNEXT(last_pNext, &timeline_feat);
     if (enable_dyn_local_read_feat) HINA_APPEND_PNEXT(last_pNext, &dyn_local_read_feat);
     if (enable_dyn_unused_attach_feat) HINA_APPEND_PNEXT(last_pNext, &dyn_unused_attach_feat);
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+    if (enable_nv_diag_config_feat) HINA_APPEND_PNEXT(last_pNext, &nv_diag_config_feat);
+#endif
 #undef HINA_APPEND_PNEXT
   }
   VkDeviceCreateInfo dci = {0};
@@ -8455,6 +9495,13 @@ static bool hina_create_device(hina_context* ctx, const hina_desc* desc)
   {
     dci.pNext = &feats2;
   }
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+  if (enable_nv_diag_config_feat && nv_diag_config_ci.flags != 0)
+  {
+    nv_diag_config_ci.pNext = dci.pNext;
+    dci.pNext = &nv_diag_config_ci;
+  }
+#endif
   VkDeviceQueueCreateInfo qcis[4];
   uint32_t qci_count = 0;
   uint32_t families[4] = {
@@ -8661,10 +9708,13 @@ static void hina_fill_caps(hina_context* ctx)
   g_device_caps.has_dynamic_rendering_unused_attachments = false;
   g_host_query_reset_supported = false;
   g_debug_caps.has_device_fault = false;
+  g_debug_caps.has_nv_checkpoints = false;
+  g_debug_caps.has_nv_diagnostics_config = false;
   g_debug_caps.has_synchronization2 = false;
   g_debug_caps.has_memory_budget = false;
   g_debug_caps.has_maintenance4 = false;
   g_debug_caps.has_maintenance5 = false;
+  g_debug_caps.uses_gpu_breadcrumbs = false;
   // Query features using version-appropriate API
   if (api_version >= VK_API_VERSION_1_1 && vkGetPhysicalDeviceFeatures2)
   {
@@ -8703,6 +9753,17 @@ static void hina_fill_caps(hina_context* ctx)
       ctx->core.device->core.phys, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
     const bool phys_has_dyn_unused_attach_ext = hina_has_device_extension(
       ctx->core.device->core.phys, VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME);
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+    const bool phys_has_nv_checkpoints_ext = hina_has_device_extension(
+      ctx->core.device->core.phys, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+    const bool phys_has_nv_diag_config_ext = hina_has_device_extension(
+      ctx->core.device->core.phys, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+    VkPhysicalDeviceDiagnosticsConfigFeaturesNV nv_diag_config = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV
+    };
+#endif
     const bool can_query_host_query_reset = api_version >= VK_API_VERSION_1_2 || phys_has_host_query_reset_ext;
     const bool can_query_dyn_local_read = api_version >= VK_API_VERSION_1_4 || phys_has_dyn_local_read_ext;
     feats.pNext = &dyn;
@@ -8740,6 +9801,9 @@ static void hina_fill_caps(hina_context* ctx)
   } while (0)
     if (can_query_dyn_local_read) HINA_APPEND_QUERY_PNEXT(query_tail, &dyn_local_read);
     if (phys_has_dyn_unused_attach_ext) HINA_APPEND_QUERY_PNEXT(query_tail, &dyn_unused_attach);
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+    if (phys_has_nv_diag_config_ext) HINA_APPEND_QUERY_PNEXT(query_tail, &nv_diag_config);
+#endif
 #undef HINA_APPEND_QUERY_PNEXT
     vkGetPhysicalDeviceFeatures2(ctx->core.device->core.phys, &feats);
     base_feats = feats.features;
@@ -8749,6 +9813,12 @@ static void hina_fill_caps(hina_context* ctx)
     g_device_caps.has_dynamic_state2 = dyn2.extendedDynamicState2 == VK_TRUE;
     g_host_query_reset_supported = can_query_host_query_reset && host_query_reset_feats.hostQueryReset == VK_TRUE;
     g_debug_caps.has_device_fault = fault.deviceFault == VK_TRUE && phys_has_device_fault;
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+    g_debug_caps.has_nv_checkpoints = phys_has_nv_checkpoints_ext;
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+    g_debug_caps.has_nv_diagnostics_config = phys_has_nv_diag_config_ext && nv_diag_config.diagnosticsConfig == VK_TRUE;
+#endif
     g_debug_caps.has_pipeline_creation_feedback = hina_has_device_extension(
       ctx->core.device->core.phys, VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     g_debug_caps.has_subgroup_size_control = hina_has_device_extension(ctx->core.device->core.phys,
@@ -8910,7 +9980,7 @@ static void hina_log_enabled_features(hina_context* ctx)
   HINA_LOGI(ctx, "  timelineSemaphore: %s%s", vkWaitSemaphores ? "YES" : "NO",
             ver >= HINA_VK_VERSION_1_2 ? " (core 1.2)" : " (VK_KHR_timeline_semaphore)");
   HINA_LOGI(ctx, "  hostQueryReset: %s", g_host_query_reset_enabled ? "YES" : "NO");
-  HINA_LOGI(ctx, "  frame fences: %u slots (HINA_MAX_FRAMES_IN_FLIGHT)", HINA_MAX_FRAMES_IN_FLIGHT);
+  HINA_LOGI(ctx, "  frame fences: %u slots (frames_in_flight)", dev->config.frames_in_flight);
   HINA_LOGI(ctx, "Rendering:");
   HINA_LOGI(ctx, "  dynamicRendering: %s%s", vkCmdBeginRendering ? "YES" : "NO",
             ver >= HINA_VK_VERSION_1_3 ? " (core 1.3)" : " (VK_KHR_dynamic_rendering)");
@@ -8939,6 +10009,15 @@ static void hina_log_enabled_features(hina_context* ctx)
   }
   HINA_LOGI(ctx, "Other:");
   HINA_LOGI(ctx, "  deviceFault: %s (VK_EXT_device_fault)", g_debug_caps.has_device_fault ? "YES" : "NO");
+#ifdef VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME
+  HINA_LOGI(ctx, "  nvCheckpoints: %s (VK_NV_device_diagnostic_checkpoints)",
+            g_debug_caps.has_nv_checkpoints ? "YES" : "NO");
+#endif
+#ifdef VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME
+  HINA_LOGI(ctx, "  nvDiagnosticsConfig: %s (VK_NV_device_diagnostics_config)",
+            g_debug_caps.has_nv_diagnostics_config ? "YES" : "NO");
+#endif
+  HINA_LOGI(ctx, "  gpuBreadcrumbs: %s", dev->diagnostics.enabled ? "YES" : "NO");
   HINA_LOGI(ctx, "Internal extensions:");
   HINA_LOGI(ctx, "  synchronization2: %s%s", vkQueueSubmit2 ? "YES" : "NO",
             ver >= HINA_VK_VERSION_1_3 ? " (core 1.3)" : " (VK_KHR_synchronization2)");
@@ -9382,6 +10461,12 @@ bool hina_init(const hina_desc* desc)
 #else
   dev->config.enable_debug_names = (desc->flags & HINA_DEBUG_NAMES_BIT) != 0 || dev->config.enable_validation;
 #endif
+  dev->config.gpu_breadcrumbs = (desc->flags & HINA_DEBUG_GPU_BREADCRUMBS_BIT) != 0;
+  dev->config.gpu_breadcrumbs_auto = dev->config.gpu_breadcrumbs &&
+    ((desc->flags & HINA_DEBUG_GPU_BREADCRUMBS_AUTO_BIT) != 0);
+#else
+  dev->config.gpu_breadcrumbs = false;
+  dev->config.gpu_breadcrumbs_auto = false;
 #endif
   dev->config.force_legacy_renderpass = (desc->flags & HINA_DEBUG_FORCE_LEGACY_RENDERPASS_BIT) != 0;
   dev->config.disable_timeline_semaphore = (desc->flags & HINA_DEBUG_NO_TIMELINE_SEMAPHORE_BIT) != 0;
@@ -9390,6 +10475,8 @@ bool hina_init(const hina_desc* desc)
   dev->config.force_separate_families = (desc->flags & HINA_DEBUG_FORCE_SEPARATE_FAMILIES_BIT) != 0;
   dev->config.force_legacy_tile_pass = (desc->flags & HINA_DEBUG_FORCE_LEGACY_TILE_PASS_BIT) != 0;
   dev->config.max_api_version = desc->max_api_version; // AUTO = highest supported
+  dev->config.frames_in_flight = (desc->frames_in_flight >= 2 && desc->frames_in_flight <= HINA_MAX_FRAMES_IN_FLIGHT)
+    ? desc->frames_in_flight : HINA_MAX_FRAMES_IN_FLIGHT;
   hina_atomic_store64(&dev->sync.global_frame_index, 0);
   dev->core.owns_instance = false;
   dev->core.owns_device = false;
@@ -9415,6 +10502,11 @@ bool hina_init(const hina_desc* desc)
   HINA_VK_CHECK_MSG_RET(ctx, hina_pick_queues(ctx), false, "picking queue families");
   if (!hina_create_device(ctx, desc)) return false;
   dev->core.owns_device = true;
+  if (!hina_gpu_diag_init(ctx))
+  {
+    HINA_LOGE(ctx, "failed to initialize GPU breadcrumb diagnostics");
+    return false;
+  }
   HINA_LOGI(ctx, "Using %s rendering backend", vkCmdBeginRendering ? "dynamic" : "legacy");
   VmaAllocatorCreateInfo vma_info = {0};
   vma_info.instance = dev->core.instance;
@@ -10271,6 +11363,25 @@ HINA_NOINLINE static VkResult hina_staging_submit_fence_impl(hina_queue_lane* la
   return result;
 }
 
+// Fence-path submit helper: lock lane, submit, update counters, unlock.
+// Returns VK_SUCCESS or error. Caller must handle error + diagnostics.
+static VkResult hina_staging_submit_locked(hina_queue_lane* lane,
+                                            VkCommandBuffer vk_cmd, VkSemaphore wait_sem,
+                                            VkPipelineStageFlags wait_stage, VkSemaphore signal_sem,
+                                            VkFence fence, uint64_t* out_diag_value)
+{
+  *out_diag_value = lane->last_signaled + 1;
+  hina_lane_lock(lane);
+  VkResult result = hina_staging_submit_fence_impl(lane, vk_cmd, wait_sem, wait_stage, signal_sem, fence);
+  if (result == VK_SUCCESS)
+  {
+    lane->last_signaled = *out_diag_value;
+    lane->submit_count++;
+  }
+  hina_lane_unlock(lane);
+  return result;
+}
+
 // Timeline submit helper: lock lane, bump signal, submit, unlock, encode ticket.
 // Returns true on success, writes encoded ticket to *out_ticket.
 // wait_sem=VK_NULL_HANDLE and wait_value=0 means no dependency.
@@ -10293,11 +11404,16 @@ static bool hina_staging_submit_timeline_queue(
   hina_lane_unlock(lane);
   if (result != VK_SUCCESS)
   {
+    if (result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, label, result);
     HINA_LOGE(ctx, "Staging %s submit failed: %d", label, result);
     return false;
   }
   hina_atomic_inc64(&ctx->core.device->sync.timeline.value);
   *out_ticket = hina_ticket_encode((uint8_t)lane_idx, signal_value);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_publish_submit(ctx, NULL, (uint8_t)lane_idx, hina_gpu_diag_queue_from_label(label), *out_ticket,
+                               signal_value, label, false, false);
+#endif
   return true;
 }
 
@@ -10405,9 +11521,15 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
     {
       VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging,
                                              VK_TRUE, UINT64_MAX);
+      if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "staging_flush_wait", wait_result);
       HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
                    "vkWaitForFences failed in staging flush: %d", wait_result);
       hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 0);
+#ifdef HINA_DEBUG
+      hina_staging_diag_complete_ticket(ctx, sc->last_submit_ticket);
+      hina_staging_diag_complete_ticket(ctx, sc->last_gfx_submit_ticket);
+      hina_staging_diag_complete_ticket(ctx, sc->last_comp_submit_ticket);
+#endif
     }
     VkResult reset_result = vkResetFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging);
     HINA_ASSERTF(reset_result == VK_SUCCESS, "vkResetFences failed in staging flush: %d", reset_result);
@@ -10434,13 +11556,12 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
       {
         signal_sem = sc->xfer_to_comp_sem;
       }
-      hina_lane_lock(lane);
-      VkResult result = hina_staging_submit_fence_impl(lane, sc->vk_cmd, VK_NULL_HANDLE, 0,
-                                                       signal_sem, fence);
-      lane->submit_count++;
-      hina_lane_unlock(lane);
+      uint64_t diag_value;
+      VkResult result = hina_staging_submit_locked(lane, sc->vk_cmd, VK_NULL_HANDLE, 0,
+                                                    signal_sem, fence, &diag_value);
       if (result != VK_SUCCESS)
       {
+        if (result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "staging_transfer", result);
         HINA_LOGE(ctx, "Staging submit failed (no timeline): %d", result);
         return 0;
       }
@@ -10450,6 +11571,12 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
         transfer_ticket = (uint64_t)hina_atomic_inc64(&ctx->core.device->sync.submission_counter);
         sc->last_submit_ticket = transfer_ticket;
       }
+#ifdef HINA_DEBUG
+      sc->last_submit_diag_ticket = hina_ticket_encode((uint8_t)lane_idx, diag_value);
+      sc->last_submit_diag_complete_ticket = 0;
+      hina_gpu_diag_publish_submit(ctx, NULL, (uint8_t)lane_idx, HINA_QUEUE_TRANSFER, sc->last_submit_diag_ticket,
+                                   diag_value, "staging_transfer", false, false);
+#endif
     }
     if (has_gfx_pending)
     {
@@ -10459,13 +11586,13 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
         : VK_NULL_HANDLE;
       VkSemaphore signal_sem = (chain_comp_after_gfx && sc->gfx_to_comp_sem) ? sc->gfx_to_comp_sem : VK_NULL_HANDLE;
       VkFence fence = use_gfx_fence ? ctx->core.device->sync.fence.staging : VK_NULL_HANDLE;
-      hina_lane_lock(lane);
-      VkResult result = hina_staging_submit_fence_impl(lane, sc->gfx_vk_cmd,
-                                                       wait_sem, VK_PIPELINE_STAGE_TRANSFER_BIT, signal_sem, fence);
-      lane->submit_count++;
-      hina_lane_unlock(lane);
+      uint64_t diag_value;
+      VkResult result = hina_staging_submit_locked(lane, sc->gfx_vk_cmd,
+                                                    wait_sem, VK_PIPELINE_STAGE_TRANSFER_BIT, signal_sem,
+                                                    fence, &diag_value);
       if (result != VK_SUCCESS)
       {
+        if (result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "staging_graphics", result);
         HINA_LOGE(ctx, "Staging graphics submit failed (no timeline): %d", result);
         return 0;
       }
@@ -10476,6 +11603,12 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
         sc->last_submit_ticket = gfx_ticket;
         sc->last_gfx_submit_ticket = gfx_ticket;
       }
+#ifdef HINA_DEBUG
+      sc->last_gfx_submit_diag_ticket = hina_ticket_encode((uint8_t)lane_idx, diag_value);
+      sc->last_gfx_submit_diag_complete_ticket = 0;
+      hina_gpu_diag_publish_submit(ctx, NULL, (uint8_t)lane_idx, HINA_QUEUE_GRAPHICS,
+                                   sc->last_gfx_submit_diag_ticket, diag_value, "staging_graphics", false, false);
+#endif
     }
     if (has_comp_pending)
     {
@@ -10491,13 +11624,12 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
       {
         wait_sem = sc->xfer_to_comp_sem;
       }
-      hina_lane_lock(lane);
-      VkResult result = hina_staging_submit_fence_impl(lane, sc->comp_vk_cmd, wait_sem, wait_stage, VK_NULL_HANDLE,
-                                                       ctx->core.device->sync.fence.staging);
-      lane->submit_count++;
-      hina_lane_unlock(lane);
+      uint64_t diag_value;
+      VkResult result = hina_staging_submit_locked(lane, sc->comp_vk_cmd, wait_sem, wait_stage, VK_NULL_HANDLE,
+                                                    ctx->core.device->sync.fence.staging, &diag_value);
       if (result != VK_SUCCESS)
       {
+        if (result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "staging_compute", result);
         HINA_LOGE(ctx, "Staging compute submit failed (no timeline): %d", result);
         return 0;
       }
@@ -10509,6 +11641,12 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
       {
         sc->last_gfx_submit_ticket = comp_ticket;
       }
+#ifdef HINA_DEBUG
+      sc->last_comp_submit_diag_ticket = hina_ticket_encode((uint8_t)lane_idx, diag_value);
+      sc->last_comp_submit_diag_complete_ticket = 0;
+      hina_gpu_diag_publish_submit(ctx, NULL, (uint8_t)lane_idx, HINA_QUEUE_COMPUTE,
+                                   sc->last_comp_submit_diag_ticket, diag_value, "staging_compute", false, false);
+#endif
     }
     // Legacy path uses a single fence; alias per-queue tickets to the fence ticket when chained.
     if (has_gfx_pending && !sc->last_gfx_submit_ticket && sc->last_submit_ticket)
@@ -10519,6 +11657,20 @@ static hina_ticket hina_staging_ctx_flush(hina_context* ctx)
     {
       sc->last_comp_submit_ticket = sc->last_submit_ticket;
     }
+#ifdef HINA_DEBUG
+    if (sc->last_submit_diag_ticket)
+    {
+      sc->last_submit_diag_complete_ticket = comp_ticket ? comp_ticket : (gfx_ticket ? gfx_ticket : transfer_ticket);
+    }
+    if (sc->last_gfx_submit_diag_ticket)
+    {
+      sc->last_gfx_submit_diag_complete_ticket = comp_ticket ? comp_ticket : gfx_ticket;
+    }
+    if (sc->last_comp_submit_diag_ticket)
+    {
+      sc->last_comp_submit_diag_complete_ticket = comp_ticket;
+    }
+#endif
   }
   hina_ticket retire_ticket = transfer_ticket ? transfer_ticket : (gfx_ticket ? gfx_ticket : comp_ticket);
   if (retire_ticket)
@@ -10548,13 +11700,19 @@ static void hina_staging_ctx_wait(hina_context* ctx, hina_ticket ticket)
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &lane->timeline,
       .pValues = &raw_value
     };
-    vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+    VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+    if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "staging_wait", wait_result);
   }
   else if (hina_atomic_load32(&ctx->core.device->sync.fence.staging_busy))
   {
-    vkWaitForFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging, VK_TRUE, UINT64_MAX);
+    VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging,
+                                           VK_TRUE, UINT64_MAX);
+    if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "staging_wait", wait_result);
     hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 0);
   }
+#ifdef HINA_DEBUG
+  hina_staging_diag_complete_ticket(ctx, ticket);
+#endif
 }
 
 // Auto-flush staged uploads: batches all STAGED resources and submits them
@@ -10719,6 +11877,7 @@ static VkCommandBuffer hina_staging_wait_reset_begin(hina_context* ctx, hina_tic
           .pValues = &raw_value
         };
         VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+        if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, label, wait_result);
         HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
                      "vkWaitSemaphores failed in staging %s: %d", label, wait_result);
       }
@@ -10729,11 +11888,15 @@ static VkCommandBuffer hina_staging_wait_reset_begin(hina_context* ctx, hina_tic
       {
         VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &ctx->core.device->sync.fence.staging,
                                                VK_TRUE, UINT64_MAX);
+        if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, label, wait_result);
         HINA_ASSERTF(wait_result == VK_SUCCESS || wait_result == VK_TIMEOUT,
                      "vkWaitForFences failed in staging %s: %d", label, wait_result);
         hina_atomic_store32(&ctx->core.device->sync.fence.staging_busy, 0);
       }
     }
+#ifdef HINA_DEBUG
+    hina_staging_diag_complete_ticket(ctx, last_ticket);
+#endif
   }
   VkResult reset_result = vkResetCommandPool(ctx->core.device->core.device, pool, 0);
   HINA_ASSERTF(reset_result == VK_SUCCESS, "vkResetCommandPool failed in staging %s: %d", label, reset_result);
@@ -11115,6 +12278,7 @@ static void hina_wait_frame_slot(hina_context* ctx, uint32_t slot)
         .semaphoreCount = wait_count, .pSemaphores = semaphores, .pValues = values
       };
       VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+      if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "wait_frame_slot", wait_result);
       (void)wait_result; // Used only by HINA_FRAME_DBG when enabled
       HINA_FRAME_DBG(ctx, "  TIMELINE wait done: result=%d", wait_result);
     }
@@ -11145,7 +12309,8 @@ static void hina_wait_frame_slot(hina_context* ctx, uint32_t slot)
       hina_submission_entry local = *e;
       if (local.fence)
       {
-        vkWaitForFences(ctx->core.device->core.device, 1, &local.fence, VK_TRUE, UINT64_MAX);
+        VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &local.fence, VK_TRUE, UINT64_MAX);
+        if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "wait_frame_slot", wait_result);
       }
       if (local.ticket > max_ticket) max_ticket = local.ticket;
       hina_release_submission_local(ctx, &local);
@@ -11219,6 +12384,9 @@ static void hina_wait_frame_slot(hina_context* ctx, uint32_t slot)
     else if (q == HINA_QUEUE_TRANSFER) reset_ok = transfer_reset_ok;
     ctx->cmd.available_cmds[q][slot].state.used = reset_ok ? 0 : ctx->cmd.available_cmds[q][slot].state.count;
   }
+#ifdef HINA_DEBUG
+  hina_gpu_diag_cleanup_slot(ctx, slot);
+#endif
   hina_frame_arena_reset(&ctx->alloc.frame_arenas[slot]);
   // Reset linear descriptor allocator for this frame slot
   hina_linear_desc_alloc_reset(ctx, &ctx->alloc.desc_allocs[slot]);
@@ -11227,6 +12395,38 @@ static void hina_wait_frame_slot(hina_context* ctx, uint32_t slot)
     vkResetDescriptorPool(ctx->core.device->core.device, ctx->alloc.temp_desc_pools[slot], 0);
   }
   HINA_FRAME_DBG(ctx, "  wait_frame_slot DONE for slot %u", slot);
+}
+
+static void hina_destroy_legacy_rp_fb_caches(hina_device* dev)
+{
+  if (!dev->core.device) return;
+  hina_rp_cache_table* rp_table = hina_atomic_load_ptr(&dev->core.backend.legacy.rp.table);
+  if (rp_table)
+  {
+    for (uint32_t i = 0; i < HINA_RP_CACHE_SIZE; ++i)
+    {
+      if (rp_table->entries[i].rp)
+        vkDestroyRenderPass(dev->core.device, rp_table->entries[i].rp, NULL);
+    }
+    hina_free_host(rp_table);
+    hina_atomic_store_ptr(&dev->core.backend.legacy.rp.table, NULL);
+  }
+  hina_fb_cache_table* fb_table = hina_atomic_load_ptr(&dev->core.backend.legacy.fb.table);
+  if (fb_table)
+  {
+    for (uint32_t i = 0; i < HINA_FB_CACHE_SIZE; ++i)
+    {
+      if (fb_table->entries[i].fb)
+        vkDestroyFramebuffer(dev->core.device, fb_table->entries[i].fb, NULL);
+    }
+    for (uint32_t i = 0; i < HINA_FB_CACHE_SIZE; ++i)
+    {
+      if (fb_table->overflow[i].attachments)
+        hina_free_host(fb_table->overflow[i].attachments);
+    }
+    hina_free_host(fb_table);
+    hina_atomic_store_ptr(&dev->core.backend.legacy.fb.table, NULL);
+  }
 }
 
 static void hina_destroy_swapchain(hina_context* ctx);
@@ -11245,7 +12445,7 @@ void hina_shutdown(void)
   if (dev->core.device)
   {
     VkResult wait_result = vkDeviceWaitIdle(dev->core.device);
-    HINA_FATAL_IF(wait_result == VK_ERROR_DEVICE_LOST);
+    if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "shutdown_wait_idle", wait_result);
     HINA_ASSERT(wait_result == VK_SUCCESS);
     hina_poll_submissions(ctx);
   }
@@ -11333,44 +12533,10 @@ void hina_shutdown(void)
     }
   }
   // Cleanup caches before vkDestroyDevice.
-  if (dev->core.device)
-  {
-    hina_rp_cache_table* rp_table = hina_atomic_load_ptr(&dev->core.backend.legacy.rp.table);
-    if (rp_table)
-    {
-      for (uint32_t i = 0; i < HINA_RP_CACHE_SIZE; ++i)
-      {
-        if (rp_table->entries[i].rp)
-        {
-          vkDestroyRenderPass(dev->core.device, rp_table->entries[i].rp, NULL);
-        }
-      }
-      hina_free_host(rp_table);
-      hina_atomic_store_ptr(&dev->core.backend.legacy.rp.table, NULL);
-    }
-    hina_fb_cache_table* fb_table = hina_atomic_load_ptr(&dev->core.backend.legacy.fb.table);
-    if (fb_table)
-    {
-      for (uint32_t i = 0; i < HINA_FB_CACHE_SIZE; ++i)
-      {
-        if (fb_table->entries[i].fb)
-        {
-          vkDestroyFramebuffer(dev->core.device, fb_table->entries[i].fb, NULL);
-        }
-      }
-      for (uint32_t i = 0; i < HINA_FB_CACHE_SIZE; ++i)
-      {
-        if (fb_table->overflow[i].attachments)
-        {
-          hina_free_host(fb_table->overflow[i].attachments);
-        }
-      }
-      hina_free_host(fb_table);
-      hina_atomic_store_ptr(&dev->core.backend.legacy.fb.table, NULL);
-    }
-  }
+  hina_destroy_legacy_rp_fb_caches(dev);
   // Destroy queue lane sync resources (semaphores/fences) before device
   hina_destroy_queue_lanes(dev);
+  hina_gpu_diag_shutdown(dev);
   // Cleanup any leaked user resources before destroying VMA
   hina_cleanup_leaked_resources(dev);
   if (dev->allocator.vma)
@@ -15152,6 +16318,40 @@ static bool hina_validate_graphics_shader_stages(
   return true;
 }
 
+// Sets up explicit bind group layouts + reflection for raw-SPIR-V pipelines.
+// Returns the VkPipelineLayout, or VK_NULL_HANDLE on failure (slot is freed on failure).
+static VkPipelineLayout hina_pipeline_setup_explicit_layouts(
+    hina_context* ctx, hina_pipeline_slot* e, uint16_t idx,
+    const hina_bind_group_layout* bind_group_layouts,
+    const hina_push_constant_range* push_constant_ranges, uint32_t push_constant_range_count,
+    VkShaderStageFlags stage_flags)
+{
+  e->reflection = NULL;
+  e->slot_bindings_allowed = 1;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  uint32_t explicit_layout_count = hina_count_bind_group_layouts(bind_group_layouts);
+  if (explicit_layout_count > 0)
+  {
+    e->reflection = hina_create_reflection_from_layouts(ctx, bind_group_layouts, explicit_layout_count, stage_flags);
+    if (!e->reflection)
+    {
+      HINA_LOGW(ctx, "Failed to build reflection from explicit layouts; slot bindings disabled");
+      e->slot_bindings_allowed = 0;
+    }
+    layout = hina_build_layout_from_explicit_bind_groups(ctx, bind_group_layouts, explicit_layout_count,
+                                                          push_constant_ranges, push_constant_range_count,
+                                                          &e->push_constant_stages, &e->push_constant_size, NULL);
+    e->set_layout_count = explicit_layout_count;
+  }
+  if (!layout)
+  {
+    if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
+    e->reflection = NULL;
+    hina_pipeline_slot_free(idx);
+  }
+  return layout;
+}
+
 // Internal implementation - used by deprecated wrappers and _ex function
 static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_pipeline_desc* desc)
 {
@@ -15193,35 +16393,10 @@ static hina_pipeline hina_make_pipeline_internal(hina_context* ctx, const hina_p
   HINA_ASSERT(handle.id != HINA_INVALID_HANDLE && "pipeline pool exhausted");
   uint16_t idx = hina_id_index(handle.id);
   hina_pipeline_slot* e = HINA_PIPELINE_ENTRY(idx);
-  VkPipelineLayout layout = VK_NULL_HANDLE;
-  // Raw shader pipelines use explicit bind group layouts
-  e->reflection = NULL;
-  e->slot_bindings_allowed = 1;
-  // Use explicit bind group layouts (required for raw shader pipelines)
-  // Count derived from array - first invalid handle terminates (zero-init = use reflection)
-  uint32_t explicit_layout_count = hina_count_bind_group_layouts(desc->bind_group_layouts);
-  if (explicit_layout_count > 0)
-  {
-    e->reflection = hina_create_reflection_from_layouts(ctx, desc->bind_group_layouts, explicit_layout_count,
-                                                        default_stage_flags);
-    if (!e->reflection)
-    {
-      HINA_LOGW(ctx, "Failed to build reflection from explicit layouts; slot bindings disabled");
-      e->slot_bindings_allowed = 0;
-    }
-    // Production path: Use explicit bind group layouts
-    layout = hina_build_layout_from_explicit_bind_groups(ctx, desc->bind_group_layouts, explicit_layout_count,
-                                                         desc->push_constant_ranges, desc->push_constant_range_count,
-                                                         &e->push_constant_stages, &e->push_constant_size, NULL);
-    e->set_layout_count = explicit_layout_count;
-  }
-  if (!layout)
-  {
-    if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
-    e->reflection = NULL;
-    hina_pipeline_slot_free(idx);
-    return (hina_pipeline){HINA_INVALID_HANDLE};
-  }
+  VkPipelineLayout layout = hina_pipeline_setup_explicit_layouts(
+      ctx, e, idx, desc->bind_group_layouts,
+      desc->push_constant_ranges, desc->push_constant_range_count, default_stage_flags);
+  if (!layout) return (hina_pipeline){HINA_INVALID_HANDLE};
   // Get or create shader modules (temp modules will be destroyed after pipeline creation)
   struct { VkShaderModule mod; bool is_temp; } temp_mods[5] = {{0}};
   uint32_t temp_mod_count = 0;
@@ -16250,35 +17425,10 @@ static hina_pipeline hina_make_compute_pipeline_internal(hina_context* ctx, cons
   HINA_ASSERT(handle.id != HINA_INVALID_HANDLE && "pipeline pool exhausted");
   uint16_t idx = hina_id_index(handle.id);
   hina_pipeline_slot* e = HINA_PIPELINE_ENTRY(idx);
-  VkPipelineLayout layout = VK_NULL_HANDLE;
-  // Raw compute shader pipelines use explicit bind group layouts
-  e->reflection = NULL;
-  e->slot_bindings_allowed = 1;
-  // Use explicit bind group layouts (required for raw shader pipelines)
-  // Count derived from array - first invalid handle terminates (zero-init = use reflection)
-  uint32_t explicit_layout_count = hina_count_bind_group_layouts(desc->bind_group_layouts);
-  if (explicit_layout_count > 0)
-  {
-    e->reflection = hina_create_reflection_from_layouts(ctx, desc->bind_group_layouts, explicit_layout_count,
-                                                        VK_SHADER_STAGE_COMPUTE_BIT);
-    if (!e->reflection)
-    {
-      HINA_LOGW(ctx, "Failed to build reflection from explicit layouts; slot bindings disabled");
-      e->slot_bindings_allowed = 0;
-    }
-    // Production path: Use explicit bind group layouts
-    layout = hina_build_layout_from_explicit_bind_groups(ctx, desc->bind_group_layouts, explicit_layout_count,
-                                                         desc->push_constant_ranges, desc->push_constant_range_count,
-                                                         &e->push_constant_stages, &e->push_constant_size, NULL);
-    e->set_layout_count = explicit_layout_count;
-  }
-  if (!layout)
-  {
-    if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
-    e->reflection = NULL;
-    hina_pipeline_slot_free(idx);
-    return (hina_pipeline){HINA_INVALID_HANDLE};
-  }
+  VkPipelineLayout layout = hina_pipeline_setup_explicit_layouts(
+      ctx, e, idx, desc->bind_group_layouts,
+      desc->push_constant_ranges, desc->push_constant_range_count, VK_SHADER_STAGE_COMPUTE_BIT);
+  if (!layout) return (hina_pipeline){HINA_INVALID_HANDLE};
   // Get or create compute shader module (lazy caching - module stored in shader struct)
   // Note: cast from const to allow caching in the shader struct
   hina_shader* cs_shader = (hina_shader*)&desc->cs;
@@ -16315,7 +17465,7 @@ static VkCommandPool hina_get_cmd_pool(hina_context* ctx, hina_queue queue, uint
                    : (uint32_t)HINA_QUEUE_GRAPHICS;
     return ctx->cmd.immediate_cmd_pools[q];
   }
-  if (slot >= HINA_MAX_FRAMES_IN_FLIGHT) slot %= HINA_MAX_FRAMES_IN_FLIGHT;
+  if (slot >= ctx->core.device->config.frames_in_flight) slot %= ctx->core.device->config.frames_in_flight;
   if (queue == HINA_QUEUE_COMPUTE && ctx->cmd.compute_cmd_pools[slot]) return ctx->cmd.compute_cmd_pools[slot];
   return ctx->cmd.graphics_cmd_pools[slot];
 }
@@ -16326,7 +17476,7 @@ static hina_cmd_list* hina_get_cmd_list(hina_context* ctx, hina_queue queue, uin
                  ? (uint32_t)queue
                  : (uint32_t)HINA_QUEUE_GRAPHICS;
   if (immediate) return &ctx->cmd.immediate_cmds[q];
-  if (slot >= HINA_MAX_FRAMES_IN_FLIGHT) slot %= HINA_MAX_FRAMES_IN_FLIGHT;
+  if (slot >= ctx->core.device->config.frames_in_flight) slot %= ctx->core.device->config.frames_in_flight;
   return &ctx->cmd.available_cmds[q][slot];
 }
 
@@ -17010,6 +18160,13 @@ void hina_cmd_begin_pass(hina_cmd* cmd, const hina_pass_action* action)
   HINA_ASSERT(cmd->recording && "hina_cmd_begin_pass: command buffer must be recording");
   HINA_ASSERT(cmd->vk_cmd != VK_NULL_HANDLE);
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_begin_pass: already inside a render pass");
+#ifdef HINA_DEBUG
+  if (cmd->ctx->core.device->config.gpu_breadcrumbs)
+  {
+    hina_cmd_begin_label(cmd, "pass", NULL);
+    cmd->gpu_diag.pass_scope_active = true;
+  }
+#endif
   if (vkCmdBeginRendering) hina_cmd_begin_pass_dynamic(cmd, action);
   else hina_cmd_begin_pass_legacy(cmd, action);
 }
@@ -17249,6 +18406,13 @@ void hina_cmd_end_pass(hina_cmd* cmd)
   }
   if (vkCmdEndRendering) hina_cmd_end_pass_dynamic(cmd);
   else hina_cmd_end_pass_legacy(cmd);
+#ifdef HINA_DEBUG
+  if (cmd->gpu_diag.pass_scope_active)
+  {
+    hina_cmd_end_label(cmd);
+    cmd->gpu_diag.pass_scope_active = false;
+  }
+#endif
 }
 
 // Tile Pass System
@@ -18026,8 +19190,12 @@ bool hina_begin_tile_pass(hina_cmd* cmd, const hina_tile_pass_desc* desc)
 #endif
   (void)subpass_count; // Used in assert above
   // Debug label for tile pass (visible in GPU debuggers like RenderDoc)
-  cmd->tile.has_label = desc->label != NULL;
-  if (desc->label) hina_cmd_begin_label(cmd, desc->label, NULL);
+  const char* tile_label = desc->label;
+#ifdef HINA_DEBUG
+  if (!tile_label && cmd->ctx->core.device->config.gpu_breadcrumbs) tile_label = "tile_pass";
+#endif
+  cmd->tile.has_label = tile_label != NULL;
+  if (tile_label) hina_cmd_begin_label(cmd, tile_label, NULL);
   // Choose backend: dynamic local read if supported, fall back to legacy if depth_input unsupported
   const bool use_dynamic = hina_tile_can_use_dynamic_local_read_desc(desc);
   cmd->tile.uses_dynamic = use_dynamic;
@@ -18689,7 +19857,7 @@ hina_transient_bind_group hina_ctx_alloc_transient_bind_group(hina_context* ctx,
 #endif
   VkDescriptorSetLayout vk_layout = layout_slot->layout;
   // Get linear allocator for current frame
-  uint32_t frame_slot = (uint32_t)(ctx->frame.frame_index % HINA_MAX_FRAMES_IN_FLIGHT);
+  uint32_t frame_slot = (uint32_t)(ctx->frame.frame_index % ctx->core.device->config.frames_in_flight);
   hina_linear_desc_alloc* desc_alloc = &ctx->alloc.desc_allocs[frame_slot];
   // Allocate from linear pool (O(1) bump allocation)
   VkDescriptorSet set = hina_linear_desc_alloc_get(ctx, desc_alloc, vk_layout);
@@ -19018,7 +20186,7 @@ HINA_NOINLINE static void hina_flush_bindings_demo_path(hina_cmd* cmd)
     return;
   }
   // Get the linear allocator for this frame
-  uint32_t frame_slot = cmd->slot % HINA_MAX_FRAMES_IN_FLIGHT;
+  uint32_t frame_slot = cmd->slot % ctx->core.device->config.frames_in_flight;
   hina_linear_desc_alloc* desc_alloc = &ctx->alloc.desc_allocs[frame_slot];
   // Allocate descriptor sets for each set that has dirty bindings
   VkDescriptorSet allocated_sets[HINA_MAX_DESCRIPTOR_SETS] = {0};
@@ -19886,7 +21054,13 @@ void hina_cmd_draw(hina_cmd* cmd, uint32_t vtx_count, uint32_t instance_count, u
 {
   HINA_ZONE_N("draw");
   HINA_VALIDATE_GRAPHICS_CMD(cmd, "hina_cmd_draw");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "draw", true);
+#endif
   vkCmdDraw(cmd->vk_cmd, vtx_count, instance_count, first_vtx, first_instance);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
   // Stats (unconditional - no branch overhead)
   ++cmd->ctx->stats.draw_calls;
   cmd->ctx->stats.vertices_submitted += (uint64_t)vtx_count * instance_count;
@@ -19898,7 +21072,13 @@ void hina_cmd_draw_indexed(hina_cmd* cmd, uint32_t idx_count, uint32_t instance_
 {
   HINA_ZONE_N("draw_indexed");
   HINA_VALIDATE_GRAPHICS_CMD(cmd, "hina_cmd_draw_indexed");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "draw_indexed", true);
+#endif
   vkCmdDrawIndexed(cmd->vk_cmd, idx_count, instance_count, first_index, vertex_offset, first_instance);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
   // Stats (unconditional - no branch overhead)
   ++cmd->ctx->stats.draw_calls;
   cmd->ctx->stats.vertices_submitted += (uint64_t)idx_count * instance_count;
@@ -19912,7 +21092,13 @@ void hina_cmd_draw_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_t of
   HINA_VALIDATE_GRAPHICS_CMD(cmd, "hina_cmd_draw_indirect");
   hina_buffer_slot* buf_slot = hina_validate_indirect_buffer(cmd, indirect_buf, "hina_cmd_draw_indirect");
   if (!buf_slot) return;
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "draw_indirect", true);
+#endif
   vkCmdDrawIndirect(cmd->vk_cmd, buf_slot->vk.buffer, offset, draw_count, stride);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
   // Stats (vertex count unknown for indirect - only count draw calls)
   cmd->ctx->stats.draw_calls += draw_count;
   HINA_ZONE_END();
@@ -19925,7 +21111,13 @@ void hina_cmd_draw_indexed_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uin
   HINA_VALIDATE_GRAPHICS_CMD(cmd, "hina_cmd_draw_indexed_indirect");
   hina_buffer_slot* buf_slot = hina_validate_indirect_buffer(cmd, indirect_buf, "hina_cmd_draw_indexed_indirect");
   if (!buf_slot) return;
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "draw_indexed_indirect", true);
+#endif
   vkCmdDrawIndexedIndirect(cmd->vk_cmd, buf_slot->vk.buffer, offset, draw_count, stride);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
   // Stats (vertex count unknown for indirect - only count draw calls)
   cmd->ctx->stats.draw_calls += draw_count;
   HINA_ZONE_END();
@@ -20013,7 +21205,13 @@ void hina_cmd_dispatch(hina_cmd* cmd, uint32_t group_count_x, uint32_t group_cou
 {
   HINA_ZONE_N("dispatch");
   HINA_VALIDATE_COMPUTE_CMD(cmd, "hina_cmd_dispatch");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "dispatch", true);
+#endif
   vkCmdDispatch(cmd->vk_cmd, group_count_x, group_count_y, group_count_z);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
   ++cmd->ctx->stats.dispatch_calls;
   HINA_ZONE_END();
 }
@@ -20024,7 +21222,13 @@ void hina_cmd_dispatch_indirect(hina_cmd* cmd, hina_buffer indirect_buf, uint64_
   HINA_VALIDATE_COMPUTE_CMD(cmd, "hina_cmd_dispatch_indirect");
   hina_buffer_slot* buf_slot = hina_validate_indirect_buffer(cmd, indirect_buf, "hina_cmd_dispatch_indirect");
   if (!buf_slot) return;
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "dispatch_indirect", true);
+#endif
   vkCmdDispatchIndirect(cmd->vk_cmd, buf_slot->vk.buffer, offset);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
   ++cmd->ctx->stats.dispatch_calls;
   HINA_ZONE_END();
 }
@@ -20050,9 +21254,15 @@ void hina_cmd_dispatch_threads(hina_cmd* cmd, uint32_t thread_count_x, uint32_t 
   uint32_t gx = (thread_count_x + lx - 1) / lx;
   uint32_t gy = (thread_count_y + ly - 1) / ly;
   uint32_t gz = (thread_count_z + lz - 1) / lz;
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "dispatch_threads", true);
+#endif
   hina_validate_bindings(cmd, "hina_cmd_dispatch_threads");
   hina_flush_bindings(cmd);
   vkCmdDispatch(cmd->vk_cmd, gx, gy, gz);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
   ++cmd->ctx->stats.dispatch_calls;
   HINA_ZONE_END();
 }
@@ -20061,6 +21271,9 @@ void hina_cmd_copy_buffer(hina_cmd* cmd, hina_buffer src, hina_buffer dst, uint6
                           uint64_t size)
 {
   HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_buffer");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "copy_buffer", false);
+#endif
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_buffer: cannot copy buffers inside a render pass");
   HINA_ASSERTF(hina_buffer_slot_valid(src), "[%s] hina_cmd_copy_buffer: invalid src buffer",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_BUFFER));
@@ -20070,12 +21283,18 @@ void hina_cmd_copy_buffer(hina_cmd* cmd, hina_buffer src, hina_buffer dst, uint6
   uint16_t didx = hina_id_index(dst.id);
   hina_copy_buffer(cmd->vk_cmd, HINA_BUF_HOT(sidx)->vk.buffer, HINA_BUF_HOT(didx)->vk.buffer, src_offset, dst_offset,
                    size);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
 }
 
 void hina_cmd_copy_buffer_to_texture(hina_cmd* cmd, hina_buffer src, hina_texture dst, uint64_t buffer_offset,
                                      uint32_t mip_level, uint32_t array_layer)
 {
   HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_buffer_to_texture");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "copy_buffer_to_texture", false);
+#endif
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_buffer_to_texture: cannot copy inside a render pass");
   HINA_ASSERTF(hina_buffer_slot_valid(src), "[%s] hina_cmd_copy_buffer_to_texture: invalid src buffer",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_BUFFER));
@@ -20097,12 +21316,18 @@ void hina_cmd_copy_buffer_to_texture(hina_cmd* cmd, hina_buffer src, hina_textur
                               mip_width > 0 ? mip_width : 1, mip_height > 0 ? mip_height : 1,
                               mip_depth > 0 ? mip_depth : 1
                             });
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
 }
 
 void hina_cmd_copy_texture_to_buffer(hina_cmd* cmd, hina_texture src, hina_buffer dst, uint32_t mip_level,
                                      uint32_t array_layer, uint64_t buffer_offset)
 {
   HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_texture_to_buffer");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "copy_texture_to_buffer", false);
+#endif
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_texture_to_buffer: cannot copy inside a render pass");
   HINA_ASSERTF(hina_texture_slot_valid(src), "[%s] hina_cmd_copy_texture_to_buffer: invalid src texture",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_IMAGE));
@@ -20124,6 +21349,9 @@ void hina_cmd_copy_texture_to_buffer(hina_cmd* cmd, hina_texture src, hina_buffe
   hina_cmd_transition_texture(cmd, src, HINA_TEXSTATE_TRANSFER_SRC);
   hina_copy_image_to_buffer(cmd->vk_cmd, hot->vk.image, hot->state.layout, HINA_BUF_HOT(didx)->vk.buffer, buffer_offset,
                             subres, (VkOffset3D){0}, extent);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
 }
 
 void hina_cmd_copy_texture_to_buffer_region(hina_cmd* cmd, hina_texture src, hina_buffer dst, uint32_t mip_level,
@@ -20131,6 +21359,9 @@ void hina_cmd_copy_texture_to_buffer_region(hina_cmd* cmd, hina_texture src, hin
                                             uint32_t width, uint32_t height, uint64_t buffer_offset)
 {
   HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_texture_to_buffer_region");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "copy_texture_to_buffer_region", false);
+#endif
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_texture_to_buffer_region: cannot copy inside a render pass");
   HINA_ASSERTF(hina_texture_slot_valid(src), "[%s] hina_cmd_copy_texture_to_buffer_region: invalid src texture",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_IMAGE));
@@ -20182,12 +21413,18 @@ void hina_cmd_copy_texture_to_buffer_region(hina_cmd* cmd, hina_texture src, hin
   hina_cmd_transition_texture(cmd, src, HINA_TEXSTATE_TRANSFER_SRC);
   hina_copy_image_to_buffer(cmd->vk_cmd, hot->vk.image, hot->state.layout, HINA_BUF_HOT(didx)->vk.buffer, buffer_offset,
                             subres, offset, extent);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
 }
 
 void hina_cmd_copy_buffer_to_texture_3d(hina_cmd* cmd, hina_buffer src, hina_texture dst, uint64_t buffer_offset,
                                         uint32_t mip_level, uint32_t z_offset, uint32_t depth)
 {
   HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_buffer_to_texture_3d");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "copy_buffer_to_texture_3d", false);
+#endif
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_buffer_to_texture_3d: cannot copy inside a render pass");
   HINA_ASSERTF(hina_buffer_slot_valid(src), "[%s] hina_cmd_copy_buffer_to_texture_3d: invalid src buffer",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_BUFFER));
@@ -20211,12 +21448,18 @@ void hina_cmd_copy_buffer_to_texture_3d(hina_cmd* cmd, hina_buffer src, hina_tex
   hina_cmd_transition_texture(cmd, dst, HINA_TEXSTATE_TRANSFER_DST);
   hina_copy_buffer_to_image(cmd->vk_cmd, HINA_BUF_HOT(sidx)->vk.buffer, hot->vk.image, hot->state.layout, buffer_offset,
                             subres, offset, extent);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
 }
 
 void hina_cmd_copy_texture_to_buffer_3d(hina_cmd* cmd, hina_texture src, hina_buffer dst, uint32_t mip_level,
                                         uint32_t z_offset, uint32_t depth, uint64_t buffer_offset)
 {
   HINA_VALIDATE_CMD(cmd, "hina_cmd_copy_texture_to_buffer_3d");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "copy_texture_to_buffer_3d", false);
+#endif
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_copy_texture_to_buffer_3d: cannot copy inside a render pass");
   HINA_ASSERTF(hina_texture_slot_valid(src), "[%s] hina_cmd_copy_texture_to_buffer_3d: invalid src texture",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_IMAGE));
@@ -20240,12 +21483,18 @@ void hina_cmd_copy_texture_to_buffer_3d(hina_cmd* cmd, hina_texture src, hina_bu
   hina_cmd_transition_texture(cmd, src, HINA_TEXSTATE_TRANSFER_SRC);
   hina_copy_image_to_buffer(cmd->vk_cmd, hot->vk.image, hot->state.layout, HINA_BUF_HOT(didx)->vk.buffer, buffer_offset,
                             subres, offset, extent);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
 }
 
 void hina_cmd_blit_texture(hina_cmd* cmd, hina_texture src, hina_texture dst, uint32_t src_mip, uint32_t dst_mip,
                            hina_filter filter)
 {
   HINA_VALIDATE_CMD(cmd, "hina_cmd_blit_texture");
+#ifdef HINA_DEBUG
+  const bool gpu_diag_scope = hina_gpu_diag_auto_scope_begin(cmd, "blit_texture", false);
+#endif
   HINA_ASSERTF(!cmd->is_rendering, "hina_cmd_blit_texture: cannot blit inside a render pass");
   HINA_ASSERTF(hina_texture_slot_valid(src), "[%s] hina_cmd_blit_texture: invalid src texture",
                hina_debug_get_label(src.id, VK_OBJECT_TYPE_IMAGE));
@@ -20285,6 +21534,9 @@ void hina_cmd_blit_texture(hina_cmd* cmd, hina_texture src, hina_texture dst, ui
   };
   hina_blit_image(cmd->vk_cmd, sh->vk.image, sh->state.layout, dh->vk.image, dh->state.layout, src_subres, src_offsets,
                   dst_subres, dst_offsets, (VkFilter)filter);
+#ifdef HINA_DEBUG
+  hina_gpu_diag_auto_scope_end(cmd, gpu_diag_scope);
+#endif
 }
 
 // Submission / tickets
@@ -20616,6 +21868,30 @@ static void hina_debug_process_ownership_ops(hina_context* ctx, hina_cmd* cmd)
   cmd->ownership_debug.count = 0; // Clear for potential reuse
 }
 #endif
+static void hina_submit_cleanup_cmd(hina_context* ctx, hina_cmd* cmd)
+{
+#ifdef HINA_DEBUG
+  hina_gpu_diag_cmd_untrack(cmd);
+  hina_gpu_diag_free_cmd_blocks(cmd->gpu_diag.head);
+  hina_gpu_diag_cmd_clear(cmd);
+#endif
+  hina_cmd_flush_deferred_destroys(ctx, cmd, 0);
+}
+// Returns true if submit failed and the caller should clean up and return.
+// Does NOT call HINA_ZONE_END() — caller must do that (Tracy zone scope).
+static bool hina_submit_check_failure(hina_context* ctx, hina_cmd* cmd, hina_submission_entry* slot,
+                                       VkResult result, const char* diag_origin, const char* check_fn_name)
+{
+  if (result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, diag_origin, result);
+  if (HINA_UNLIKELY(result != VK_SUCCESS) && !hina_vk_check_with_msg(
+    ctx, result, check_fn_name, __FILE__, __LINE__, "queue submit failed"))
+  {
+    hina_submit_cleanup_cmd(ctx, cmd);
+    hina_release_submission_slot(slot);
+    return true;
+  }
+  return false;
+}
 static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, const VkSemaphore* extra_wait_sems,
                                            const VkPipelineStageFlags* extra_wait_stages, uint32_t extra_wait_count,
                                            const VkSemaphore* extra_signal_sems, uint32_t extra_signal_count,
@@ -20640,7 +21916,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
       hina_atomic_dec32(&owner_ctx->cmd.immediate_active[q]);
     }
     HINA_LOGE(ctx, "submission queue full");
-    hina_cmd_flush_deferred_destroys(ctx, cmd, 0);
+    hina_submit_cleanup_cmd(ctx, cmd);
     HINA_ZONE_END();
     return 0;
   }
@@ -20657,7 +21933,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
   if (!is_immediate)
   {
     fence_slot = cmd->cmd_pool_index;
-    if (fence_slot >= HINA_MAX_FRAMES_IN_FLIGHT) fence_slot %= HINA_MAX_FRAMES_IN_FLIGHT;
+    if (fence_slot >= ctx->core.device->config.frames_in_flight) fence_slot %= ctx->core.device->config.frames_in_flight;
   }
   uint64_t ticket = 0;
   uint64_t timeline_value = 0;
@@ -20771,38 +22047,8 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
       lane->submit_count++;
     }
     hina_lane_unlock(lane);
-    if (submit_result == VK_ERROR_DEVICE_LOST && g_debug_caps.has_device_fault)
+    if (hina_submit_check_failure(ctx, cmd, slot, submit_result, "queue_submit2", "vkQueueSubmit2"))
     {
-      VkDeviceFaultCountsEXT counts = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
-      if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, NULL) == VK_SUCCESS)
-      {
-        VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
-        VkDeviceFaultAddressInfoEXT* addrs = NULL;
-        VkDeviceFaultVendorInfoEXT* vendors = NULL;
-        void* vendor_bin = NULL;
-        if (counts.addressInfoCount)
-          addrs = (VkDeviceFaultAddressInfoEXT*)hina_alloc_host(
-            sizeof(VkDeviceFaultAddressInfoEXT) * counts.addressInfoCount);
-        if (counts.vendorInfoCount)
-          vendors = (VkDeviceFaultVendorInfoEXT*)hina_alloc_host(
-            sizeof(VkDeviceFaultVendorInfoEXT) * counts.vendorInfoCount);
-        if (counts.vendorBinarySize) vendor_bin = hina_alloc_host(counts.vendorBinarySize);
-        info.pAddressInfos = addrs;
-        info.pVendorInfos = vendors;
-        info.pVendorBinaryData = vendor_bin;
-        if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, &info) == VK_SUCCESS)
-          HINA_LOGE(ctx, "device fault occurred (desc=%s)", info.description);
-        hina_free_host(addrs);
-        hina_free_host(vendors);
-        hina_free_host(vendor_bin);
-      }
-      HINA_FATAL("VK_ERROR_DEVICE_LOST in vkQueueSubmit2");
-    }
-    if (HINA_UNLIKELY(submit_result != VK_SUCCESS) && !hina_vk_check_with_msg(
-      ctx, submit_result, "vkQueueSubmit2", __FILE__, __LINE__, "queue submit failed"))
-    {
-      hina_cmd_flush_deferred_destroys(ctx, cmd, 0);
-      hina_release_submission_slot(slot);
       HINA_ZONE_END();
       return 0;
     }
@@ -20917,38 +22163,8 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
       lane->submit_count++;
     }
     hina_lane_unlock(lane);
-    if (submit_result == VK_ERROR_DEVICE_LOST && g_debug_caps.has_device_fault)
+    if (hina_submit_check_failure(ctx, cmd, slot, submit_result, "queue_submit", "vkQueueSubmit"))
     {
-      VkDeviceFaultCountsEXT counts = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
-      if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, NULL) == VK_SUCCESS)
-      {
-        VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
-        VkDeviceFaultAddressInfoEXT* addrs = NULL;
-        VkDeviceFaultVendorInfoEXT* vendors = NULL;
-        void* vendor_bin = NULL;
-        if (counts.addressInfoCount)
-          addrs = (VkDeviceFaultAddressInfoEXT*)hina_alloc_host(
-            sizeof(VkDeviceFaultAddressInfoEXT) * counts.addressInfoCount);
-        if (counts.vendorInfoCount)
-          vendors = (VkDeviceFaultVendorInfoEXT*)hina_alloc_host(
-            sizeof(VkDeviceFaultVendorInfoEXT) * counts.vendorInfoCount);
-        if (counts.vendorBinarySize) vendor_bin = hina_alloc_host(counts.vendorBinarySize);
-        info.pAddressInfos = addrs;
-        info.pVendorInfos = vendors;
-        info.pVendorBinaryData = vendor_bin;
-        if (vkGetDeviceFaultInfoEXT(ctx->core.device->core.device, &counts, &info) == VK_SUCCESS)
-          HINA_LOGE(ctx, "device fault occurred (desc=%s)", info.description);
-        hina_free_host(addrs);
-        hina_free_host(vendors);
-        hina_free_host(vendor_bin);
-      }
-      HINA_FATAL("VK_ERROR_DEVICE_LOST in vkQueueSubmit");
-    }
-    if (HINA_UNLIKELY(submit_result != VK_SUCCESS) && !hina_vk_check_with_msg(
-      ctx, submit_result, "vkQueueSubmit", __FILE__, __LINE__, "queue submit failed"))
-    {
-      hina_cmd_flush_deferred_destroys(ctx, cmd, 0);
-      hina_release_submission_slot(slot);
       HINA_ZONE_END();
       return 0;
     }
@@ -20965,6 +22181,11 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
       hina_atomic_store64(&ctx->core.device->sync.timeline.slot_values[fence_slot][lane_idx], (int64_t)timeline_value);
     }
   }
+#ifdef HINA_DEBUG
+  hina_gpu_diag_publish_submit(ctx, cmd, (uint8_t)lane_idx, cmd->queue, ticket, timeline_value,
+                               is_immediate ? "immediate_submit" : "frame_submit", is_immediate,
+                               cmd->uses_swapchain);
+#endif
   slot->ticket = ticket;
   slot->timeline_value = timeline_value;
   slot->fence = has_timeline ? VK_NULL_HANDLE : submit_fence;
@@ -21037,11 +22258,13 @@ void hina_ctx_wait_ticket(hina_context* ctx, hina_ticket ticket)
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &lane->timeline,
         .pValues = &local.timeline_value
       };
-      vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+      VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+      if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "wait_ticket", wait_result);
     }
     else
     {
-      vkWaitForFences(ctx->core.device->core.device, 1, &local.fence, VK_TRUE, UINT64_MAX);
+      VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &local.fence, VK_TRUE, UINT64_MAX);
+      if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "wait_ticket", wait_result);
     }
     hina_release_submission_local(ctx, &local);
     if (claimed) hina_submission_release_slot(claimed);
@@ -21054,13 +22277,15 @@ void hina_ctx_wait_ticket(hina_context* ctx, hina_ticket ticket)
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &lane->timeline,
         .pValues = &raw_value
       };
-      vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+      VkResult wait_result = vkWaitSemaphores(ctx->core.device->core.device, &wi, UINT64_MAX);
+      if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "wait_ticket", wait_result);
     }
     else if (lane->fallback)
     {
       uint32_t slot = (uint32_t)(raw_value & HINA_LANE_FENCE_RING_MASK);
       VkFence fence = lane->fallback->fences[slot];
-      vkWaitForFences(ctx->core.device->core.device, 1, &fence, VK_TRUE, UINT64_MAX);
+      VkResult wait_result = vkWaitForFences(ctx->core.device->core.device, 1, &fence, VK_TRUE, UINT64_MAX);
+      if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "wait_ticket", wait_result);
       hina_lane_fence_poll(ctx, lane);
     }
   }
@@ -21073,7 +22298,7 @@ void hina_ctx_wait_ticket(hina_context* ctx, hina_ticket ticket)
     }
   }
   hina_staging_ctx_process_retired(ctx);
-  hina_flush_zombies(ctx, (uint32_t)(ctx->frame.frame_index % HINA_MAX_FRAMES_IN_FLIGHT));
+  hina_flush_zombies(ctx, (uint32_t)(ctx->frame.frame_index % ctx->core.device->config.frames_in_flight));
 }
 
 void hina_wait_ticket(hina_ticket ticket)
@@ -21128,7 +22353,7 @@ hina_swapchain_image hina_ctx_frame_begin_ex(hina_context* ctx, hina_frame_flags
                "hina_ctx_frame_begin: called while frame already in progress (missing hina_frame_end?)");
   ctx->frame.frame_index++;
   ctx->frame.explicit_frame_lifecycle = true;
-  uint32_t slot = (uint32_t)(ctx->frame.frame_index % HINA_MAX_FRAMES_IN_FLIGHT);
+  uint32_t slot = (uint32_t)(ctx->frame.frame_index % ctx->core.device->config.frames_in_flight);
   ctx->frame.current_slot = slot;
   HINA_FRAME_DBG(ctx, "FRAME_BEGIN: frame_index=%llu, slot=%u", (unsigned long long)ctx->frame.frame_index, slot);
   hina_wait_frame_slot(ctx, slot);
@@ -21137,14 +22362,14 @@ hina_swapchain_image hina_ctx_frame_begin_ex(hina_context* ctx, hina_frame_flags
   // PERF: We don't use VK_QUERY_RESULT_WAIT_BIT because hina_wait_frame_slot() already
   // waited on the fence for this slot. Once the fence is signaled, queries from that
   // command buffer are guaranteed complete. This avoids redundant GPU-CPU sync.
-  if (ctx->stats.gpu_time_pool && ctx->frame.frame_index > HINA_MAX_FRAMES_IN_FLIGHT)
+  if (ctx->stats.gpu_time_pool && ctx->frame.frame_index > ctx->core.device->config.frames_in_flight)
   {
     uint64_t ts[2] = {0, 0};
     VkResult r = vkGetQueryPoolResults(ctx->core.device->core.device, ctx->stats.gpu_time_pool, slot * 2, 2, sizeof(ts),
                                        ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
     if (r == VK_SUCCESS && ts[1] > ts[0]) ctx->stats.gpu_time_ms = hina_timestamp_to_ns(ts[1] - ts[0]) / 1000000.0;
   }
-  else if (ctx->frame.frame_index <= HINA_MAX_FRAMES_IN_FLIGHT)
+  else if (ctx->frame.frame_index <= ctx->core.device->config.frames_in_flight)
   {
     ctx->stats.gpu_time_ms = 0.0;
   }
@@ -21701,19 +22926,21 @@ uint64_t hina_get_completed_frame_index(void)
 {
   if (!g_hina_ctx.core.device) return 0;
   // The completed frame is the one where GPU work has finished.
-  // With our ring buffer of HINA_MAX_FRAMES_IN_FLIGHT slots,
-  // the oldest in-flight frame is (current - MAX_FRAMES_IN_FLIGHT + 1).
+  // With our ring buffer of frames_in_flight slots (2 or 3),
+  // the oldest in-flight frame is (current - frames_in_flight + 1).
   // When we wait on a slot in frame_begin, that frame becomes complete.
-  //
-  // Example with 3 slots:
-  //   frame_index = 5 → slot 2, waiting on slot 2 = frame 2 completes
-  //   completed_frame = frame_index - MAX_FRAMES_IN_FLIGHT = 5 - 3 = 2
-  //
-  if (g_hina_ctx.frame.frame_index < HINA_MAX_FRAMES_IN_FLIGHT)
+  uint32_t fif = g_hina_ctx.core.device->config.frames_in_flight;
+  if (g_hina_ctx.frame.frame_index < fif)
   {
     return 0; // Not enough frames have passed for any to complete
   }
-  return g_hina_ctx.frame.frame_index - HINA_MAX_FRAMES_IN_FLIGHT;
+  return g_hina_ctx.frame.frame_index - fif;
+}
+
+uint32_t hina_get_frames_in_flight(void)
+{
+  if (!g_hina_ctx.core.device) return HINA_MAX_FRAMES_IN_FLIGHT;
+  return g_hina_ctx.core.device->config.frames_in_flight;
 }
 
 // GPU-side Cross-Queue Dependencies
@@ -21833,43 +23060,11 @@ void hina_free_pipeline_cache_data(void* data)
 static void hina_destroy_swapchain(hina_context* ctx)
 {
   VkResult wait_result = vkDeviceWaitIdle(ctx->core.device->core.device);
-  HINA_FATAL_IF(wait_result == VK_ERROR_DEVICE_LOST);
+  if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "swapchain_wait_idle", wait_result);
   HINA_ASSERT(wait_result == VK_SUCCESS);
   hina_staging_ctx_process_retired(ctx);
   // Clean up legacy render pass / framebuffer caches (may be used even if backend_kind isn't legacy)
-  hina_rp_cache_table* rp_table = hina_atomic_load_ptr(&ctx->core.device->core.backend.legacy.rp.table);
-  if (rp_table)
-  {
-    for (uint32_t i = 0; i < HINA_RP_CACHE_SIZE; ++i)
-    {
-      if (rp_table->entries[i].rp)
-      {
-        vkDestroyRenderPass(ctx->core.device->core.device, rp_table->entries[i].rp, NULL);
-      }
-    }
-    hina_free_host(rp_table);
-    hina_atomic_store_ptr(&ctx->core.device->core.backend.legacy.rp.table, NULL);
-  }
-  hina_fb_cache_table* fb_table = hina_atomic_load_ptr(&ctx->core.device->core.backend.legacy.fb.table);
-  if (fb_table)
-  {
-    for (uint32_t i = 0; i < HINA_FB_CACHE_SIZE; ++i)
-    {
-      if (fb_table->entries[i].fb)
-      {
-        vkDestroyFramebuffer(ctx->core.device->core.device, fb_table->entries[i].fb, NULL);
-      }
-    }
-    for (uint32_t i = 0; i < HINA_FB_CACHE_SIZE; ++i)
-    {
-      if (fb_table->overflow[i].attachments)
-      {
-        hina_free_host(fb_table->overflow[i].attachments);
-      }
-    }
-    hina_free_host(fb_table);
-    hina_atomic_store_ptr(&ctx->core.device->core.backend.legacy.fb.table, NULL);
-  }
+  hina_destroy_legacy_rp_fb_caches(ctx->core.device);
   if (ctx->core.device->surface.swapchain.vk.swapchain)
   {
     for (uint32_t i = 0; i < ctx->core.device->surface.swapchain.state.image_count; ++i)
@@ -22397,6 +23592,7 @@ static hina_swapchain_image hina_ctx_acquire_swapchain_image(hina_context* ctx)
 #ifdef __ANDROID__
   if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS; // Android: allow suboptimal for pre-rotation
 #endif
+  if (r == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "acquire_swapchain_image", r);
   if (r == VK_ERROR_SURFACE_LOST_KHR || (r < 0 && r != VK_ERROR_OUT_OF_DATE_KHR))
   {
     HINA_LOGW(ctx, "Surface lost (VkResult=%d), marking for recreation", (int)r);
@@ -22457,6 +23653,10 @@ static void hina_ctx_present(hina_context* ctx, hina_swapchain_image image)
     const hina_swapchain_desc* sd = &ctx->core.device->surface.swapchain_desc;
     hina_create_swapchain(ctx, sd);
   }
+  else if (r == VK_ERROR_DEVICE_LOST)
+  {
+    hina_gpu_diag_capture_device_lost(ctx, "queue_present", r);
+  }
   else if (r == VK_ERROR_SURFACE_LOST_KHR || (r < 0 && r != VK_ERROR_OUT_OF_DATE_KHR && r != VK_SUBOPTIMAL_KHR))
   {
     HINA_LOGW(ctx, "Surface lost during present (VkResult=%d), marking for recreation", (int)r);
@@ -22489,7 +23689,9 @@ bool hina_ctx_recreate_surface(hina_context* ctx, void* native_window, void* nat
   }
   HINA_LOGI(ctx, "Recreating surface with new native_window=%p", native_window);
   // Wait for all GPU work to complete before destroying anything
-  vkDeviceWaitIdle(ctx->core.device->core.device);
+  VkResult wait_result = vkDeviceWaitIdle(ctx->core.device->core.device);
+  if (wait_result == VK_ERROR_DEVICE_LOST) hina_gpu_diag_capture_device_lost(ctx, "recreate_surface_wait_idle", wait_result);
+  HINA_ASSERT(wait_result == VK_SUCCESS);
   // Destroy old swapchain
   hina_destroy_swapchain(ctx);
   // Destroy old surface
@@ -22872,6 +24074,7 @@ void hina_cmd_begin_label(hina_cmd* cmd, const char* name, float color[4])
 {
 #ifdef HINA_DEBUG
   HINA_ASSERT(cmd && name);
+  hina_gpu_diag_cmd_record(cmd, HINA_GPU_DIAG_EVENT_SCOPE_BEGIN, name);
   if (cmd->ctx->core.device->config.has_debug_utils)
   {
     VkDebugUtilsLabelEXT label = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = name};
@@ -22887,6 +24090,7 @@ void hina_cmd_end_label(hina_cmd* cmd)
 {
 #ifdef HINA_DEBUG
   HINA_ASSERT(cmd);
+  hina_gpu_diag_cmd_record(cmd, HINA_GPU_DIAG_EVENT_SCOPE_END, NULL);
   if (cmd->ctx->core.device->config.has_debug_utils)
   {
     vkCmdEndDebugUtilsLabelEXT(cmd->vk_cmd);
@@ -22900,6 +24104,7 @@ void hina_cmd_insert_label(hina_cmd* cmd, const char* name, float color[4])
 {
 #ifdef HINA_DEBUG
   HINA_ASSERT(cmd && name);
+  hina_gpu_diag_cmd_record(cmd, HINA_GPU_DIAG_EVENT_MARKER, name);
   if (cmd->ctx->core.device->config.has_debug_utils)
   {
     VkDebugUtilsLabelEXT label = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, .pLabelName = name};
@@ -22941,6 +24146,7 @@ const hina_debug_caps* hina_get_debug_caps(void)
   g_debug_caps.uses_dynamic_rendering = vkCmdBeginRendering != NULL;
   g_debug_caps.uses_timeline_semaphore = vkWaitSemaphores != NULL;
   g_debug_caps.has_dedicated_compute = g_hina_ctx.core.device->queue.has_dedicated_compute;
+  g_debug_caps.uses_gpu_breadcrumbs = g_hina_ctx.core.device->diagnostics.enabled;
   return &g_debug_caps;
 }
 

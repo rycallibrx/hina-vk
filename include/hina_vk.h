@@ -718,7 +718,11 @@ typedef enum
   // Force legacy multi-subpass VkRenderPass for tile passes instead of
   // VK_KHR_dynamic_rendering_local_read. Tests Vulkan 1.0-1.3 compatibility.
   HINA_DEBUG_FORCE_LEGACY_TILE_PASS_BIT  = HINA_FLAG_BIT(14),
-  // bits 15-31 reserved for future debug flags
+  // Enable debug-only GPU breadcrumb tracking and crash reporting.
+  HINA_DEBUG_GPU_BREADCRUMBS_BIT         = HINA_FLAG_BIT(15),
+  // Enable extra GPU breadcrumb detail and vendor auto-checkpoint features.
+  HINA_DEBUG_GPU_BREADCRUMBS_AUTO_BIT    = HINA_FLAG_BIT(16),
+  // bits 17-31 reserved for future debug flags
 } hina_debug_flags;
 
 /**
@@ -768,6 +772,10 @@ typedef struct hina_desc
   // specific Vulkan versions. When set, the library will not use features from
   // higher versions even if the device supports them.
   hina_vk_version max_api_version;
+  // Number of frames the CPU can pipeline ahead of the GPU (2 or 3, default 0 = 3).
+  // Lower values reduce input latency at the cost of slightly more CPU stalls.
+  // The application MUST rotate its own per-frame resources at this same period.
+  uint32_t frames_in_flight;
 } hina_desc;
 
 // Defaults: .staging_buffer_size = 16MB, .gpu_block_size = 64MB
@@ -869,10 +877,13 @@ typedef struct hina_debug_caps
   bool has_memory_budget; // VK_EXT_memory_budget (accurate GPU memory tracking)
   bool has_maintenance4; // VK_KHR_maintenance4 or 1.3+ (query mem reqs without object)
   bool has_maintenance5; // VK_KHR_maintenance5 or 1.4+ (inline shader modules)
+  bool has_nv_checkpoints; // VK_NV_device_diagnostic_checkpoints
+  bool has_nv_diagnostics_config; // VK_NV_device_diagnostics_config
   // Active usage flags (set after volkLoadDevice from function pointers)
   bool uses_synchronization2; // Using vkQueueSubmit2/vkCmdPipelineBarrier2
   bool uses_dynamic_rendering; // Using VK_KHR_dynamic_rendering (vs legacy render passes)
   bool uses_timeline_semaphore; // Using timeline semaphores for sync
+  bool uses_gpu_breadcrumbs; // Debug-only GPU breadcrumb system active
   // Queue topology
   bool has_dedicated_compute; // Compute queue is separate from graphics (async compute)
 } hina_debug_caps;
@@ -1254,6 +1265,14 @@ HINA_API uint64_t hina_get_frame_index(void);
  * @return Last completed frame index, or 0 if no frames have completed.
  */
 HINA_API uint64_t hina_get_completed_frame_index(void);
+
+/**
+ * @brief Get the active frames-in-flight count (2 or 3).
+ *
+ * Applications MUST rotate their own per-frame resources (uniform buffers,
+ * descriptor sets, etc.) at this period: frame_index % hina_get_frames_in_flight().
+ */
+HINA_API uint32_t hina_get_frames_in_flight(void);
 
 // Memory placement - where the buffer lives (enum, not combinable)
 typedef enum
