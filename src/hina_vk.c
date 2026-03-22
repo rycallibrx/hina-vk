@@ -253,6 +253,11 @@ void  hina_tracy_vk_context_name(void* ctx, const char* name);
 // MSVC 17.8+ has C11 threads
 #include <threads.h>
 #define HINA_HAS_C11_THREADS 1
+#ifdef _WIN32
+#define HINA_CURRENT_THREAD_ID() ((unsigned long)GetCurrentThreadId())
+#else
+#define HINA_CURRENT_THREAD_ID() ((unsigned long)(uintptr_t)pthread_self())
+#endif
 #else
 // All other platforms: use POSIX pthreads or Win32 APIs directly.
 // This avoids fragile C11 <threads.h> detection and Android Bionic quirks
@@ -277,6 +282,7 @@ static int mtx_unlock(mtx_t* mtx) { LeaveCriticalSection(mtx); return 0; }
 static void mtx_destroy(mtx_t* mtx) { DeleteCriticalSection(mtx); }
 
 static thrd_t thrd_current(void) { return GetCurrentThreadId(); }
+#define HINA_CURRENT_THREAD_ID() ((unsigned long)GetCurrentThreadId())
 
 static int thrd_equal(thrd_t a, thrd_t b) { return a == b; }
 
@@ -309,6 +315,7 @@ static int mtx_unlock(mtx_t* mtx) { return pthread_mutex_unlock(mtx) == 0 ? 0 : 
 static void mtx_destroy(mtx_t* mtx) { pthread_mutex_destroy(mtx); }
 
 static thrd_t thrd_current(void) { return pthread_self(); }
+#define HINA_CURRENT_THREAD_ID() ((unsigned long)(uintptr_t)pthread_self())
 
 static int thrd_equal(thrd_t a, thrd_t b) { return pthread_equal(a, b); }
 
@@ -404,6 +411,11 @@ static HINA_INLINE int64_t hina_atomic_inc64(hina_atomic64_t* ptr) { return _Int
 
 /* Returns the OLD value. */
 static HINA_INLINE int64_t hina_atomic_cas64(hina_atomic64_t* ptr, int64_t old_val, int64_t new_val) { return _InterlockedCompareExchange64(ptr, new_val, old_val); }
+
+static HINA_INLINE int64_t hina_atomic_add64(hina_atomic64_t* ptr, int64_t delta)
+{
+  return _InterlockedExchangeAdd64(ptr, delta) + delta;
+}
 #else
 
 // GCC / Clang Implementation
@@ -457,6 +469,11 @@ static HINA_INLINE int64_t hina_atomic_cas64(hina_atomic64_t* ptr, int64_t old_v
   int64_t expected = old_val;
   __atomic_compare_exchange_n(ptr, &expected, new_val, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
   return expected;
+}
+
+static HINA_INLINE int64_t hina_atomic_add64(hina_atomic64_t* ptr, int64_t delta)
+{
+  return __atomic_add_fetch(ptr, delta, __ATOMIC_ACQ_REL);
 }
 #endif
 // Atomic Pointer Helpers (64-bit only)
@@ -606,6 +623,123 @@ static HINA_INLINE uint64_t hina_get_time_ns(void)
 #else
   return 0; // Fallback: no timing available
 #endif
+}
+
+static HINA_INLINE void hina_atomic_max64(hina_atomic64_t* ptr, uint64_t value)
+{
+  uint64_t prev = (uint64_t)hina_atomic_load64(ptr);
+  while (value > prev)
+  {
+    int64_t observed = hina_atomic_cas64(ptr, (int64_t)prev, (int64_t)value);
+    if ((uint64_t)observed == prev) break;
+    prev = (uint64_t)observed;
+  }
+}
+
+static HINA_INLINE void hina_atomic_max32(hina_atomic32_t* ptr, uint32_t value)
+{
+  uint32_t prev = (uint32_t)hina_atomic_load32(ptr);
+  while (value > prev)
+  {
+    int32_t observed = hina_atomic_cas32(ptr, (int32_t)prev, (int32_t)value);
+    if ((uint32_t)observed == prev) break;
+    prev = (uint32_t)observed;
+  }
+}
+
+typedef struct hina_internal_profile
+{
+  bool enabled;
+  bool initialized;
+  uint8_t pad_[6];
+
+  hina_atomic64_t upload_find_calls;
+  hina_atomic64_t upload_find_ns;
+  hina_atomic64_t upload_find_probes;
+
+  hina_atomic64_t retired_process_calls;
+  hina_atomic64_t retired_process_ns;
+  hina_atomic64_t retired_process_scanned;
+  hina_atomic64_t retired_process_released;
+
+  hina_atomic64_t context_init_calls;
+  hina_atomic64_t context_init_ns;
+
+  hina_atomic64_t frame_arena_blocks_created;
+  hina_atomic64_t frame_arena_bytes_created;
+
+  hina_atomic64_t desc_blocks_created;
+  hina_atomic64_t desc_sets_capacity_created;
+
+  hina_atomic64_t page_pool_pages_created;
+  hina_atomic64_t page_pool_pages_destroyed;
+  hina_atomic32_t page_pool_peak_total;
+  hina_atomic32_t page_pool_peak_free;
+} hina_internal_profile;
+
+static hina_internal_profile g_hina_profile = {0};
+
+static bool hina_env_is_truthy(const char* value)
+{
+  if (!value || !value[0]) return false;
+  if (strcmp(value, "1") == 0) return true;
+  if (strcmp(value, "true") == 0) return true;
+  if (strcmp(value, "TRUE") == 0) return true;
+  if (strcmp(value, "yes") == 0) return true;
+  if (strcmp(value, "YES") == 0) return true;
+  if (strcmp(value, "on") == 0) return true;
+  if (strcmp(value, "ON") == 0) return true;
+  return false;
+}
+
+static void hina_profile_init_once(void)
+{
+  if (g_hina_profile.initialized) return;
+  memset(&g_hina_profile, 0, sizeof(g_hina_profile));
+  g_hina_profile.enabled = hina_env_is_truthy(getenv("HINA_INTERNAL_PROFILE"));
+  g_hina_profile.initialized = true;
+}
+
+static HINA_INLINE bool hina_profile_enabled(void)
+{
+  return g_hina_profile.enabled;
+}
+
+static void hina_profile_dump(void)
+{
+  if (!g_hina_profile.enabled) return;
+
+  fprintf(stderr, "\n=== HinaVK Internal CPU Profile ===\n");
+  fprintf(stderr,
+          "upload_find calls=%llu total_ns=%llu probes=%llu\n",
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.upload_find_calls),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.upload_find_ns),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.upload_find_probes));
+  fprintf(stderr,
+          "retired_process calls=%llu total_ns=%llu scanned=%llu released=%llu\n",
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.retired_process_calls),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.retired_process_ns),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.retired_process_scanned),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.retired_process_released));
+  fprintf(stderr,
+          "context_init calls=%llu total_ns=%llu\n",
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.context_init_calls),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.context_init_ns));
+  fprintf(stderr,
+          "frame_arena blocks=%llu bytes=%llu\n",
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.frame_arena_blocks_created),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.frame_arena_bytes_created));
+  fprintf(stderr,
+          "descriptor_blocks blocks=%llu set_capacity=%llu\n",
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.desc_blocks_created),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.desc_sets_capacity_created));
+  fprintf(stderr,
+          "page_pool created=%llu destroyed=%llu peak_total=%u peak_free=%u\n",
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.page_pool_pages_created),
+          (unsigned long long)hina_atomic_load64(&g_hina_profile.page_pool_pages_destroyed),
+          (uint32_t)hina_atomic_load32(&g_hina_profile.page_pool_peak_total),
+          (uint32_t)hina_atomic_load32(&g_hina_profile.page_pool_peak_free));
+  fprintf(stderr, "==================================\n\n");
 }
 
 static HINA_INLINE void hina_spin_lock(hina_spinlock* lock)
@@ -947,7 +1081,8 @@ HINA_STATIC_ASSERT(sizeof(hina_depth_bias_state) == 16, hina_depth_bias_state_si
 HINA_STATIC_ASSERT((HINA_PERSISTENT_ALLOC_ALIGN & (HINA_PERSISTENT_ALLOC_ALIGN - 1u)) == 0,
                    persistent_alloc_align_must_be_pow2);
 // Sentinel for freelist termination and invalid arena offsets
-#define HINA_SLOT_FREE_SENTINEL     UINT16_MAX
+#define HINA_SLOT_FREE_SENTINEL             UINT16_MAX
+#define HINA_SLOT_PENDING_DESTROY_SENTINEL  (UINT16_MAX - 1)
 // Upload ticket state
 #define HINA_UPLOAD_TICKET_NONE UINT64_C(0)
 
@@ -2382,8 +2517,14 @@ typedef enum hina_zombie_kind
   HINA_ZOMBIE_BIND_GROUP_LAYOUT = 6, // vkDestroyDescriptorSetLayout (handle=VkDescriptorSetLayout)
   HINA_ZOMBIE_RENDER_PASS = 7, // vkDestroyRenderPass (handle=VkRenderPass)
   HINA_ZOMBIE_FRAMEBUFFER = 8, // vkDestroyFramebuffer (handle=VkFramebuffer)
-  // NOTE: HINA_ZOMBIE_TEXTURE uses this because it needs 3 handles
-  // (VkImage + VkImageView + VmaAllocation) which don't fit in 16 bytes
+  // Slot-index-based kinds: handle = pool slot index. Zombie reads hot data from
+  // the slot (still valid in PENDING_DESTROY state), destroys resources, then frees the slot.
+  HINA_ZOMBIE_SLOT_TEXTURE = 9,
+  HINA_ZOMBIE_SLOT_BUFFER = 10,
+  HINA_ZOMBIE_SLOT_SAMPLER = 11,
+  HINA_ZOMBIE_SLOT_PIPELINE = 12,
+  HINA_ZOMBIE_SLOT_QUERY_POOL = 13,
+  HINA_ZOMBIE_SLOT_BIND_GROUP = 14,
   HINA_ZOMBIE_CUSTOM = 255 // Fallback: uses function pointer + payload
 } hina_zombie_kind;
 
@@ -3096,6 +3237,18 @@ typedef struct hina_device
   void* tracy_vk_ctx;
 } hina_device;
 
+#define HINA_MAX_TRANSFER_CONTEXTS 8
+
+typedef enum hina_context_kind {
+  HINA_CTX_ROOT,      // The global g_hina_ctx — owns the device
+  HINA_CTX_RECORDING, // Frame-synced child for parallel command recording
+  HINA_CTX_TRANSFER   // Frame-independent child for async uploads
+} hina_context_kind;
+
+#define HINA_ASSERT_NOT_TRANSFER(ctx, fn_name) \
+  HINA_ASSERTF((ctx)->core.kind != HINA_CTX_TRANSFER, \
+    fn_name ": not valid on a transfer context — use a recording context")
+
 // CONTEXT: Render context (semantic namespaces)
 typedef struct hina_context
 {
@@ -3104,7 +3257,8 @@ typedef struct hina_context
   {
     hina_device* device;
     bool owns_device, initialized;
-    uint8_t pad_[6];
+    hina_context_kind kind;
+    uint8_t pad_[2];
   } core;
 
   // Frame tracking
@@ -3179,13 +3333,15 @@ typedef struct hina_context
   } stats;
 
   // Context hierarchy for collective frame management
-  // Child contexts are auto-registered with parent and managed collectively
+  // Recording contexts (children[]): frame-synced, managed by hina_frame_begin/end
+  // Transfer contexts: frame-independent, invisible to frame propagation
   struct
   {
-    hina_context* children[8]; // HINA_MAX_THREAD_CONTEXTS
+    hina_context* children[8]; // HINA_MAX_THREAD_CONTEXTS (recording contexts)
     uint32_t child_count;
+    hina_context* transfer_contexts[HINA_MAX_TRANSFER_CONTEXTS];
+    uint32_t transfer_context_count;
     hina_context* parent; // NULL for root context
-    uint8_t pad_[4];
   } hierarchy;
 } hina_context;
 
@@ -3666,6 +3822,11 @@ static hina_frame_arena_block* hina_frame_arena_block_new(uint32_t block_size)
   block->next = NULL;
   block->size = block_size;
   block->offset = 0;
+  if (hina_profile_enabled())
+  {
+    hina_atomic_inc64(&g_hina_profile.frame_arena_blocks_created);
+    hina_atomic_add64(&g_hina_profile.frame_arena_bytes_created, (int64_t)block_size);
+  }
   return block;
 }
 
@@ -3744,6 +3905,8 @@ static void* hina_frame_temp_alloc(hina_context* ctx, size_t size, uint32_t alig
   return hina_frame_alloc(arena, size, align ? align : 1u);
 }
 
+static void hina_destroy_pipeline_reflection(hina_context* ctx, hina_pipeline_reflection* refl);
+
 static HINA_INLINE void hina_destroy_zombie_fast(hina_context* ctx, const hina_zombie_entry* e)
 {
   VmaAllocator vma = ctx->core.device->allocator.vma;
@@ -3781,6 +3944,69 @@ static HINA_INLINE void hina_destroy_zombie_fast(hina_context* ctx, const hina_z
   case HINA_ZOMBIE_FRAMEBUFFER:
     vkDestroyFramebuffer(dev, (VkFramebuffer)(uintptr_t)e->handle, NULL);
     break;
+  // Slot-index-based kinds: handle = pool slot index. Read hot data from the
+  // still-valid slot (PENDING_DESTROY prevents reallocation), destroy resources,
+  // zero hot data, then free the slot back to the pool.
+  case HINA_ZOMBIE_SLOT_TEXTURE:
+  {
+    uint16_t idx = (uint16_t)e->handle;
+    hina_texture_hot* hot = HINA_TEX_HOT(idx);
+    if (hot->vk.default_view) vkDestroyImageView(dev, hot->vk.default_view, NULL);
+    if (hot->owns_image && hot->vk.image) vmaDestroyImage(vma, hot->vk.image, hot->vk.allocation);
+    memset(hot, 0, sizeof(*hot));
+    hina_texture_slot_free(idx);
+    break;
+  }
+  case HINA_ZOMBIE_SLOT_BUFFER:
+  {
+    uint16_t idx = (uint16_t)e->handle;
+    hina_buffer_hot* hot = HINA_BUF_HOT(idx);
+    if (hot->vk.buffer) vmaDestroyBuffer(vma, hot->vk.buffer, hot->vk.allocation);
+    memset(hot, 0, sizeof(*hot));
+    hina_buffer_slot_free(idx);
+    break;
+  }
+  case HINA_ZOMBIE_SLOT_SAMPLER:
+  {
+    uint16_t idx = (uint16_t)e->handle;
+    hina_sampler_slot* entry = HINA_SAMPLER_ENTRY(idx);
+    if (entry->sampler) vkDestroySampler(dev, entry->sampler, NULL);
+    memset(entry, 0, sizeof(*entry));
+    hina_sampler_slot_free(idx);
+    break;
+  }
+  case HINA_ZOMBIE_SLOT_PIPELINE:
+  {
+    uint16_t idx = (uint16_t)e->handle;
+    hina_pipeline_slot* pe = HINA_PIPELINE_ENTRY(idx);
+    if (pe->pipeline) vkDestroyPipeline(dev, pe->pipeline, NULL);
+    if (pe->layout) vkDestroyPipelineLayout(dev, pe->layout, NULL);
+    if (pe->reflection) hina_destroy_pipeline_reflection(ctx, pe->reflection);
+    memset(pe, 0, sizeof(*pe));
+    hina_pipeline_slot_free(idx);
+    break;
+  }
+  case HINA_ZOMBIE_SLOT_QUERY_POOL:
+  {
+    uint16_t idx = (uint16_t)e->handle;
+    hina_query_slot* qs = HINA_QUERY_ENTRY(idx);
+    if (qs->pool) vkDestroyQueryPool(dev, qs->pool, NULL);
+    memset(qs, 0, sizeof(*qs));
+    hina_query_slot_free(idx);
+    break;
+  }
+  case HINA_ZOMBIE_SLOT_BIND_GROUP:
+  {
+    uint16_t idx = (uint16_t)e->handle;
+    hina_desc_set_slot* ds = HINA_DESC_SET_ENTRY(idx);
+    if (ds->set && ctx->core.device->descriptor_pool)
+    {
+      vkFreeDescriptorSets(dev, ctx->core.device->descriptor_pool, 1, &ds->set);
+    }
+    memset(ds, 0, sizeof(*ds));
+    hina_desc_set_slot_free(idx);
+    break;
+  }
   case HINA_ZOMBIE_CUSTOM:
     if (e->custom.destroy_fn)
     {
@@ -4101,6 +4327,11 @@ static void hina_upload_ring_retire_completed_locked(hina_context* ctx, hina_upl
 
 static uint64_t hina_upload_ring_find_ticket_locked(const hina_upload_batch_ring* ring, uint32_t handle_id, bool is_texture)
 {
+  uint64_t start_ns = 0;
+  uint64_t probes = 0;
+  if (hina_profile_enabled()) start_ns = hina_get_time_ns();
+
+  uint64_t ticket = 0;
   for (uint32_t i = ring->head; i != ring->tail; ++i)
   {
     const hina_upload_batch* batch = &ring->entries[i & HINA_UPLOAD_BATCH_MASK];
@@ -4108,10 +4339,22 @@ static uint64_t hina_upload_ring_find_ticket_locked(const hina_upload_batch_ring
     uint32_t count = is_texture ? batch->texture_count : batch->buffer_count;
     for (uint32_t j = 0; j < count; ++j)
     {
-      if (handles[j] == handle_id) return batch->ticket;
+      ++probes;
+      if (handles[j] == handle_id)
+      {
+        ticket = batch->ticket;
+        goto done;
+      }
     }
   }
-  return 0;
+done:
+  if (hina_profile_enabled())
+  {
+    hina_atomic_inc64(&g_hina_profile.upload_find_calls);
+    hina_atomic_add64(&g_hina_profile.upload_find_ns, (int64_t)(hina_get_time_ns() - start_ns));
+    hina_atomic_add64(&g_hina_profile.upload_find_probes, (int64_t)probes);
+  }
+  return ticket;
 }
 
 // Flush any pending staging work before deferred destruction.
@@ -4231,7 +4474,15 @@ static void hina_defer_destroy_fast(hina_context* ctx, hina_zombie_kind kind, ui
   }
   hina_device* dev = ctx->core.device;
   hina_zombie_list* list = &dev->sync.zombies[frame_slot];
-  if (!list->entries) return;
+  if (!list->entries)
+  {
+    // Cannot queue — synchronous destroy to prevent PENDING_DESTROY slot leak
+    hina_zombie_entry sync_entry = {
+      .handle = handle, .allocation = allocation, .ticket = 0, .kind = (uint32_t)kind, .pad_ = 0
+    };
+    hina_destroy_zombie_fast(ctx, &sync_entry);
+    return;
+  }
   mtx_lock(&dev->lock.zombie_lock);
   if (list->state.count == list->state.capacity)
   {
@@ -5345,6 +5596,43 @@ static void hina_gpu_diag_log_nv_checkpoints(hina_context* ctx)
 }
 #endif
 
+static const char* hina_context_kind_name(hina_context_kind kind)
+{
+  switch (kind)
+  {
+  case HINA_CTX_ROOT: return "ROOT";
+  case HINA_CTX_RECORDING: return "RECORDING";
+  case HINA_CTX_TRANSFER: return "TRANSFER";
+  default: return "UNKNOWN";
+  }
+}
+
+static void hina_gpu_diag_log_context_info(hina_context* ctx, const char* origin)
+{
+  HINA_LOGE(ctx, "  context: %s (ctx=%p, thread=%lu)", hina_context_kind_name(ctx->core.kind),
+            (void*)ctx, (unsigned long)HINA_CURRENT_THREAD_ID());
+  HINA_LOGE(ctx, "  origin: %s", origin ? origin : "unknown");
+  HINA_LOGE(ctx, "  frame_index: %llu, current_slot: %u",
+            (unsigned long long)ctx->frame.frame_index, ctx->frame.current_slot);
+  hina_staging_context* sc = &ctx->staging;
+  if (sc->last_submit_ticket || sc->last_gfx_submit_ticket || sc->last_comp_submit_ticket)
+  {
+    HINA_LOGE(ctx, "  staging tickets: xfer=%" PRIu64 " gfx=%" PRIu64 " comp=%" PRIu64,
+              sc->last_submit_ticket, sc->last_gfx_submit_ticket, sc->last_comp_submit_ticket);
+  }
+  if (sc->staged_buffers.count || sc->staged_textures.count)
+  {
+    HINA_LOGE(ctx, "  staged pending: %u buffers, %u textures",
+              sc->staged_buffers.count, sc->staged_textures.count);
+  }
+  if (sc->pending_cmd || sc->gfx_pending_cmd || sc->comp_pending_cmd)
+  {
+    HINA_LOGE(ctx, "  staging cmd state: pending_cmd=%s gfx_pending=%s comp_pending=%s",
+              sc->pending_cmd ? "YES" : "no", sc->gfx_pending_cmd ? "YES" : "no",
+              sc->comp_pending_cmd ? "YES" : "no");
+  }
+}
+
 static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* origin, VkResult result)
 {
   if (!ctx || !ctx->core.device)
@@ -5354,6 +5642,8 @@ static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* ori
   hina_gpu_diagnostics* diag = &ctx->core.device->diagnostics;
   if (hina_atomic_cas32(&diag->crash_reported, 0, 1) == 0)
   {
+    HINA_LOGE(ctx, "=== VK_ERROR_DEVICE_LOST ===");
+    hina_gpu_diag_log_context_info(ctx, origin);
     VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
     uint32_t address_count = 0;
     uint32_t vendor_count = 0;
@@ -5380,13 +5670,9 @@ static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* ori
       hina_gpu_diag_log_nv_checkpoints(ctx);
       hina_gpu_diag_log_device_fault(ctx, origin, result, &info, address_count, vendor_count);
     }
-    else
+    else if (info.description[0])
     {
-      HINA_LOGE(ctx, "GPU device loss during %s: %s", origin ? origin : "unknown", hina_vk_result_string(result));
-      if (info.description[0])
-      {
-        HINA_LOGE(ctx, "Device fault description: %s", info.description);
-      }
+      HINA_LOGE(ctx, "Device fault description: %s", info.description);
     }
   }
   fflush(NULL); // Flush all streams before abort - log_fn may write to any stream
@@ -5432,7 +5718,16 @@ static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* ori
 {
   if (ctx && ctx->core.device)
   {
-    HINA_LOGE(ctx, "GPU device loss during %s: %s", origin ? origin : "unknown", hina_vk_result_string(result));
+    HINA_LOGE(ctx, "=== VK_ERROR_DEVICE_LOST ===");
+    HINA_LOGE(ctx, "  context: %s (ctx=%p, thread=%lu)", hina_context_kind_name(ctx->core.kind),
+              (void*)ctx, (unsigned long)HINA_CURRENT_THREAD_ID());
+    HINA_LOGE(ctx, "  origin: %s", origin ? origin : "unknown");
+    hina_staging_context* sc = &ctx->staging;
+    if (sc->last_submit_ticket || sc->last_gfx_submit_ticket || sc->last_comp_submit_ticket)
+    {
+      HINA_LOGE(ctx, "  staging tickets: xfer=%" PRIu64 " gfx=%" PRIu64 " comp=%" PRIu64,
+                sc->last_submit_ticket, sc->last_gfx_submit_ticket, sc->last_comp_submit_ticket);
+    }
     if (g_debug_caps.has_device_fault && vkGetDeviceFaultInfoEXT)
     {
       enum { HINA_RELEASE_FAULT_MAX_ADDRS = 16, HINA_RELEASE_FAULT_MAX_VENDORS = 16 };
@@ -10121,10 +10416,6 @@ static bool hina_init_context_resources(hina_context* ctx)
   ctx->core.initialized = false;
   for (uint32_t i = 0; i < HINA_MAX_FRAMES_IN_FLIGHT; ++i)
   {
-    if (!ctx->alloc.frame_arenas[i].head)
-    {
-      ctx->alloc.frame_arenas[i].head = hina_frame_arena_block_new(HINA_FRAME_ARENA_SIZE);
-    }
     hina_frame_arena_reset(&ctx->alloc.frame_arenas[i]);
   }
   VkCommandPoolCreateInfo pool_info = {
@@ -10269,6 +10560,18 @@ static bool hina_init_context_resources(hina_context* ctx)
   // Log detailed feature/extension summary
   hina_log_enabled_features(ctx);
   ctx->core.initialized = true;
+  return true;
+}
+
+static bool hina_init_transfer_context_resources(hina_context* ctx)
+{
+  // Only initialize the staging context — no per-frame pools, no descriptor
+  // allocators, no frame arenas. Transfer contexts are for async uploads only.
+  if (!hina_staging_ctx_init(ctx, &ctx->staging))
+  {
+    HINA_LOGE(ctx, "hina_init_transfer_context_resources: staging init failed");
+    return false;
+  }
   return true;
 }
 
@@ -10436,6 +10739,7 @@ static void hina_trim_working_set(void)
 bool hina_init(const hina_desc* desc)
 {
   HINA_ASSERT(desc);
+  hina_profile_init_once();
   hina_context* ctx = &g_hina_ctx;
   if (ctx->core.initialized && ctx->core.device && ctx->core.device->core.initialized) return true;
   // Initialize static storage system (idempotent)
@@ -10447,6 +10751,7 @@ bool hina_init(const hina_desc* desc)
   if (!dev) return false;
   ctx->core.device = dev;
   ctx->core.owns_device = true;
+  ctx->core.kind = HINA_CTX_ROOT;
   ctx->frame.last_recorded_frame = UINT64_MAX;
   ctx->frame.current_slot = 0;
   dev->config.log_fn = desc->log_fn;
@@ -10595,7 +10900,15 @@ bool hina_init(const hina_desc* desc)
   memset(&dev->page_pool, 0, sizeof(dev->page_pool));
   mtx_init(&dev->page_pool.lock, mtx_plain);
   dev->page_pool.page_size = desc->staging_buffer_size ? (uint32_t)desc->staging_buffer_size : HINA_STAGING_PAGE_SIZE;
-  if (!hina_init_context_resources(ctx)) return false;
+  {
+    uint64_t start_ns = hina_profile_enabled() ? hina_get_time_ns() : 0;
+    if (!hina_init_context_resources(ctx)) return false;
+    if (hina_profile_enabled())
+    {
+      hina_atomic_inc64(&g_hina_profile.context_init_calls);
+      hina_atomic_add64(&g_hina_profile.context_init_ns, (int64_t)(hina_get_time_ns() - start_ns));
+    }
+  }
   // Initialize Tracy GPU profiling context (when enabled)
 #ifdef TRACY_ENABLE
   {
@@ -10679,6 +10992,10 @@ static hina_staging_page* hina_page_pool_create_page(hina_context* ctx, uint32_t
   VkMemoryPropertyFlags mem_flags = 0;
   vmaGetAllocationMemoryProperties(ctx->core.device->allocator.vma, page->allocation, &mem_flags);
   page->coherent = (mem_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+  if (hina_profile_enabled())
+  {
+    hina_atomic_inc64(&g_hina_profile.page_pool_pages_created);
+  }
   return page;
 }
 
@@ -10688,6 +11005,10 @@ static void hina_page_pool_destroy_page(hina_context* ctx, hina_staging_page* pa
   if (page->buffer)
   {
     vmaDestroyBuffer(ctx->core.device->allocator.vma, page->buffer, page->allocation);
+  }
+  if (hina_profile_enabled())
+  {
+    hina_atomic_inc64(&g_hina_profile.page_pool_pages_destroyed);
   }
   hina_free_host(page);
 }
@@ -10706,7 +11027,14 @@ static hina_staging_page* hina_page_pool_acquire(hina_context* ctx)
     page->next = NULL;
     page->used = 0;
     page->fence_value = 0;
+    uint32_t total_count = pool->state.total_count;
+    uint32_t free_count = pool->state.free_count;
     mtx_unlock(&pool->lock);
+    if (hina_profile_enabled())
+    {
+      hina_atomic_max32(&g_hina_profile.page_pool_peak_total, total_count);
+      hina_atomic_max32(&g_hina_profile.page_pool_peak_free, free_count);
+    }
     return page;
   }
   // No free pages, create a new one (still under lock for total_count tracking)
@@ -10730,6 +11058,11 @@ static hina_staging_page* hina_page_pool_acquire(hina_context* ctx)
   mtx_lock(&pool->lock);
   page->all_next = pool->pages.all_pages;
   pool->pages.all_pages = page;
+  if (hina_profile_enabled())
+  {
+    hina_atomic_max32(&g_hina_profile.page_pool_peak_total, pool->state.total_count);
+    hina_atomic_max32(&g_hina_profile.page_pool_peak_free, pool->state.free_count);
+  }
   mtx_unlock(&pool->lock);
   return page;
 }
@@ -10745,6 +11078,11 @@ static void hina_page_pool_release(hina_context* ctx, hina_staging_page* page)
   page->next = pool->pages.free_list;
   pool->pages.free_list = page;
   pool->state.free_count++;
+  if (hina_profile_enabled())
+  {
+    hina_atomic_max32(&g_hina_profile.page_pool_peak_total, pool->state.total_count);
+    hina_atomic_max32(&g_hina_profile.page_pool_peak_free, pool->state.free_count);
+  }
   mtx_unlock(&pool->lock);
 }
 
@@ -10762,6 +11100,11 @@ static void hina_page_pool_release_batch(hina_context* ctx, hina_staging_page** 
     pool->pages.free_list = page;
   }
   pool->state.free_count += count;
+  if (hina_profile_enabled())
+  {
+    hina_atomic_max32(&g_hina_profile.page_pool_peak_total, pool->state.total_count);
+    hina_atomic_max32(&g_hina_profile.page_pool_peak_free, pool->state.free_count);
+  }
   mtx_unlock(&pool->lock);
 }
 
@@ -11076,6 +11419,9 @@ static void hina_page_pool_shutdown(hina_context* ctx)
 
 static void hina_process_retired_timeline(hina_context* ctx)
 {
+  uint64_t start_ns = 0;
+  uint32_t scanned = ctx->staging.retired.count;
+  if (hina_profile_enabled()) start_ns = hina_get_time_ns();
   hina_poll_lane_completions(ctx);
   // Snapshot lane completion values ONCE (4 loads vs N*4 in-loop)
   uint64_t lane_completed[HINA_MAX_QUEUE_LANES];
@@ -11086,10 +11432,21 @@ static void hina_process_retired_timeline(hina_context* ctx)
     fence != HINA_TICKET_PENDING &&
     (hina_ticket_value(fence) > 0 && hina_ticket_lane(fence) < HINA_MAX_QUEUE_LANES) &&
     lane_completed[hina_ticket_lane(fence)] >= hina_ticket_value(fence));
+  if (hina_profile_enabled())
+  {
+    hina_atomic_inc64(&g_hina_profile.retired_process_calls);
+    hina_atomic_add64(&g_hina_profile.retired_process_ns, (int64_t)(hina_get_time_ns() - start_ns));
+    hina_atomic_add64(&g_hina_profile.retired_process_scanned, (int64_t)scanned);
+    hina_atomic_add64(&g_hina_profile.retired_process_released,
+                      (int64_t)(scanned - ctx->staging.retired.count));
+  }
 }
 
 static void hina_process_retired_legacy(hina_context* ctx)
 {
+  uint64_t start_ns = 0;
+  uint32_t scanned = ctx->staging.retired.count;
+  if (hina_profile_enabled()) start_ns = hina_get_time_ns();
   uint64_t completed = (uint64_t)hina_atomic_load64(&ctx->core.device->sync.last_completed_ticket);
   if (ctx->staging.last_submit_ticket > 0)
   {
@@ -11121,6 +11478,14 @@ static void hina_process_retired_legacy(hina_context* ctx)
   }
   HINA_IMPL_PROCESS_RETIRED(ctx,
     (fence != HINA_TICKET_PENDING) && (fence <= completed));
+  if (hina_profile_enabled())
+  {
+    hina_atomic_inc64(&g_hina_profile.retired_process_calls);
+    hina_atomic_add64(&g_hina_profile.retired_process_ns, (int64_t)(hina_get_time_ns() - start_ns));
+    hina_atomic_add64(&g_hina_profile.retired_process_scanned, (int64_t)scanned);
+    hina_atomic_add64(&g_hina_profile.retired_process_released,
+                      (int64_t)(scanned - ctx->staging.retired.count));
+  }
 }
 
 static void hina_staging_ctx_process_retired(hina_context* ctx)
@@ -12122,6 +12487,11 @@ static hina_desc_block* hina_desc_block_create(hina_context* ctx, uint32_t capac
   block->state.capacity = capacity;
   block->state.head = 0;
   block->next = NULL;
+  if (hina_profile_enabled())
+  {
+    hina_atomic_inc64(&g_hina_profile.desc_blocks_created);
+    hina_atomic_add64(&g_hina_profile.desc_sets_capacity_created, (int64_t)capacity);
+  }
   return block;
 }
 
@@ -12141,16 +12511,9 @@ static void hina_desc_block_destroy(hina_context* ctx, hina_desc_block* block)
 
 static bool hina_linear_desc_alloc_init(hina_context* ctx, hina_linear_desc_alloc* alloc)
 {
+  (void)ctx;
   HINA_ASSERT(alloc);
   memset(alloc, 0, sizeof(*alloc));
-  // Create primary block
-  alloc->blocks.primary = hina_desc_block_create(ctx, HINA_LINEAR_DESC_BLOCK_SIZE);
-  if (!alloc->blocks.primary)
-  {
-    return false;
-  }
-  alloc->blocks.current = alloc->blocks.primary;
-  alloc->blocks.overflow_head = NULL;
   return true;
 }
 
@@ -12200,7 +12563,17 @@ static void hina_linear_desc_alloc_reset(hina_context* ctx, hina_linear_desc_all
 static VkDescriptorSet hina_linear_desc_alloc_get(hina_context* ctx, hina_linear_desc_alloc* alloc,
                                                   VkDescriptorSetLayout layout)
 {
-  HINA_ASSERT(alloc && alloc->blocks.current && layout != VK_NULL_HANDLE);
+  HINA_ASSERT(alloc && layout != VK_NULL_HANDLE);
+  if (!alloc->blocks.primary)
+  {
+    alloc->blocks.primary = hina_desc_block_create(ctx, HINA_LINEAR_DESC_BLOCK_SIZE);
+    if (!alloc->blocks.primary)
+    {
+      HINA_LOGW(ctx, "Failed to create primary transient descriptor block");
+      return VK_NULL_HANDLE;
+    }
+  }
+  if (!alloc->blocks.current) alloc->blocks.current = alloc->blocks.primary;
 retry:;
   hina_desc_block* block = alloc->blocks.current;
   // Fast path: space available in current block
@@ -12439,6 +12812,18 @@ void hina_shutdown(void)
   g_host_query_reset_supported = false;
   g_host_query_reset_enabled = false;
   hina_context* ctx = &g_hina_ctx;
+#ifdef HINA_DEBUG
+  if (ctx->hierarchy.transfer_context_count > 0)
+  {
+    HINA_LOGW(ctx, "hina_shutdown: %u transfer context(s) not destroyed — call hina_destroy_transfer_context before shutdown",
+              ctx->hierarchy.transfer_context_count);
+  }
+  if (ctx->hierarchy.child_count > 0)
+  {
+    HINA_LOGW(ctx, "hina_shutdown: %u recording context(s) not destroyed — call hina_destroy_recording_context before shutdown",
+              ctx->hierarchy.child_count);
+  }
+#endif
   hina_device* dev = ctx->core.device;
   if (!dev || !dev->core.initialized) return;
   // Wait for all GPU work to complete and clear submission tracking
@@ -12576,23 +12961,24 @@ void hina_shutdown(void)
   ctx->core.device = NULL;
   ctx->core.owns_device = false;
   hina_storage_shutdown();
+  hina_profile_dump();
   hina_alloc_dump_stats();  // After storage shutdown so debug names are freed
 }
 
-// Thread context management
-hina_context* hina_create_thread_context(void)
+// Recording context: frame-synced child for parallel command recording
+hina_context* hina_create_recording_context(void)
 {
   hina_context* parent = &g_hina_ctx;
-  // Check if parent can accept more children
   if (parent->hierarchy.child_count >= 8) // HINA_MAX_THREAD_CONTEXTS
   {
-    HINA_LOGE(parent, "hina_create_thread_context: parent has max children (%u)", parent->hierarchy.child_count);
+    HINA_LOGE(parent, "hina_create_recording_context: parent has max children (%u)", parent->hierarchy.child_count);
     return NULL;
   }
   hina_context* ctx = hina_calloc_host(1, sizeof(hina_context));
   if (!ctx) return NULL;
   ctx->core.device = parent->core.device;
   ctx->core.owns_device = false;
+  ctx->core.kind = HINA_CTX_RECORDING;
   ctx->frame.last_recorded_frame = UINT64_MAX;
   ctx->frame.current_slot = 0;
   // Initialize hierarchy - register with parent
@@ -12602,17 +12988,25 @@ hina_context* hina_create_thread_context(void)
   // Sync frame index with parent so child starts on same frame
   ctx->frame.frame_index = parent->frame.frame_index;
   ctx->frame.current_slot = parent->frame.current_slot;
-  if (!hina_init_context_resources(ctx))
   {
-    // Unregister from parent on failure
-    parent->hierarchy.child_count--;
-    hina_free_host(ctx);
-    return NULL;
+    uint64_t start_ns = hina_profile_enabled() ? hina_get_time_ns() : 0;
+    if (!hina_init_context_resources(ctx))
+    {
+      // Unregister from parent on failure
+      parent->hierarchy.child_count--;
+      hina_free_host(ctx);
+      return NULL;
+    }
+    if (hina_profile_enabled())
+    {
+      hina_atomic_inc64(&g_hina_profile.context_init_calls);
+      hina_atomic_add64(&g_hina_profile.context_init_ns, (int64_t)(hina_get_time_ns() - start_ns));
+    }
   }
   return ctx;
 }
 
-void hina_destroy_thread_context(hina_context* ctx)
+void hina_destroy_recording_context(hina_context* ctx)
 {
   if (ctx == &g_hina_ctx) return;
   if (ctx->core.owns_device) return;
@@ -12663,6 +13057,87 @@ void hina_destroy_thread_context(hina_context* ctx)
   }
   hina_staging_ctx_process_retired(ctx);
   hina_destroy_context_resources(ctx);
+  hina_free_host(ctx);
+}
+
+// Transfer context: frame-independent child for async uploads
+hina_context* hina_create_transfer_context(void)
+{
+  hina_context* parent = &g_hina_ctx;
+  if (parent->hierarchy.transfer_context_count >= HINA_MAX_TRANSFER_CONTEXTS)
+  {
+    HINA_LOGE(parent, "hina_create_transfer_context: max transfer contexts (%u)",
+              parent->hierarchy.transfer_context_count);
+    return NULL;
+  }
+  hina_context* ctx = hina_calloc_host(1, sizeof(hina_context));
+  if (!ctx) return NULL;
+  ctx->core.device = parent->core.device;
+  ctx->core.owns_device = false;
+  ctx->core.kind = HINA_CTX_TRANSFER;
+  ctx->frame.last_recorded_frame = UINT64_MAX;
+  ctx->hierarchy.parent = parent;
+  ctx->hierarchy.child_count = 0;
+  ctx->hierarchy.transfer_context_count = 0;
+  // HINA_STAGING_CHECK_THREAD: no explicit owner_thread set needed.
+  // The macro lazily captures the owner thread on first staging access.
+  // Since hina_calloc_host zeroes the struct, owner_thread_set starts false.
+  // Register in parent's transfer_contexts list (NOT children — invisible to frame propagation)
+  parent->hierarchy.transfer_contexts[parent->hierarchy.transfer_context_count++] = ctx;
+  if (!hina_init_transfer_context_resources(ctx))
+  {
+    parent->hierarchy.transfer_context_count--;
+    hina_free_host(ctx);
+    return NULL;
+  }
+  return ctx;
+}
+
+void hina_destroy_transfer_context(hina_context* ctx)
+{
+  if (!ctx) return;
+  if (ctx->core.kind != HINA_CTX_TRANSFER)
+  {
+    HINA_LOGE(ctx, "hina_destroy_transfer_context: context is not a transfer context");
+    return;
+  }
+  // Full staging drain: flush all pending command buffers and wait for all tickets.
+  // The staging system supports split-queue submissions (transfer->graphics, transfer->compute)
+  // which produce separate pending_cmd/gfx_pending_cmd/comp_pending_cmd and separate tickets.
+  hina_staging_context* sc = &ctx->staging;
+  if (sc->pending_cmd || sc->gfx_pending_cmd || sc->comp_pending_cmd ||
+      sc->staged_buffers.count > 0 || sc->staged_textures.count > 0)
+  {
+    hina_staging_ctx_flush(ctx);
+  }
+  if (sc->last_submit_ticket > 0)
+    hina_staging_ctx_wait(ctx, sc->last_submit_ticket);
+  if (sc->last_gfx_submit_ticket > 0)
+    hina_staging_ctx_wait(ctx, sc->last_gfx_submit_ticket);
+  if (sc->last_comp_submit_ticket > 0)
+    hina_staging_ctx_wait(ctx, sc->last_comp_submit_ticket);
+  // Process retired staging pages
+  hina_staging_ctx_process_retired(ctx);
+  // Destroy staging resources
+  hina_staging_ctx_destroy(ctx, &ctx->staging);
+  // Unregister from parent
+  hina_context* parent = ctx->hierarchy.parent;
+  if (parent)
+  {
+    for (uint32_t i = 0; i < parent->hierarchy.transfer_context_count; ++i)
+    {
+      if (parent->hierarchy.transfer_contexts[i] == ctx)
+      {
+        for (uint32_t j = i; j < parent->hierarchy.transfer_context_count - 1; ++j)
+        {
+          parent->hierarchy.transfer_contexts[j] = parent->hierarchy.transfer_contexts[j + 1];
+        }
+        parent->hierarchy.transfer_contexts[--parent->hierarchy.transfer_context_count] = NULL;
+        break;
+      }
+    }
+    ctx->hierarchy.parent = NULL;
+  }
   hina_free_host(ctx);
 }
 
@@ -12862,13 +13337,9 @@ void hina_ctx_destroy_buffer(hina_context* ctx, hina_buffer buf)
   hina_debug_name_remove(buf.id, VK_OBJECT_TYPE_BUFFER);
 #endif
   uint16_t idx = hina_id_index(buf.id);
-  hina_buffer_hot* hot = HINA_BUF_HOT(idx);
-  VkBuffer vk_buf = hot->vk.buffer;
-  VmaAllocation vma_alloc = hot->vk.allocation;
   hina_buffer_upload_pending_clear(ctx, idx);
-  memset(hot, 0, sizeof(*hot));
-  hina_buffer_slot_free(idx);
-  HINA_DEFER_DESTROY_BUFFER(ctx, vk_buf, vma_alloc);
+  g_storage.buffer_pool.slots[idx].next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
+  hina_defer_destroy_fast(ctx, HINA_ZOMBIE_SLOT_BUFFER, (uint64_t)idx, 0);
 }
 
 void hina_destroy_buffer(hina_buffer buf)
@@ -13660,11 +14131,6 @@ static VkFramebuffer hina_legacy_get_cached_framebuffer(hina_context* ctx, hina_
   return fb;
 }
 
-static void hina_destroy_texture_cb(hina_context* ctx, void* payload)
-{
-  hina_destroy_texture_handles(ctx, payload);
-}
-
 hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* desc)
 {
   HINA_ASSERT(desc);
@@ -13853,37 +14319,70 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
     if (!upload_succeeded)
     {
       HINA_LOGW(ctx, "texture upload failed, transitioning to SHADER_READ_ONLY (will sample black)");
-      // Fallback: transition to SHADER_READ_ONLY_OPTIMAL so the texture is at least usable
-      // (will sample zeros/undefined content, but avoids validation errors)
-      hina_cmd* fallback_cmd = hina_ctx_cmd_begin_ex(ctx, HINA_QUEUE_GRAPHICS);
-      if (fallback_cmd)
+      if (ctx->core.kind == HINA_CTX_TRANSFER)
       {
-        HINA_IMAGE_BARRIER(fallback_cmd->vk_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, owner_shader_stages, 0,
-                           VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, hot->vk.image,
-                           ((VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, hot->mip_levels, 0, hot->layers}));
-        hina_cmd_end(fallback_cmd);
-        hina_ticket t = hina_ctx_submit_immediate(ctx, fallback_cmd);
-        if (t)
+        // Transfer context fallback: route through staging command buffer.
+        // Cannot use hina_ctx_cmd_begin_ex (requires frame arenas) or
+        // hina_ctx_submit_immediate (guarded). The staging context already
+        // has command pools capable of pipeline barriers.
+        //
+        // On split-queue devices, shader stage bits are invalid on the transfer
+        // queue — use the graphics command buffer instead.
+        hina_staging_context* sc = &ctx->staging;
+        bool split = hina_staging_use_split(ctx, sc);
+        VkCommandBuffer vk_cmd = split
+          ? hina_staging_ctx_acquire_gfx_cmd(ctx)
+          : hina_staging_ctx_acquire_cmd(ctx);
+        if (vk_cmd)
         {
-          // Wait immediately for the fallback transition since this is an error recovery path
-          hina_ctx_wait_ticket(ctx, t);
+          VkImageAspectFlags fallback_aspect = hina_aspect_from_format(hot->dims.format);
+          HINA_IMAGE_BARRIER(vk_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, owner_shader_stages, 0,
+                             VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, hot->vk.image,
+                             ((VkImageSubresourceRange){fallback_aspect, 0, hot->mip_levels, 0, hot->layers}));
+          hina_ticket t = hina_staging_ctx_flush(ctx);
+          if (t) hina_staging_ctx_wait(ctx, t);
+          hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          hot->state.access = VK_ACCESS_SHADER_READ_BIT;
+          hot->state.stages = owner_shader_stages;
           hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
-          hina_texture_upload_pending_clear(ctx, idx);
         }
         else
         {
-          // Fallback transition failed to submit; keep resource explicitly not-ready.
+          // Staging cmd acquisition failed; keep resource explicitly not-ready.
           hina_texture_upload_pending_set(ctx, idx);
         }
-        hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        hot->state.access = VK_ACCESS_SHADER_READ_BIT;
-        hot->state.stages = owner_shader_stages;
       }
       else
       {
-        // Fallback transition command couldn't be allocated; keep resource explicitly not-ready.
-        hina_texture_upload_pending_set(ctx, idx);
+        // Recording/root context fallback: use immediate submission
+        hina_cmd* fallback_cmd = hina_ctx_cmd_begin_ex(ctx, HINA_QUEUE_GRAPHICS);
+        if (fallback_cmd)
+        {
+          HINA_IMAGE_BARRIER(fallback_cmd->vk_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, owner_shader_stages, 0,
+                             VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, hot->vk.image,
+                             ((VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, hot->mip_levels, 0, hot->layers}));
+          hina_cmd_end(fallback_cmd);
+          hina_ticket t = hina_ctx_submit_immediate(ctx, fallback_cmd);
+          if (t)
+          {
+            hina_ctx_wait_ticket(ctx, t);
+            hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
+            hina_texture_upload_pending_clear(ctx, idx);
+          }
+          else
+          {
+            hina_texture_upload_pending_set(ctx, idx);
+          }
+          hot->state.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          hot->state.access = VK_ACCESS_SHADER_READ_BIT;
+          hot->state.stages = owner_shader_stages;
+        }
+        else
+        {
+          hina_texture_upload_pending_set(ctx, idx);
+        }
       }
     }
   }
@@ -14350,19 +14849,13 @@ void hina_ctx_destroy_texture(hina_context* ctx, hina_texture tex)
       hina_texture_view_slot_free((uint16_t)i);
     }
   }
-  hina_texture_hot temp = *hot;
   hina_texture_upload_pending_clear(ctx, idx);
-  memset(hot, 0, sizeof(*hot));
-  hina_texture_slot_free(idx);
-  // Only defer if we own the image (swapchain textures don't own their images)
-  if (temp.owns_image)
-  {
-    hina_defer_destroy(ctx, &temp, sizeof(temp), hina_destroy_texture_cb);
-  }
-  else
-  {
-    hina_destroy_texture_handles(ctx, &temp);
-  }
+  // Mark slot as pending destroy: handle invalidated (next_free != SENTINEL),
+  // hot data stays alive for GPU. Zombie reads hot data on fire.
+  g_storage.texture_pool.slots[idx].next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
+  // Zombie flush checks hot->owns_image to handle swapchain textures correctly
+  // (only destroys default VkImageView, not the VkImage).
+  hina_defer_destroy_fast(ctx, HINA_ZOMBIE_SLOT_TEXTURE, (uint64_t)idx, 0);
 }
 
 void hina_destroy_texture(hina_texture tex)
@@ -14372,6 +14865,7 @@ void hina_destroy_texture(hina_texture tex)
 
 hina_ticket hina_ctx_generate_mips(hina_context* ctx, hina_texture tex)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_generate_mips");
   HINA_ASSERTF(hina_texture_slot_valid(tex), "[%s] hina_generate_mips: invalid texture handle",
                hina_debug_get_label(tex.id, VK_OBJECT_TYPE_IMAGE));
   uint16_t idx = hina_id_index(tex.id);
@@ -14490,19 +14984,16 @@ hina_sampler hina_make_sampler(const hina_sampler_desc* desc)
 
 void hina_ctx_destroy_sampler(hina_context* ctx, hina_sampler samp)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_destroy_sampler");
   if (!hina_sampler_slot_valid(samp)) return;
 #ifdef HINA_DEBUG
   hina_debug_name_remove(samp.id, VK_OBJECT_TYPE_SAMPLER);
 #endif
   uint16_t idx = hina_id_index(samp.id);
   hina_sampler_slot* entry = HINA_SAMPLER_ENTRY(idx);
-  VkSampler sampler = entry->sampler;
-  entry->sampler = VK_NULL_HANDLE;
-  hina_sampler_slot_free(idx);
-  if (sampler)
-  {
-    HINA_DEFER_DESTROY_SAMPLER(ctx, sampler);
-  }
+  entry->in_use = 0; // invalidate handle (sampler_slot_valid checks in_use)
+  entry->next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
+  hina_defer_destroy_fast(ctx, HINA_ZOMBIE_SLOT_SAMPLER, (uint64_t)idx, 0);
 }
 
 void hina_destroy_sampler(hina_sampler samp)
@@ -14811,6 +15302,7 @@ hina_bind_group_layout hina_create_bind_group_layout_from_hsl_module(const hina_
 
 void hina_ctx_destroy_bind_group_layout(hina_context* ctx, hina_bind_group_layout layout)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_destroy_bind_group_layout");
   if (!hina_desc_layout_slot_valid((hina_desc_set_layout){layout.id})) return;
 #ifdef HINA_DEBUG
   hina_debug_name_remove(layout.id, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT);
@@ -15111,6 +15603,7 @@ static hina_bind_group hina_ctx_create_bind_group_internal(hina_context* ctx, co
 
 hina_bind_group hina_ctx_create_bind_group(hina_context* ctx, const hina_bind_group_desc* desc)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_create_bind_group");
   HINA_ASSERT(desc);
   // Initialize descriptor pool if needed
   if (!ctx->core.device->descriptor_pool && !hina_init_descriptor_pool(ctx))
@@ -15128,6 +15621,7 @@ hina_bind_group hina_create_bind_group(const hina_bind_group_desc* desc)
 
 void hina_ctx_destroy_bind_group(hina_context* ctx, hina_bind_group group)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_destroy_bind_group");
   if (!hina_desc_set_slot_valid((hina_desc_set){group.id})) return;
 #ifdef HINA_DEBUG
   hina_debug_name_remove(group.id, VK_OBJECT_TYPE_DESCRIPTOR_SET);
@@ -15135,16 +15629,12 @@ void hina_ctx_destroy_bind_group(hina_context* ctx, hina_bind_group group)
 #endif
   uint16_t idx = hina_id_index(group.id);
   hina_desc_set_slot* slot = HINA_DESC_SET_ENTRY(idx);
-  // Extract Vulkan handle before clearing slot
-  VkDescriptorSet vk_set = slot->set;
-  slot->set = VK_NULL_HANDLE;
-  slot->layout = (hina_desc_set_layout){HINA_INVALID_HANDLE};
-  hina_desc_set_slot_free(idx);
-  // Defer Vulkan destruction until GPU is done
-  if (vk_set && ctx->core.device->descriptor_pool)
-  {
-    HINA_DEFER_DESTROY_BIND_GROUP(ctx, vk_set);
-  }
+  // Invalidate via generation bump — don't null slot->set (zombie needs it).
+  // desc_set_slot_valid checks generation AND set != NULL; bumping generation
+  // makes old handles fail the generation check.
+  slot->generation++;
+  slot->next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
+  hina_defer_destroy_fast(ctx, HINA_ZOMBIE_SLOT_BIND_GROUP, (uint64_t)idx, 0);
 }
 
 void hina_destroy_bind_group(hina_bind_group group)
@@ -16474,26 +16964,18 @@ hina_pipeline hina_make_pipeline_ex(const hina_pipeline_desc_any* desc)
   return hina_ctx_make_pipeline_ex(&g_hina_ctx, desc);
 }
 
-static void hina_destroy_pipeline_cb(hina_context* ctx, void* payload)
-{
-  hina_pipeline_entry* e = payload;
-  if (e->pipeline) vkDestroyPipeline(ctx->core.device->core.device, e->pipeline, NULL);
-  if (e->layout) vkDestroyPipelineLayout(ctx->core.device->core.device, e->layout, NULL);
-  if (e->reflection) hina_destroy_pipeline_reflection(ctx, e->reflection);
-}
-
 void hina_ctx_destroy_pipeline(hina_context* ctx, hina_pipeline pip)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_destroy_pipeline");
   if (!hina_pipeline_slot_valid(pip)) return;
 #ifdef HINA_DEBUG
   hina_debug_name_remove(pip.id, VK_OBJECT_TYPE_PIPELINE);
 #endif
   uint16_t idx = hina_id_index(pip.id);
   hina_pipeline_slot* e = HINA_PIPELINE_ENTRY(idx);
-  hina_pipeline_slot temp = *e;
-  memset(e, 0, sizeof(*e));
-  hina_pipeline_slot_free(idx);
-  hina_defer_destroy(ctx, &temp, sizeof(temp), hina_destroy_pipeline_cb);
+  e->in_use = 0; // invalidate handle (pipeline_slot_valid checks in_use)
+  e->next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
+  hina_defer_destroy_fast(ctx, HINA_ZOMBIE_SLOT_PIPELINE, (uint64_t)idx, 0);
 }
 
 void hina_destroy_pipeline(hina_pipeline pip)
@@ -17539,6 +18021,7 @@ hina_cmd* hina_cmd_begin(void)
 // Command buffer with explicit queue selection
 hina_cmd* hina_ctx_cmd_begin_ex(hina_context* ctx, hina_queue queue)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_cmd_begin_ex");
   // Resolve queue type to lane index
   int8_t lane_idx = -1;
   switch (queue)
@@ -19836,6 +20319,7 @@ void hina_cmd_bind_group_with_offsets(hina_cmd* cmd, uint32_t set, hina_bind_gro
 // Transient Bind Groups (Per-Frame, Lock-Free)
 hina_transient_bind_group hina_ctx_alloc_transient_bind_group(hina_context* ctx, hina_bind_group_layout layout)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_alloc_transient_bind_group");
   hina_transient_bind_group result = {0};
   if (layout.id == HINA_INVALID_HANDLE)
   {
@@ -22214,6 +22698,7 @@ static hina_ticket hina_submit_internal_ex(hina_context* ctx, hina_cmd* cmd, con
 
 hina_ticket hina_ctx_submit_immediate(hina_context* ctx, hina_cmd* cmd)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_submit_immediate");
   HINA_ASSERT(cmd);
   if (cmd->uses_swapchain)
   {
@@ -24157,6 +24642,7 @@ hina_frame_stats hina_ctx_get_frame_stats(hina_context* ctx)
     hina_frame_stats empty = {0};
     return empty;
   }
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_get_frame_stats");
   return ctx->stats.completed;
 }
 
@@ -24239,15 +24725,13 @@ hina_query_pool hina_make_query_pool(const hina_query_pool_desc* desc)
 
 void hina_ctx_destroy_query_pool(hina_context* ctx, hina_query_pool pool)
 {
+  HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_destroy_query_pool");
   if (!hina_query_slot_valid(pool)) return;
   uint16_t idx = hina_id_index(pool.id);
-  VkQueryPool vk_pool = HINA_QUERY_ENTRY(idx)->pool;
-  HINA_QUERY_ENTRY(idx)->pool = VK_NULL_HANDLE;
-  hina_query_slot_free(idx);
-  if (vk_pool)
-  {
-    HINA_DEFER_DESTROY_QUERY_POOL(ctx, vk_pool);
-  }
+  // Invalidate via generation bump — don't null pool handle (zombie needs it).
+  HINA_QUERY_ENTRY(idx)->generation++;
+  HINA_QUERY_ENTRY(idx)->next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
+  hina_defer_destroy_fast(ctx, HINA_ZOMBIE_SLOT_QUERY_POOL, (uint64_t)idx, 0);
 }
 
 void hina_destroy_query_pool(hina_query_pool pool)

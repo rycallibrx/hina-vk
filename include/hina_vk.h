@@ -104,17 +104,27 @@
  * - **Bind Groups**: `hina_create_bind_group`, `hina_destroy_bind_group`,
  *   `hina_alloc_transient_bind_group`
  *
- * ### Multi-Threaded Command Recording
- * For parallel command recording, create child contexts via `hina_create_thread_context()`.
- * Each thread context has its own command pools, staging buffers, and can record independently.
- * Submit all command buffers from the main thread.
+ * ### Recording Contexts (parallel command recording)
+ * Created via `hina_create_recording_context()`. Frame-synced with the parent:
+ * `hina_frame_begin`/`hina_frame_end` automatically manage their per-frame pools.
+ * Each recording context has its own command pools, descriptor allocators, and staging
+ * buffers. Use one recording context per worker thread; submit all command buffers
+ * from the main thread. See `examples/gltf_renderer` for usage.
  *
- * ### Multi-Threaded Staging/Uploads
- * Each context (`hina_context`) has its own staging command buffer and retired page list.
- * When using thread contexts for parallel asset loading:
- * - Call `hina_ctx_flush_uploads(thread_ctx)` to flush that context's staged uploads
+ * ### Transfer Contexts (async resource uploads)
+ * Created via `hina_create_transfer_context()`. NOT frame-synced — the caller owns
+ * the lifecycle (create, use, flush, wait, destroy). Transfer contexts only allocate
+ * staging resources and support a restricted API surface:
+ * - **Valid**: `hina_ctx_make_texture`, `hina_ctx_make_buffer`, `hina_ctx_destroy_texture`,
+ *   `hina_ctx_destroy_buffer`, `hina_ctx_flush_uploads`, `hina_ctx_flush_staging`,
+ *   `hina_ctx_wait_ticket`, `hina_ctx_download_texture`, `hina_ctx_download_texture_3d`
+ * - **NOT valid** (asserts in debug): `hina_ctx_cmd_begin`, `hina_ctx_submit_immediate`,
+ *   `hina_ctx_create_bind_group`, `hina_ctx_generate_mips`, and other recording-only functions
+ * - Transfer contexts must upload textures with `mip_levels = 1` or pre-generated mip chains
+ *   (`hina_ctx_generate_mips` is not available on transfer contexts)
  * - The global staging page pool is shared and thread-safe
  * - Ready-check APIs (`hina_buffer_is_ready`, etc.) are thread-safe for different resources
+ * See `examples/streaminggallery` for usage.
  *
  * ### Vulkan Synchronization Notes
  * - Resource creation (`vkCreate*`) is generally thread-safe in Vulkan
@@ -362,14 +372,15 @@ HINA_API hina_ticket hina_flush_uploads(void);
  *
  * Each context has its own staging command buffer and pending upload list.
  * Use this when doing multi-threaded asset loading where each thread has
- * its own context created via `hina_create_thread_context()`.
+ * its own context created via `hina_create_transfer_context()` or
+ * `hina_create_recording_context()`.
  *
  * @note The staging page pool is shared across all contexts (thread-safe),
  *       but each context's staging command buffer is context-local.
  *
- * @param ctx Context whose staged uploads should be flushed
+ * @param ctx Context whose staged uploads should be flushed (valid on: all contexts)
  * @return Ticket for the flushed uploads, or 0 if nothing was staged
- * @see hina_flush_uploads, hina_create_thread_context
+ * @see hina_flush_uploads, hina_create_transfer_context, hina_create_recording_context
  */
 HINA_API hina_ticket hina_ctx_flush_uploads(hina_context* ctx);
 
@@ -792,10 +803,18 @@ HINA_API bool hina_init(const hina_desc* desc);
  */
 HINA_API void hina_shutdown(void);
 
-// HinaVK allows creating child contexts for multi-threaded command recording.
-HINA_API hina_context* hina_create_thread_context(void);
+// Recording contexts for parallel command recording within a frame.
+// Frame-synced with parent: hina_frame_begin/end manages their per-frame pools.
+// Each context should be used from a single dedicated thread.
+HINA_API hina_context* hina_create_recording_context(void);
+HINA_API void          hina_destroy_recording_context(hina_context* ctx);
 
-HINA_API void hina_destroy_thread_context(hina_context* ctx);
+// Transfer contexts for async resource uploads from background threads.
+// NOT frame-synced: caller owns the lifecycle (create, use, flush, wait, destroy).
+// Restricted API: only staging/upload functions are valid.
+// Attempting command recording (hina_ctx_cmd_begin) asserts in debug.
+HINA_API hina_context* hina_create_transfer_context(void);
+HINA_API void          hina_destroy_transfer_context(hina_context* ctx);
 
 typedef struct hina_vulkan_handles
 {
@@ -919,6 +938,7 @@ typedef struct hina_frame_stats
  */
 HINA_API hina_frame_stats hina_get_frame_stats(void);
 
+/** @brief Get frame statistics for a specific context. (valid on: recording/root contexts only) */
 HINA_API hina_frame_stats hina_ctx_get_frame_stats(hina_context* ctx);
 
 /**
@@ -1086,6 +1106,7 @@ HINA_API void hina_frame_wait_at(hina_queue dst, hina_sync_point src, hina_stage
  */
 HINA_API hina_ticket hina_submit_immediate(hina_cmd* cmd);
 
+/** @brief Submit a command buffer for immediate execution. (valid on: recording/root contexts only) */
 HINA_API hina_ticket hina_ctx_submit_immediate(hina_context* ctx, hina_cmd* cmd);
 
 /**
@@ -1095,6 +1116,7 @@ HINA_API hina_ticket hina_ctx_submit_immediate(hina_context* ctx, hina_cmd* cmd)
  */
 HINA_API void hina_wait_ticket(hina_ticket ticket);
 
+/** @brief Wait for a GPU submission ticket to complete. (valid on: all contexts) */
 HINA_API void hina_ctx_wait_ticket(hina_context* ctx, hina_ticket ticket);
 
 //  Swapchain & Presentation
@@ -1325,6 +1347,7 @@ HINA_API hina_buffer_desc hina_buffer_desc_default(void);
 // Global API
 HINA_API hina_buffer hina_make_buffer(const hina_buffer_desc* desc);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. */
 HINA_API void hina_destroy_buffer(hina_buffer buf);
 
 // Returns persistent mapped pointer for HINA_BUFFER_CPU or HINA_BUFFER_CPU_EXPLICIT buffers.
@@ -1346,10 +1369,13 @@ HINA_API void hina_download_buffer(hina_buffer src, size_t offset, size_t size, 
 
 HINA_API hina_ticket hina_flush_staging(void); // Flush internal staging buffers
 // Context API (for functions requiring per-context frame state)
+/** @brief Create a buffer on a specific context. (valid on: all contexts) */
 HINA_API hina_buffer hina_ctx_make_buffer(hina_context* ctx, const hina_buffer_desc* desc);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. (valid on: all contexts) */
 HINA_API void hina_ctx_destroy_buffer(hina_context* ctx, hina_buffer buf);
 
+/** @brief Flush internal staging buffers for a specific context. (valid on: all contexts) */
 HINA_API hina_ticket hina_ctx_flush_staging(hina_context* ctx);
 
 //  Textures & Views
@@ -1420,15 +1446,19 @@ HINA_API hina_texture_desc hina_texture_desc_default(void);
 // Global API
 HINA_API hina_texture hina_make_texture(const hina_texture_desc* desc);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. */
 HINA_API void hina_destroy_texture(hina_texture tex);
 
 HINA_API hina_ticket hina_generate_mips(hina_texture tex);
 
 // Context API
+/** @brief Create a texture on a specific context. (valid on: all contexts) */
 HINA_API hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* desc);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. (valid on: all contexts) */
 HINA_API void hina_ctx_destroy_texture(hina_context* ctx, hina_texture tex);
 
+/** @brief Generate mipmaps for a texture. (valid on: recording/root contexts only) */
 HINA_API hina_ticket hina_ctx_generate_mips(hina_context* ctx, hina_texture tex);
 
 /**
@@ -1514,12 +1544,14 @@ HINA_API bool hina_texture_view_is_valid(hina_texture_view view);
  */
 HINA_API void hina_download_texture(hina_texture src, uint32_t mip, uint32_t layer, void* dst, size_t dst_size);
 
+/** @brief Download texture data from GPU to CPU. (valid on: all contexts) */
 HINA_API void hina_ctx_download_texture(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t layer, void* dst,
                                         size_t dst_size);
 
 HINA_API void hina_download_texture_3d(hina_texture src, uint32_t mip, uint32_t z_offset, uint32_t depth, void* dst,
                                        size_t dst_size);
 
+/** @brief Download 3D texture data from GPU to CPU. (valid on: all contexts) */
 HINA_API void hina_ctx_download_texture_3d(hina_context* ctx, hina_texture src, uint32_t mip, uint32_t z_offset,
                                            uint32_t depth, void* dst, size_t dst_size);
 
@@ -1585,8 +1617,10 @@ HINA_API hina_sampler_desc hina_sampler_desc_default(void);
 
 HINA_API hina_sampler hina_make_sampler(const hina_sampler_desc* desc);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. */
 HINA_API void hina_destroy_sampler(hina_sampler samp);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. (valid on: recording/root contexts only) */
 HINA_API void hina_ctx_destroy_sampler(hina_context* ctx, hina_sampler samp);
 
 /**
@@ -1757,6 +1791,7 @@ HINA_API hina_bind_group_layout hina_create_bind_group_layout_from_hsl_module(
 HINA_API void hina_destroy_bind_group_layout(hina_bind_group_layout layout);
 
 // Context-aware version (for deferred destruction)
+/** @brief Destroy a bind group layout via a specific context (for deferred destruction). (valid on: recording/root contexts only) */
 HINA_API void hina_ctx_destroy_bind_group_layout(hina_context* ctx, hina_bind_group_layout layout);
 
 /**
@@ -1766,15 +1801,14 @@ HINA_API void hina_ctx_destroy_bind_group_layout(hina_context* ctx, hina_bind_gr
  */
 HINA_API hina_bind_group hina_create_bind_group(const hina_bind_group_desc* desc);
 
-/**
- * @brief Destroy a persistent bind group.
- * Safe to call with invalid handle. Do NOT call on temporary bind groups.
- */
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. */
 HINA_API void hina_destroy_bind_group(hina_bind_group group);
 
 // Context-aware versions
+/** @brief Create a bind group on a specific context. (valid on: recording/root contexts only) */
 HINA_API hina_bind_group hina_ctx_create_bind_group(hina_context* ctx, const hina_bind_group_desc* desc);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. (valid on: recording/root contexts only) */
 HINA_API void hina_ctx_destroy_bind_group(hina_context* ctx, hina_bind_group group);
 
 // ---------------------------------------------------------------------------
@@ -1947,6 +1981,7 @@ typedef struct hina_transient_bind_group
  */
 HINA_API hina_transient_bind_group hina_alloc_transient_bind_group(hina_bind_group_layout layout);
 
+/** @brief Allocate a transient bind group. (valid on: recording/root contexts only) */
 HINA_API hina_transient_bind_group hina_ctx_alloc_transient_bind_group(hina_context* ctx, hina_bind_group_layout layout);
 
 /**
@@ -2695,8 +2730,10 @@ typedef struct hina_pipeline_desc_any
 // Pipeline Creation
 HINA_API hina_pipeline hina_make_pipeline_ex(const hina_pipeline_desc_any* desc);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. */
 HINA_API void hina_destroy_pipeline(hina_pipeline pip);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. (valid on: recording/root contexts only) */
 HINA_API void hina_ctx_destroy_pipeline(hina_context* ctx, hina_pipeline pip);
 
 /**
@@ -2829,11 +2866,13 @@ HINA_API void hina_free_pipeline_cache_data(void* data);
 // Begin/End Recording (convenience - defaults to GRAPHICS queue)
 HINA_API hina_cmd* hina_cmd_begin(void);
 
+/** @brief Begin a graphics command buffer. (valid on: recording/root contexts only) */
 HINA_API hina_cmd* hina_ctx_cmd_begin(hina_context* ctx);
 
 // Begin/End Recording (explicit queue selection)
 HINA_API hina_cmd* hina_cmd_begin_ex(hina_queue queue);
 
+/** @brief Begin a command buffer on a specific queue. (valid on: recording/root contexts only) */
 HINA_API hina_cmd* hina_ctx_cmd_begin_ex(hina_context* ctx, hina_queue queue);
 
 HINA_API void hina_cmd_end(hina_cmd* cmd);
@@ -3286,8 +3325,10 @@ typedef struct hina_query_pool_desc
 
 HINA_API hina_query_pool hina_make_query_pool(const hina_query_pool_desc* desc);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. */
 HINA_API void hina_destroy_query_pool(hina_query_pool pool);
 
+/** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. (valid on: recording/root contexts only) */
 HINA_API void hina_ctx_destroy_query_pool(hina_context* ctx, hina_query_pool pool);
 
 HINA_API void hina_cmd_reset_query_pool(hina_cmd* cmd, hina_query_pool pool, uint32_t first_query, uint32_t count);

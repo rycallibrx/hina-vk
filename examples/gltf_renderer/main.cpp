@@ -1674,15 +1674,15 @@ int main(int argc, char** argv) {
     // Thread contexts
     // ========================================================================
 
-    hina_context* shadow_ctx = hina_create_thread_context();
-    hina_context* main_ctx = hina_create_thread_context();
+    hina_context* shadow_ctx = hina_create_recording_context();
+    hina_context* main_ctx = hina_create_recording_context();
     if (!shadow_ctx || !main_ctx) {
         EXAMPLE_LOGE("Failed to create thread contexts");
         return 1;
     }
     HINA_SCOPE_EXIT({
-        hina_destroy_thread_context(shadow_ctx);
-        hina_destroy_thread_context(main_ctx);
+        hina_destroy_recording_context(shadow_ctx);
+        hina_destroy_recording_context(main_ctx);
     });
 
     WorkerState shadow_worker;
