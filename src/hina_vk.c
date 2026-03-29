@@ -7877,10 +7877,11 @@ static void hina_free_all_deferred_payload_blocks(hina_context* ctx)
   ctx->core.device->deferred.payload_free = NULL;
 }
 
-// Create legacy render pass with color + optional MSAA resolve + optional depth
+// Create legacy render pass with optional color + optional MSAA resolve + optional depth
+// Pass color_format = VK_FORMAT_UNDEFINED for depth-only
 // Pass depth_format = VK_FORMAT_UNDEFINED for color-only
 // Pass color_resolve_format = VK_FORMAT_UNDEFINED for no MSAA resolve
-// Attachment order: [0] color, [1] resolve OR depth, [2] depth (if MSAA+depth)
+// Attachment order: [0..] color (if present), resolve (if MSAA), depth (if present)
 static VkRenderPass hina_legacy_make_render_pass(hina_context* ctx, VkFormat color_format,
                                                  VkSampleCountFlagBits color_samples, VkAttachmentLoadOp color_load,
                                                  VkAttachmentStoreOp color_store, VkImageLayout color_initial,
@@ -7888,20 +7889,26 @@ static VkRenderPass hina_legacy_make_render_pass(hina_context* ctx, VkFormat col
                                                  VkFormat depth_format, VkSampleCountFlagBits depth_samples,
                                                  VkAttachmentLoadOp depth_load, VkAttachmentStoreOp depth_store)
 {
+  bool has_color = color_format != VK_FORMAT_UNDEFINED;
   bool has_depth = depth_format != VK_FORMAT_UNDEFINED;
-  bool has_resolve = color_resolve_format != VK_FORMAT_UNDEFINED;
+  bool has_resolve = has_color && color_resolve_format != VK_FORMAT_UNDEFINED;
   uint32_t att_count = 0;
   VkAttachmentDescription attachments[3];
-  // [0] Color attachment (MSAA or 1x)
-  // CRITICAL for tile-based GPUs: MSAA attachment uses DONT_CARE storeOp (resolve target is what we keep)
-  attachments[att_count++] = (VkAttachmentDescription){
-    .format = color_format, .samples = color_samples, .loadOp = color_load,
-    .storeOp = has_resolve ? VK_ATTACHMENT_STORE_OP_DONT_CARE : color_store,
-    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-    .initialLayout = color_initial, .finalLayout = has_resolve ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : color_final
-  };
-  uint32_t resolve_idx = 0;
-  uint32_t depth_idx = 0;
+  uint32_t color_idx = VK_ATTACHMENT_UNUSED;
+  if (has_color)
+  {
+    // [0] Color attachment (MSAA or 1x)
+    // CRITICAL for tile-based GPUs: MSAA attachment uses DONT_CARE storeOp (resolve target is what we keep)
+    color_idx = att_count;
+    attachments[att_count++] = (VkAttachmentDescription){
+      .format = color_format, .samples = color_samples, .loadOp = color_load,
+      .storeOp = has_resolve ? VK_ATTACHMENT_STORE_OP_DONT_CARE : color_store,
+      .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+      .initialLayout = color_initial, .finalLayout = has_resolve ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : color_final
+    };
+  }
+  uint32_t resolve_idx = VK_ATTACHMENT_UNUSED;
+  uint32_t depth_idx = VK_ATTACHMENT_UNUSED;
   if (has_resolve)
   {
     // [1] Resolve attachment (always 1x samples)
@@ -7915,7 +7922,7 @@ static VkRenderPass hina_legacy_make_render_pass(hina_context* ctx, VkFormat col
   }
   if (has_depth)
   {
-    // [1 or 2] Depth attachment
+    // Depth attachment (index depends on whether color/resolve are present)
     depth_idx = att_count;
     attachments[att_count++] = (VkAttachmentDescription){
       .format = depth_format, .samples = depth_samples, .loadOp = depth_load, .storeOp = depth_store,
@@ -7926,23 +7933,30 @@ static VkRenderPass hina_legacy_make_render_pass(hina_context* ctx, VkFormat col
       .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
     };
   }
-  VkAttachmentReference color_ref = {.attachment = 0, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  HINA_ASSERTF(att_count > 0, "hina_legacy_make_render_pass: no attachments (need at least color or depth)");
+  VkAttachmentReference color_ref = {.attachment = color_idx, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkAttachmentReference resolve_ref = {.attachment = resolve_idx, .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
   VkAttachmentReference depth_ref = {
     .attachment = depth_idx, .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
   };
   VkSubpassDescription subpass = {
-    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &color_ref,
-    .pResolveAttachments = has_resolve ? &resolve_ref : NULL, .pDepthStencilAttachment = has_depth ? &depth_ref : NULL
+    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+    .colorAttachmentCount = has_color ? 1 : 0,
+    .pColorAttachments = has_color ? &color_ref : NULL,
+    .pResolveAttachments = has_resolve ? &resolve_ref : NULL,
+    .pDepthStencilAttachment = has_depth ? &depth_ref : NULL
   };
   // Subpass dependencies for layout transitions - critical for some drivers (e.g., Mali)
   VkSubpassDependency dependencies[2];
   uint32_t dep_count = 0;
-  dependencies[dep_count++] = (VkSubpassDependency){
-    .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-    .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .srcAccessMask = 0,
-    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT, .dependencyFlags = 0
-  };
+  if (has_color)
+  {
+    dependencies[dep_count++] = (VkSubpassDependency){
+      .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .srcAccessMask = 0,
+      .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT, .dependencyFlags = 0
+    };
+  }
   if (has_depth)
   {
     dependencies[dep_count++] = (VkSubpassDependency){
@@ -13899,7 +13913,8 @@ static void hina_cache_sweep(hina_context* ctx)
   mtx_unlock(&dev->lock.legacy_cache_lock);
 }
 
-// Generate a hash key for render pass cache (with optional depth and MSAA resolve)
+// Generate a hash key for render pass cache (with optional color and/or depth)
+// Pass color_fmt = VK_FORMAT_UNDEFINED for depth-only
 // Pass depth_fmt = VK_FORMAT_UNDEFINED for color-only
 // Pass color_resolve_fmt = VK_FORMAT_UNDEFINED for no MSAA resolve
 // Supports 1x and 4x sample counts only
@@ -13923,11 +13938,14 @@ static uint64_t hina_rp_cache_key(VkFormat color_fmt, VkSampleCountFlagBits colo
   // [23:22] depth_store (2 bits)
   // [21:13] color_initial (9 bits)
   // [12:4]  color_final (9 bits)
+  // [3]     has_color
   uint64_t key = 0;
+  bool has_color = color_fmt != VK_FORMAT_UNDEFINED;
   if (depth_fmt != VK_FORMAT_UNDEFINED) key |= 0x8000000000000000ULL;
   if (color_samples == VK_SAMPLE_COUNT_4_BIT) key |= 0x4000000000000000ULL;
   if (depth_samples == VK_SAMPLE_COUNT_4_BIT) key |= 0x2000000000000000ULL;
   if (color_resolve_fmt != VK_FORMAT_UNDEFINED) key |= 0x1000000000000000ULL;
+  if (has_color) key |= 0x0000000000000008ULL;  // bit [3]: has_color
   key |= (uint64_t)(color_fmt & 0xFFF) << 48;
   key |= (uint64_t)(color_resolve_fmt & 0xFF) << 40;
   key |= (uint64_t)(depth_fmt & 0xFF) << 32;
@@ -13940,7 +13958,8 @@ static uint64_t hina_rp_cache_key(VkFormat color_fmt, VkSampleCountFlagBits colo
   return key;
 }
 
-// Lookup or create a cached render pass (with optional depth and MSAA resolve)
+// Lookup or create a cached render pass (with optional color and/or depth)
+// Pass color_fmt = VK_FORMAT_UNDEFINED for depth-only
 // Pass depth_fmt = VK_FORMAT_UNDEFINED for color-only
 // Pass color_resolve_fmt = VK_FORMAT_UNDEFINED for no MSAA resolve
 static VkRenderPass hina_legacy_get_cached_render_pass(hina_context* ctx, hina_cmd* cmd, VkFormat color_fmt,
@@ -18331,120 +18350,146 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
   hina_context* ctx = cmd->ctx;
   HINA_DEBUG_INC_PASS(ctx);
   HINA_GPU_ZONE_BEGIN(ctx->core.device, cmd, "render_pass");
-  const bool transient_color = (action->flags & HINA_PASS_TRANSIENT_COLOR_BIT) != 0;
-  const bool transient_depth = (action->flags & HINA_PASS_TRANSIENT_DEPTH_BIT) != 0;
   {
     // Legacy render pass path - supports single color + optional MSAA resolve + optional depth
-    hina_texture_view color_view_handle = action->colors[0].image;
+    // Also supports depth-only (0 color attachments) for shadow maps / depth pre-pass
+    const bool transient_color = (action->flags & HINA_PASS_TRANSIENT_COLOR_BIT) != 0;
+    const bool transient_depth = (action->flags & HINA_PASS_TRANSIENT_DEPTH_BIT) != 0;
+    const bool has_color = action->colors[0].image.id != HINA_INVALID_HANDLE;
+
+    // ── Color attachment (optional) ──────────────────────────────────────
     hina_texture_view_slot* color_view_slot = NULL;
-    VkImageView color_view = hina_get_or_create_view(color_view_handle, VK_IMAGE_ASPECT_COLOR_BIT, &color_view_slot);
-    if (!color_view || !color_view_slot)
-    {
-      HINA_ZONE_END();
-      return;
-    }
-    hina_texture_hot* color_hot = HINA_TEX_HOT(color_view_slot->parent_idx);
-    VkFormat color_fmt = color_view_slot->format;
-    VkSampleCountFlagBits color_samples = color_hot->samples;
-    // Check for MSAA resolve target
-    hina_texture_view resolve_view_handle = action->colors[0].resolve;
-    hina_texture_view_slot* resolve_view_slot = NULL;
-    VkImageView resolve_view = VK_NULL_HANDLE;
+    VkImageView color_view = VK_NULL_HANDLE;
+    hina_texture_hot* color_hot = NULL;
+    VkFormat color_fmt = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlagBits color_samples = VK_SAMPLE_COUNT_1_BIT;
+    hina_texture_view resolve_view_handle = (hina_texture_view){HINA_INVALID_HANDLE};
     VkFormat color_resolve_fmt = VK_FORMAT_UNDEFINED;
     bool has_resolve = false;
-    if (color_samples > VK_SAMPLE_COUNT_1_BIT)
+    VkAttachmentLoadOp color_load = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    VkAttachmentStoreOp color_store = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    VkImageLayout color_initial = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout color_final = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (has_color)
     {
-      // MSAA requires a resolve target
-      if (resolve_view_handle.id != HINA_INVALID_HANDLE)
+      hina_texture_view color_view_handle_local = action->colors[0].image;
+      color_view = hina_get_or_create_view(color_view_handle_local, VK_IMAGE_ASPECT_COLOR_BIT, &color_view_slot);
+      if (!color_view || !color_view_slot)
       {
-        resolve_view = hina_get_or_create_view(resolve_view_handle, VK_IMAGE_ASPECT_COLOR_BIT, &resolve_view_slot);
-        if (resolve_view && resolve_view_slot)
+        HINA_ZONE_END();
+        return;
+      }
+      color_hot = HINA_TEX_HOT(color_view_slot->parent_idx);
+      color_fmt = color_view_slot->format;
+      color_samples = color_hot->samples;
+      // Check for MSAA resolve target
+      resolve_view_handle = action->colors[0].resolve;
+      hina_texture_view_slot* resolve_view_slot = NULL;
+      VkImageView resolve_view = VK_NULL_HANDLE;
+      if (color_samples > VK_SAMPLE_COUNT_1_BIT)
+      {
+        if (resolve_view_handle.id != HINA_INVALID_HANDLE)
         {
-          hina_texture_hot* resolve_hot = HINA_TEX_HOT(resolve_view_slot->parent_idx);
-          HINA_ASSERTF(resolve_hot->samples == VK_SAMPLE_COUNT_1_BIT,
-                       "MSAA resolve target must have 1x samples, got %d", (int)resolve_hot->samples);
-          color_resolve_fmt = resolve_view_slot->format;
-          has_resolve = true;
+          resolve_view = hina_get_or_create_view(resolve_view_handle, VK_IMAGE_ASPECT_COLOR_BIT, &resolve_view_slot);
+          if (resolve_view && resolve_view_slot)
+          {
+            hina_texture_hot* resolve_hot = HINA_TEX_HOT(resolve_view_slot->parent_idx);
+            HINA_ASSERTF(resolve_hot->samples == VK_SAMPLE_COUNT_1_BIT,
+                         "MSAA resolve target must have 1x samples, got %d", (int)resolve_hot->samples);
+            color_resolve_fmt = resolve_view_slot->format;
+            has_resolve = true;
+          }
+        }
+        HINA_ASSERTF(has_resolve, "MSAA color attachment requires a resolve target");
+      }
+      hina_load_op color_load_action = action->colors[0].load_op;
+      hina_store_op color_store_action = action->colors[0].store_op;
+      if (transient_color)
+      {
+        if (color_load_action != HINA_LOAD_OP_CLEAR) color_load_action = HINA_LOAD_OP_DONT_CARE;
+        color_store_action = HINA_STORE_OP_DONT_CARE;
+        hina_texture_hot* store_target = has_resolve ? HINA_TEX_HOT(resolve_view_slot->parent_idx) : color_hot;
+        if (!store_target->owns_image)
+        {
+          color_store_action = HINA_STORE_OP_STORE;
+          HINA_LOGW(ctx, "hina_cmd_begin_pass: transient color on swapchain image forces STORE");
         }
       }
-      HINA_ASSERTF(has_resolve, "MSAA color attachment requires a resolve target");
-    }
-    hina_load_op color_load_action = action->colors[0].load_op;
-    hina_store_op color_store_action = action->colors[0].store_op;
-    if (transient_color)
-    {
-      if (color_load_action != HINA_LOAD_OP_CLEAR) color_load_action = HINA_LOAD_OP_DONT_CARE;
-      color_store_action = HINA_STORE_OP_DONT_CARE;
-      // For MSAA, check resolve target for swapchain, not the MSAA buffer
-      hina_texture_hot* store_target = has_resolve ? HINA_TEX_HOT(resolve_view_slot->parent_idx) : color_hot;
-      if (!store_target->owns_image)
+      color_load = hina_load_op_to_vk(color_load_action);
+      color_store = hina_store_op_to_vk(color_store_action);
+      color_initial = VK_IMAGE_LAYOUT_UNDEFINED;
+      if (color_load == VK_ATTACHMENT_LOAD_OP_LOAD)
       {
-        color_store_action = HINA_STORE_OP_STORE;
-        HINA_LOGW(ctx, "hina_cmd_begin_pass: transient color on swapchain image forces STORE");
+        color_initial = color_hot->state.layout;
+        if (color_initial == VK_IMAGE_LAYOUT_UNDEFINED) color_initial = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
       }
-    }
-    VkAttachmentLoadOp color_load = hina_load_op_to_vk(color_load_action);
-    VkAttachmentStoreOp color_store = hina_store_op_to_vk(color_store_action);
-    // For render pass compatibility, use UNDEFINED as initial layout when doing CLEAR
-    VkImageLayout color_initial = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (color_load == VK_ATTACHMENT_LOAD_OP_LOAD)
-    {
-      color_initial = color_hot->state.layout;
-      if (color_initial == VK_IMAGE_LAYOUT_UNDEFINED) color_initial = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    }
-    // Final layout depends on resolve/swapchain target
-    // For MSAA, color_final affects the RESOLVE attachment's finalLayout, not the MSAA buffer
-    VkImageLayout color_final = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    if (has_resolve && resolve_view_slot)
-    {
-      hina_texture_hot* resolve_hot = HINA_TEX_HOT(resolve_view_slot->parent_idx);
-      if (!resolve_hot->owns_image)
+      color_final = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      if (has_resolve && resolve_view_slot)
+      {
+        hina_texture_hot* resolve_hot = HINA_TEX_HOT(resolve_view_slot->parent_idx);
+        if (!resolve_hot->owns_image)
+        {
+          color_final = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+          hina_cmd_note_swapchain_use(cmd, resolve_hot, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        }
+        else
+        {
+          color_final = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+      }
+      else if (!color_hot->owns_image)
       {
         color_final = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        hina_cmd_note_swapchain_use(cmd, resolve_hot, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        hina_cmd_note_swapchain_use(cmd, color_hot, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
       }
       else
       {
-        // Owned resolve target (render-to-texture) → ready for sampling
         color_final = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       }
     }
-    else if (!color_hot->owns_image)
-    {
-      color_final = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-      hina_cmd_note_swapchain_use(cmd, color_hot, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-    }
-    else
-    {
-      color_final = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    }
+
+    // ── Depth attachment (optional) ──────────────────────────────────────
     hina_texture_view depth_view_handle = action->depth.image;
     hina_texture_view_slot* depth_view_slot = NULL;
     VkImageView depth_view = hina_get_or_create_view(depth_view_handle, VK_IMAGE_ASPECT_DEPTH_BIT, &depth_view_slot);
     bool has_depth = depth_view != VK_NULL_HANDLE;
-    // Attachment order: [0] color, [1] resolve OR depth, [2] depth (if MSAA+depth)
+
+    // Must have at least one attachment
+    if (!has_color && !has_depth)
+    {
+      HINA_LOGE(ctx, "hina_cmd_begin_pass_legacy: no color or depth attachment");
+      HINA_ZONE_END();
+      return;
+    }
+
+    // ── Build attachment array ───────────────────────────────────────────
+    // Attachment order: [0..] color (if present), resolve (if MSAA), depth (if present)
     VkImageView attachments[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkClearValue clears[3] = {0};
     uint32_t attachment_count = 0;
-    // [0] Color attachment
-    attachments[attachment_count] = color_view;
-    memcpy(clears[attachment_count].color.float32, action->colors[0].clear_color, sizeof(float) * 4);
-    attachment_count++;
-    // [1] Resolve (if MSAA) or Depth (if no MSAA but has depth)
-    if (has_resolve)
+    if (has_color)
     {
-      attachments[attachment_count] = resolve_view;
-      memset(&clears[attachment_count], 0, sizeof(VkClearValue));
+      attachments[attachment_count] = color_view;
+      memcpy(clears[attachment_count].color.float32, action->colors[0].clear_color, sizeof(float) * 4);
       attachment_count++;
+      if (has_resolve)
+      {
+        hina_texture_view_slot* rv_slot = NULL;
+        VkImageView rv = hina_get_or_create_view(resolve_view_handle, VK_IMAGE_ASPECT_COLOR_BIT, &rv_slot);
+        attachments[attachment_count] = rv;
+        memset(&clears[attachment_count], 0, sizeof(VkClearValue));
+        attachment_count++;
+      }
     }
-    // Depth attachment
     VkFormat depth_fmt = VK_FORMAT_UNDEFINED;
     VkSampleCountFlagBits depth_samples = VK_SAMPLE_COUNT_1_BIT;
     VkAttachmentLoadOp depth_load = 0;
     VkAttachmentStoreOp depth_store = 0;
+    hina_texture_hot* depth_hot = NULL;
     if (has_depth)
     {
-      hina_texture_hot* depth_hot = HINA_TEX_HOT(depth_view_slot->parent_idx);
+      depth_hot = HINA_TEX_HOT(depth_view_slot->parent_idx);
       depth_fmt = depth_view_slot->format;
       depth_samples = depth_hot->samples;
       hina_load_op depth_load_action = action->depth.load_op;
@@ -18456,9 +18501,12 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
       }
       depth_load = hina_load_op_to_vk(depth_load_action);
       depth_store = hina_store_op_to_vk(depth_store_action);
-      HINA_ASSERTF(depth_hot->dims.width >= color_hot->dims.width && depth_hot->dims.height >= color_hot->dims.height,
-                   "depth buffer (%ux%u) must be >= color attachment (%ux%u)", depth_hot->dims.width,
-                   depth_hot->dims.height, color_hot->dims.width, color_hot->dims.height);
+      if (has_color)
+      {
+        HINA_ASSERTF(depth_hot->dims.width >= color_hot->dims.width && depth_hot->dims.height >= color_hot->dims.height,
+                     "depth buffer (%ux%u) must be >= color attachment (%ux%u)", depth_hot->dims.width,
+                     depth_hot->dims.height, color_hot->dims.width, color_hot->dims.height);
+      }
       attachments[attachment_count] = depth_view;
       clears[attachment_count].depthStencil.depth = action->depth.depth_clear;
       clears[attachment_count].depthStencil.stencil = action->depth.stencil_clear;
@@ -18469,7 +18517,27 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
     {
       cmd->depth_view = (hina_texture_view){HINA_INVALID_HANDLE};
     }
-    // Get cached render pass with MSAA support
+
+    // ── Derive render area dimensions ────────────────────────────────────
+    // Priority: action->width/height (explicit) > color dims > depth dims
+    uint32_t width = action->width;
+    uint32_t height = action->height;
+    if (width == 0 || height == 0)
+    {
+      if (has_color)
+      {
+        width = color_hot->dims.width;
+        height = color_hot->dims.height;
+      }
+      else if (has_depth)
+      {
+        width = depth_hot->dims.width;
+        height = depth_hot->dims.height;
+      }
+    }
+    HINA_ASSERTF(width > 0 && height > 0, "hina_cmd_begin_pass_legacy: render area is 0x0");
+
+    // ── Get cached render pass and framebuffer ───────────────────────��───
     VkRenderPass rp = hina_legacy_get_cached_render_pass(ctx, cmd, color_fmt, color_samples, color_load, color_store,
                                                          color_initial, color_final, color_resolve_fmt, depth_fmt,
                                                          depth_samples, depth_load, depth_store);
@@ -18478,9 +18546,7 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
       HINA_ZONE_END();
       return;
     }
-    // Get cached framebuffer
-    VkFramebuffer framebuffer = hina_legacy_get_cached_framebuffer(ctx, cmd, rp, color_hot->dims.width,
-                                                                    color_hot->dims.height, attachments,
+    VkFramebuffer framebuffer = hina_legacy_get_cached_framebuffer(ctx, cmd, rp, width, height, attachments,
                                                                     attachment_count);
     if (framebuffer == VK_NULL_HANDLE)
     {
@@ -18489,14 +18555,23 @@ HINA_NOINLINE static void hina_cmd_begin_pass_legacy(hina_cmd* cmd, const hina_p
     }
     const VkRenderPassBeginInfo bi = {
       .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp, .framebuffer = framebuffer,
-      .renderArea.extent = {color_hot->dims.width, color_hot->dims.height}, .clearValueCount = attachment_count,
+      .renderArea.extent = {width, height}, .clearValueCount = attachment_count,
       .pClearValues = clears
     };
     vkCmdBeginRenderPass(cmd->vk_cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
-    hina_cmd_set_viewport_scissor_internal(cmd, color_hot->dims.width, color_hot->dims.height);
-    cmd->color_views[0] = color_view_handle;
-    cmd->resolve_views[0] = resolve_view_handle;
-    cmd->color_count = 1;
+    hina_cmd_set_viewport_scissor_internal(cmd, width, height);
+    if (has_color)
+    {
+      cmd->color_views[0] = action->colors[0].image;
+      cmd->resolve_views[0] = resolve_view_handle;
+      cmd->color_count = 1;
+    }
+    else
+    {
+      cmd->color_views[0] = (hina_texture_view){HINA_INVALID_HANDLE};
+      cmd->resolve_views[0] = (hina_texture_view){HINA_INVALID_HANDLE};
+      cmd->color_count = 0;
+    }
     cmd->is_rendering = true;
   }
   HINA_ZONE_END();
