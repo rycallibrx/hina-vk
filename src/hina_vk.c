@@ -3237,6 +3237,39 @@ typedef struct hina_device
   void* tracy_vk_ctx;
 } hina_device;
 
+// Debug operation log: lightweight ring buffer of recent resource operations.
+// Always-on in debug builds. Dumped on VK_ERROR_DEVICE_LOST.
+#ifdef HINA_DEBUG
+typedef enum hina_oplog_op {
+  HINA_OPLOG_MAKE = 0,
+  HINA_OPLOG_DESTROY = 1,
+  HINA_OPLOG_FLUSH = 2,
+  HINA_OPLOG_WAIT = 3,
+} hina_oplog_op;
+
+typedef enum hina_oplog_kind {
+  HINA_OPLOG_TEXTURE = 0,
+  HINA_OPLOG_BUFFER = 1,
+  HINA_OPLOG_SAMPLER = 2,
+  HINA_OPLOG_BIND_GROUP = 3,
+  HINA_OPLOG_PIPELINE = 4,
+  HINA_OPLOG_QUERY_POOL = 5,
+  HINA_OPLOG_STAGING = 6,
+} hina_oplog_kind;
+
+#define HINA_OPLOG_SIZE 32
+#define HINA_OPLOG(ctx, _op, _kind, _slot, _ticket) do { \
+    uint32_t _i = (ctx)->debug.oplog.head++ & (HINA_OPLOG_SIZE - 1); \
+    (ctx)->debug.oplog.entries[_i].op = (uint8_t)(_op); \
+    (ctx)->debug.oplog.entries[_i].kind = (uint8_t)(_kind); \
+    (ctx)->debug.oplog.entries[_i].slot = (uint16_t)(_slot); \
+    (ctx)->debug.oplog.entries[_i].frame = (uint32_t)((ctx)->frame.frame_index); \
+    (ctx)->debug.oplog.entries[_i].ticket = (_ticket); \
+  } while(0)
+#else
+#define HINA_OPLOG(ctx, _op, _kind, _slot, _ticket) ((void)0)
+#endif
+
 #define HINA_MAX_TRANSFER_CONTEXTS 8
 
 typedef enum hina_context_kind {
@@ -3314,6 +3347,19 @@ typedef struct hina_context
     uint32_t temp_desc_overflow;
     uint32_t transient_desc_overflow;
     uint32_t staging_retired;
+    // Lightweight operation log — always-on in debug, dumped on device-lost
+    struct
+    {
+      struct
+      {
+        uint8_t op;      // hina_oplog_op enum
+        uint8_t kind;    // resource kind (0=texture, 1=buffer, 2=sampler, etc.)
+        uint16_t slot;   // pool slot index
+        uint32_t frame;  // lower 32 bits of frame_index
+        uint64_t ticket; // associated ticket (for flush/wait ops)
+      } entries[32];
+      uint32_t head; // next write index (wraps at 32)
+    } oplog;
   } debug;
 #endif
   // Frame statistics (always accumulated, no branch overhead)
@@ -3598,6 +3644,24 @@ static void hina_logf(hina_context* ctx, hina_log_level level, const char* fmt, 
 #else
 #define HINA_LOGE(ctx, ...) ((void)0)
 #endif
+
+// Device-lost crash dump: write directly to stderr to survive abort.
+// The log callback (HINA_LOGE) may buffer, and assert(0) kills the process
+// before the buffer flushes. fprintf(stderr) is unbuffered on most platforms.
+#define HINA_CRASH_LOG(fmt, ...) do { \
+    fprintf(stderr, "[hina][CRASH] " fmt "\n", ##__VA_ARGS__); \
+  } while(0)
+
+static const char* hina_context_kind_name(hina_context_kind kind)
+{
+  switch (kind)
+  {
+  case HINA_CTX_ROOT: return "ROOT";
+  case HINA_CTX_RECORDING: return "RECORDING";
+  case HINA_CTX_TRANSFER: return "TRANSFER";
+  default: return "UNKNOWN";
+  }
+}
 
 // Assert logging - uses logging system if available, falls back to stderr
 #ifdef HINA_DEBUG
@@ -5596,41 +5660,88 @@ static void hina_gpu_diag_log_nv_checkpoints(hina_context* ctx)
 }
 #endif
 
-static const char* hina_context_kind_name(hina_context_kind kind)
+static const char* hina_oplog_op_name(uint8_t op)
+{
+  switch (op)
+  {
+  case HINA_OPLOG_MAKE: return "MAKE";
+  case HINA_OPLOG_DESTROY: return "DESTROY";
+  case HINA_OPLOG_FLUSH: return "FLUSH";
+  case HINA_OPLOG_WAIT: return "WAIT";
+  default: return "?";
+  }
+}
+
+static const char* hina_oplog_kind_name(uint8_t kind)
 {
   switch (kind)
   {
-  case HINA_CTX_ROOT: return "ROOT";
-  case HINA_CTX_RECORDING: return "RECORDING";
-  case HINA_CTX_TRANSFER: return "TRANSFER";
-  default: return "UNKNOWN";
+  case HINA_OPLOG_TEXTURE: return "texture";
+  case HINA_OPLOG_BUFFER: return "buffer";
+  case HINA_OPLOG_SAMPLER: return "sampler";
+  case HINA_OPLOG_BIND_GROUP: return "bind_group";
+  case HINA_OPLOG_PIPELINE: return "pipeline";
+  case HINA_OPLOG_QUERY_POOL: return "query_pool";
+  case HINA_OPLOG_STAGING: return "staging";
+  default: return "?";
+  }
+}
+
+static void hina_gpu_diag_log_oplog(hina_context* ctx)
+{
+  uint32_t head = ctx->debug.oplog.head;
+  uint32_t count = head < HINA_OPLOG_SIZE ? head : HINA_OPLOG_SIZE;
+  if (count == 0)
+  {
+    HINA_CRASH_LOG("  oplog: (empty)");
+    return;
+  }
+  HINA_CRASH_LOG("  oplog: last %u operations (newest first):", count);
+  for (uint32_t i = 0; i < count; ++i)
+  {
+    uint32_t idx = (head - 1 - i) & (HINA_OPLOG_SIZE - 1);
+    const char* op = hina_oplog_op_name(ctx->debug.oplog.entries[idx].op);
+    const char* kind = hina_oplog_kind_name(ctx->debug.oplog.entries[idx].kind);
+    uint16_t slot = ctx->debug.oplog.entries[idx].slot;
+    uint32_t frame = ctx->debug.oplog.entries[idx].frame;
+    uint64_t ticket = ctx->debug.oplog.entries[idx].ticket;
+    if (ticket)
+    {
+      HINA_CRASH_LOG("    [%2u] %-7s %-10s slot=%u frame=%u ticket=%" PRIu64, i, op, kind, slot, frame, ticket);
+    }
+    else
+    {
+      HINA_CRASH_LOG("    [%2u] %-7s %-10s slot=%u frame=%u", i, op, kind, slot, frame);
+    }
   }
 }
 
 static void hina_gpu_diag_log_context_info(hina_context* ctx, const char* origin)
 {
-  HINA_LOGE(ctx, "  context: %s (ctx=%p, thread=%lu)", hina_context_kind_name(ctx->core.kind),
-            (void*)ctx, (unsigned long)HINA_CURRENT_THREAD_ID());
-  HINA_LOGE(ctx, "  origin: %s", origin ? origin : "unknown");
-  HINA_LOGE(ctx, "  frame_index: %llu, current_slot: %u",
-            (unsigned long long)ctx->frame.frame_index, ctx->frame.current_slot);
+  HINA_CRASH_LOG("  context: %s (ctx=%p, thread=%lu)", hina_context_kind_name(ctx->core.kind),
+                 (void*)ctx, (unsigned long)HINA_CURRENT_THREAD_ID());
+  HINA_CRASH_LOG("  origin: %s", origin ? origin : "unknown");
+  HINA_CRASH_LOG("  frame_index: %llu, current_slot: %u",
+                 (unsigned long long)ctx->frame.frame_index, ctx->frame.current_slot);
   hina_staging_context* sc = &ctx->staging;
   if (sc->last_submit_ticket || sc->last_gfx_submit_ticket || sc->last_comp_submit_ticket)
   {
-    HINA_LOGE(ctx, "  staging tickets: xfer=%" PRIu64 " gfx=%" PRIu64 " comp=%" PRIu64,
-              sc->last_submit_ticket, sc->last_gfx_submit_ticket, sc->last_comp_submit_ticket);
+    HINA_CRASH_LOG("  staging tickets: xfer=%" PRIu64 " gfx=%" PRIu64 " comp=%" PRIu64,
+                   sc->last_submit_ticket, sc->last_gfx_submit_ticket, sc->last_comp_submit_ticket);
   }
   if (sc->staged_buffers.count || sc->staged_textures.count)
   {
-    HINA_LOGE(ctx, "  staged pending: %u buffers, %u textures",
-              sc->staged_buffers.count, sc->staged_textures.count);
+    HINA_CRASH_LOG("  staged pending: %u buffers, %u textures",
+                   sc->staged_buffers.count, sc->staged_textures.count);
   }
   if (sc->pending_cmd || sc->gfx_pending_cmd || sc->comp_pending_cmd)
   {
-    HINA_LOGE(ctx, "  staging cmd state: pending_cmd=%s gfx_pending=%s comp_pending=%s",
-              sc->pending_cmd ? "YES" : "no", sc->gfx_pending_cmd ? "YES" : "no",
-              sc->comp_pending_cmd ? "YES" : "no");
+    HINA_CRASH_LOG("  staging cmd state: pending_cmd=%s gfx_pending=%s comp_pending=%s",
+                   sc->pending_cmd ? "YES" : "no", sc->gfx_pending_cmd ? "YES" : "no",
+                   sc->comp_pending_cmd ? "YES" : "no");
   }
+  hina_gpu_diag_log_oplog(ctx);
+  fflush(stderr);
 }
 
 static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* origin, VkResult result)
@@ -5642,7 +5753,7 @@ static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* ori
   hina_gpu_diagnostics* diag = &ctx->core.device->diagnostics;
   if (hina_atomic_cas32(&diag->crash_reported, 0, 1) == 0)
   {
-    HINA_LOGE(ctx, "=== VK_ERROR_DEVICE_LOST ===");
+    HINA_CRASH_LOG("=== VK_ERROR_DEVICE_LOST ===");
     hina_gpu_diag_log_context_info(ctx, origin);
     VkDeviceFaultInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
     uint32_t address_count = 0;
@@ -5718,16 +5829,17 @@ static void hina_gpu_diag_capture_device_lost(hina_context* ctx, const char* ori
 {
   if (ctx && ctx->core.device)
   {
-    HINA_LOGE(ctx, "=== VK_ERROR_DEVICE_LOST ===");
-    HINA_LOGE(ctx, "  context: %s (ctx=%p, thread=%lu)", hina_context_kind_name(ctx->core.kind),
-              (void*)ctx, (unsigned long)HINA_CURRENT_THREAD_ID());
-    HINA_LOGE(ctx, "  origin: %s", origin ? origin : "unknown");
+    HINA_CRASH_LOG("=== VK_ERROR_DEVICE_LOST ===");
+    HINA_CRASH_LOG("  context: %s (ctx=%p, thread=%lu)", hina_context_kind_name(ctx->core.kind),
+                   (void*)ctx, (unsigned long)HINA_CURRENT_THREAD_ID());
+    HINA_CRASH_LOG("  origin: %s", origin ? origin : "unknown");
     hina_staging_context* sc = &ctx->staging;
     if (sc->last_submit_ticket || sc->last_gfx_submit_ticket || sc->last_comp_submit_ticket)
     {
-      HINA_LOGE(ctx, "  staging tickets: xfer=%" PRIu64 " gfx=%" PRIu64 " comp=%" PRIu64,
-                sc->last_submit_ticket, sc->last_gfx_submit_ticket, sc->last_comp_submit_ticket);
+      HINA_CRASH_LOG("  staging tickets: xfer=%" PRIu64 " gfx=%" PRIu64 " comp=%" PRIu64,
+                     sc->last_submit_ticket, sc->last_gfx_submit_ticket, sc->last_comp_submit_ticket);
     }
+    fflush(stderr);
     if (g_debug_caps.has_device_fault && vkGetDeviceFaultInfoEXT)
     {
       enum { HINA_RELEASE_FAULT_MAX_ADDRS = 16, HINA_RELEASE_FAULT_MAX_VENDORS = 16 };
@@ -10767,6 +10879,12 @@ bool hina_init(const hina_desc* desc)
   dev->config.enable_debug_names = (desc->flags & HINA_DEBUG_NAMES_BIT) != 0 || dev->config.enable_validation;
 #endif
   dev->config.gpu_breadcrumbs = (desc->flags & HINA_DEBUG_GPU_BREADCRUMBS_BIT) != 0;
+  // Auto-enable breadcrumbs in debug builds — the whole point of debug is to catch problems
+  if (!dev->config.gpu_breadcrumbs)
+  {
+    dev->config.gpu_breadcrumbs = true;
+    HINA_LOGI(ctx, "GPU breadcrumbs auto-enabled (debug build)");
+  }
   dev->config.gpu_breadcrumbs_auto = dev->config.gpu_breadcrumbs &&
     ((desc->flags & HINA_DEBUG_GPU_BREADCRUMBS_AUTO_BIT) != 0);
 #else
@@ -12138,6 +12256,7 @@ static hina_ticket hina_auto_flush_staged(hina_context* ctx)
   sc->staged_buffers.count = 0;
   sc->staged_textures.count = 0;
 
+  HINA_OPLOG(ctx, HINA_OPLOG_FLUSH, HINA_OPLOG_STAGING, 0, ticket);
   return ticket;
 }
 
@@ -13337,6 +13456,7 @@ void hina_ctx_destroy_buffer(hina_context* ctx, hina_buffer buf)
   hina_debug_name_remove(buf.id, VK_OBJECT_TYPE_BUFFER);
 #endif
   uint16_t idx = hina_id_index(buf.id);
+  HINA_OPLOG(ctx, HINA_OPLOG_DESTROY, HINA_OPLOG_BUFFER, idx, 0);
   hina_buffer_upload_pending_clear(ctx, idx);
   g_storage.buffer_pool.slots[idx].next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
   hina_defer_destroy_fast(ctx, HINA_ZOMBIE_SLOT_BUFFER, (uint64_t)idx, 0);
@@ -14830,6 +14950,7 @@ void hina_ctx_destroy_texture(hina_context* ctx, hina_texture tex)
   hina_debug_name_remove(tex.id, VK_OBJECT_TYPE_IMAGE);
 #endif
   uint16_t idx = hina_id_index(tex.id);
+  HINA_OPLOG(ctx, HINA_OPLOG_DESTROY, HINA_OPLOG_TEXTURE, idx, 0);
   hina_texture_hot* hot = HINA_TEX_HOT(idx);
   // Destroy all child views via linear scan of view pool
   // This includes both user-created views and the default view
@@ -14990,6 +15111,7 @@ void hina_ctx_destroy_sampler(hina_context* ctx, hina_sampler samp)
   hina_debug_name_remove(samp.id, VK_OBJECT_TYPE_SAMPLER);
 #endif
   uint16_t idx = hina_id_index(samp.id);
+  HINA_OPLOG(ctx, HINA_OPLOG_DESTROY, HINA_OPLOG_SAMPLER, idx, 0);
   hina_sampler_slot* entry = HINA_SAMPLER_ENTRY(idx);
   entry->in_use = 0; // invalidate handle (sampler_slot_valid checks in_use)
   entry->next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
@@ -15628,6 +15750,7 @@ void hina_ctx_destroy_bind_group(hina_context* ctx, hina_bind_group group)
   hina_debug_bg_untrack(group.id);
 #endif
   uint16_t idx = hina_id_index(group.id);
+  HINA_OPLOG(ctx, HINA_OPLOG_DESTROY, HINA_OPLOG_BIND_GROUP, idx, 0);
   hina_desc_set_slot* slot = HINA_DESC_SET_ENTRY(idx);
   // Invalidate via generation bump — don't null slot->set (zombie needs it).
   // desc_set_slot_valid checks generation AND set != NULL; bumping generation
@@ -16972,6 +17095,7 @@ void hina_ctx_destroy_pipeline(hina_context* ctx, hina_pipeline pip)
   hina_debug_name_remove(pip.id, VK_OBJECT_TYPE_PIPELINE);
 #endif
   uint16_t idx = hina_id_index(pip.id);
+  HINA_OPLOG(ctx, HINA_OPLOG_DESTROY, HINA_OPLOG_PIPELINE, idx, 0);
   hina_pipeline_slot* e = HINA_PIPELINE_ENTRY(idx);
   e->in_use = 0; // invalidate handle (pipeline_slot_valid checks in_use)
   e->next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
@@ -22716,6 +22840,7 @@ hina_ticket hina_submit_immediate(hina_cmd* cmd)
 
 void hina_ctx_wait_ticket(hina_context* ctx, hina_ticket ticket)
 {
+  HINA_OPLOG(ctx, HINA_OPLOG_WAIT, HINA_OPLOG_STAGING, 0, ticket);
   HINA_ASSERT(ticket != 0);
   bool has_timeline = vkWaitSemaphores != NULL;
   bool found_entry = false;
@@ -24728,6 +24853,7 @@ void hina_ctx_destroy_query_pool(hina_context* ctx, hina_query_pool pool)
   HINA_ASSERT_NOT_TRANSFER(ctx, "hina_ctx_destroy_query_pool");
   if (!hina_query_slot_valid(pool)) return;
   uint16_t idx = hina_id_index(pool.id);
+  HINA_OPLOG(ctx, HINA_OPLOG_DESTROY, HINA_OPLOG_QUERY_POOL, idx, 0);
   // Invalidate via generation bump — don't null pool handle (zombie needs it).
   HINA_QUERY_ENTRY(idx)->generation++;
   HINA_QUERY_ENTRY(idx)->next_free = HINA_SLOT_PENDING_DESTROY_SENTINEL;
