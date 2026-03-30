@@ -1604,6 +1604,11 @@ typedef struct hina_texture_desc
   size_t initial_stride; // Row stride in bytes (0 = tight packing)
   hina_queue initial_owner; // Queue that initially owns this texture (default: HINA_QUEUE_GRAPHICS)
   const char* label; // Optional debug label (shows in RenderDoc, validation layers)
+  // Per-mip data pointers [mip_levels]. NULL = use initial_data for mip 0 only.
+  // When non-NULL, each mip_data[k] points to the pre-generated data for mip level k.
+  // Byte sizes are computed from format + mip dimensions. NULL entries skip that level.
+  // Caller must provide at least [mip_levels] entries. Supersedes initial_data when set.
+  const void* const* mip_data;
 } hina_texture_desc;
 
 // Sentinel to auto-calculate mip count from texture dimensions.
@@ -1612,7 +1617,8 @@ typedef struct hina_texture_desc
 #define HINA_MIP_LEVELS_AUTO ((uint16_t)0xFFFF)
 // Defaults: .type = HINA_TEX_TYPE_2D, .depth = 1, .layers = 1,
 //           .mip_levels = 1, .samples = HINA_SAMPLE_COUNT_1_BIT,
-//           .usage = HINA_TEXTURE_SAMPLED_BIT
+//           .usage = HINA_TEXTURE_SAMPLED_BIT,
+//           .mip_data = NULL (upload mip 0 from initial_data)
 HINA_API hina_texture_desc hina_texture_desc_default(void);
 
 // Global API
@@ -1629,6 +1635,20 @@ HINA_API hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_textur
 
 /** @brief Safe to call at any time. Handle invalidated immediately; GPU resource freed after completion. (valid on: all contexts) */
 HINA_API void hina_ctx_destroy_texture(hina_context* ctx, hina_texture tex);
+
+/**
+ * @brief Upload specific mip levels to an existing texture via the staging system.
+ * Uses the internal staging page pool and QFOT — no manual staging buffer needed.
+ * Batched with other staging operations; submitted on next flush.
+ * @param mip_data Array of [mip_count] data pointers (tightly packed, sizes computed from format + dims).
+ *                 NULL entries skip that level.
+ * @param base_mip First mip level to upload (0 = base/largest).
+ * @param mip_count Number of mip levels to upload starting from base_mip.
+ * (valid on: all contexts including transfer)
+ */
+HINA_API bool hina_ctx_upload_texture_mips(hina_context* ctx, hina_texture tex,
+                                            const void* const* mip_data,
+                                            uint32_t base_mip, uint32_t mip_count);
 
 /** @brief Generate mipmaps for a texture. (valid on: recording/root contexts only) */
 HINA_API hina_ticket hina_ctx_generate_mips(hina_context* ctx, hina_texture tex);

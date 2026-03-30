@@ -7394,7 +7394,7 @@ static VkImageUsageFlags hina_get_vk_image_usage_flags(const hina_texture_desc* 
   if (usage & HINA_TEXTURE_INPUT_ATTACHMENT_BIT) flags |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
   //    We need TRANSFER_DST if we are uploading initial data, or if the texture
   //    is a standard asset (not a render target) that might need updates.
-  if (desc->initial_data != NULL || !is_render_target)
+  if (desc->initial_data != NULL || desc->mip_data != NULL || !is_render_target)
   {
     flags |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   }
@@ -13680,9 +13680,34 @@ static HINA_INLINE void hina_copy_texture_rows(uint8_t* HINA_RESTRICT dst, const
   }
 }
 
+// Compute byte size of a single mip level for upload.
+// For compressed: block_w/block_h/block_bytes from hina_format_block_info.
+// For uncompressed: block_bytes = pixel_size, block_w/block_h = 0 (ignored).
+static uint64_t hina_mip_level_size(uint32_t base_width, uint32_t base_height, uint32_t mip,
+                                     bool is_compressed, uint32_t block_w, uint32_t block_h,
+                                     uint32_t block_bytes)
+{
+  uint32_t w = base_width >> mip;
+  uint32_t h = base_height >> mip;
+  if (w == 0) w = 1;
+  if (h == 0) h = 1;
+  if (is_compressed)
+  {
+    uint32_t blocks_x = hina_div_ceil_u32(w, block_w);
+    uint32_t blocks_y = hina_div_ceil_u32(h, block_h);
+    return (uint64_t)blocks_x * blocks_y * block_bytes;
+  }
+  return (uint64_t)w * h * block_bytes;
+}
+
 static bool hina_upload_texture_initial(hina_context* ctx, hina_texture_hot* hot, const hina_texture_desc* desc)
 {
-  HINA_ASSERT(hot && desc && desc->initial_data);
+  HINA_ASSERT(hot && desc && (desc->initial_data || desc->mip_data));
+  bool has_mip_data = desc->mip_data != NULL;
+  if (has_mip_data)
+  {
+    HINA_ASSERTF(hot->mip_levels > 0, "mip_data provided but mip_levels is 0");
+  }
   bool is_3d = hot->texture_dim == HINA_TEX_DIM_3D;
   bool is_compressed = hina_format_is_block_compressed(desc->format);
   hina_block_format_info block = {0};
@@ -13717,13 +13742,18 @@ static bool hina_upload_texture_initial(hina_context* ctx, hina_texture_hot* hot
     HINA_LOGE(ctx, "row size is zero");
     return false;
   }
-  uint64_t src_stride = desc->initial_stride ? desc->initial_stride : row_bytes;
-  if (src_stride < row_bytes)
+  uint64_t src_stride = 0;
+  uint64_t slice_stride = 0;
+  if (!has_mip_data)
   {
-    HINA_LOGE(ctx, "initial_stride smaller than row size");
-    return false;
+    src_stride = desc->initial_stride ? desc->initial_stride : row_bytes;
+    if (src_stride < row_bytes)
+    {
+      HINA_LOGE(ctx, "initial_stride smaller than row size");
+      return false;
+    }
+    slice_stride = src_stride * (uint64_t)block_rows;
   }
-  uint64_t slice_stride = src_stride * (uint64_t)block_rows;
   // Acquire staging command buffer up front
   VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
   if (!xfer_cmd)
@@ -13746,17 +13776,12 @@ static bool hina_upload_texture_initial(hina_context* ctx, hina_texture_hot* hot
     }
   }
   // Copy texture data to staging buffer in chunks that fit a page
-  const uint8_t* src = desc->initial_data;
   VkImageAspectFlags aspect = hina_aspect_from_format(hot->dims.format);
   uint32_t page_size = ctx->core.device->page_pool.page_size;
   uint32_t max_chunk = page_size > 256 ? page_size - 256 : page_size;
-  if (row_bytes > max_chunk)
-  {
-    HINA_LOGE(ctx, "row size (%" PRIu64 ") exceeds staging page size (%u)", row_bytes, page_size);
-    return false;
-  }
-  bool generate_mips = hot->mip_levels > 1 && !is_compressed;
-  if (!generate_mips && is_compressed && hot->mip_levels > 1)
+  bool generate_mips = hot->mip_levels > 1 && !is_compressed && !has_mip_data;
+  uint32_t upload_mip_count = has_mip_data ? hot->mip_levels : 1u;
+  if (!generate_mips && !has_mip_data && is_compressed && hot->mip_levels > 1)
   {
     HINA_LOGW(ctx, "Compressed textures do not support mip generation; only mip 0 will be uploaded");
   }
@@ -13764,53 +13789,95 @@ static bool hina_upload_texture_initial(hina_context* ctx, hina_texture_hot* hot
                      VK_ACCESS_TRANSFER_WRITE_BIT, hot->state.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      hot->vk.image,
                      ((VkImageSubresourceRange){ .aspectMask = hina_aspect_from_format(hot->dims.format), .levelCount =
-                       generate_mips ? hot->mip_levels : 1, .layerCount = is_3d ? 1u : layers }));
+                       (generate_mips || has_mip_data) ? hot->mip_levels : 1, .layerCount = is_3d ? 1u : layers }));
   HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   uint32_t slice_count = is_3d ? depth : layers;
-  for (uint32_t slice = 0; slice < slice_count; ++slice)
+  for (uint32_t mip = 0; mip < upload_mip_count; ++mip)
   {
-    const uint8_t* slice_src = src + (uint64_t)slice * slice_stride;
-    uint32_t row_index = 0;
-    while (row_index < block_rows)
+    uint32_t mip_w = width >> mip;
+    uint32_t mip_h = height >> mip;
+    if (mip_w == 0) mip_w = 1;
+    if (mip_h == 0) mip_h = 1;
+    uint32_t mip_block_rows = is_compressed ? hina_div_ceil_u32(mip_h, block.block_h) : mip_h;
+    uint64_t mip_row_bytes = is_compressed
+                               ? (uint64_t)hina_div_ceil_u32(mip_w, block.block_w) * block.block_bytes
+                               : (uint64_t)mip_w * pixel_size;
+    HINA_ASSERT(mip_row_bytes * mip_block_rows ==
+                hina_mip_level_size(width, height, mip, is_compressed,
+                                    block.block_w, block.block_h,
+                                    is_compressed ? block.block_bytes : (uint32_t)pixel_size));
+    const uint8_t* mip_src;
+    uint64_t mip_src_stride;
+    uint64_t mip_slice_stride;
+    if (has_mip_data)
     {
-      uint32_t rows = (uint32_t)(max_chunk / row_bytes);
-      if (rows == 0) rows = 1;
-      if (rows > block_rows - row_index) rows = block_rows - row_index;
-      uint32_t chunk_size = rows * (uint32_t)row_bytes;
-      VkBuffer staging_buf = VK_NULL_HANDLE;
-      uint64_t staging_offset = 0;
-      uint32_t align = ctx->core.device->core.caps.limits.staging_copy_alignment;
-      uint8_t* dst = hina_staging_ctx_alloc(ctx, chunk_size, align, &staging_buf, &staging_offset);
-      if (!dst)
+      mip_src = (const uint8_t*)desc->mip_data[mip];
+      if (!mip_src)
       {
-        HINA_LOGE(ctx, "staging alloc failed for texture upload chunk (size=%u)", chunk_size);
-        return false;
+        // Still halve 3D depth even for skipped mips to keep slice_count correct
+        if (is_3d && slice_count > 1) slice_count = slice_count >> 1 ? slice_count >> 1 : 1;
+        continue;
       }
-      const uint8_t* chunk_src = slice_src + (uint64_t)row_index * src_stride;
-      hina_copy_texture_rows(dst, chunk_src, rows, row_bytes, src_stride);
-      VkImageSubresourceLayers subres = {aspect, 0, is_3d ? 0 : slice, 1};
-      int32_t offset_y = is_compressed ? (int32_t)(row_index * block.block_h) : (int32_t)row_index;
-      VkOffset3D offset = {0, offset_y, is_3d ? (int32_t)slice : 0};
-      uint32_t extent_height;
-      if (is_compressed)
-      {
-        uint32_t remaining_texels = height > (uint32_t)offset_y ? height - (uint32_t)offset_y : 0u;
-        uint32_t rows_texels = rows * block.block_h;
-        extent_height = remaining_texels < rows_texels ? remaining_texels : rows_texels;
-      }
-      else
-      {
-        extent_height = rows;
-      }
-      VkExtent3D extent = {width, extent_height, 1};
-      hina_copy_buffer_to_image(xfer_cmd, staging_buf, hot->vk.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                staging_offset, subres, offset, extent);
-      row_index += rows;
+      mip_src_stride = mip_row_bytes;
+      mip_slice_stride = mip_row_bytes * mip_block_rows;
     }
+    else
+    {
+      mip_src = (const uint8_t*)desc->initial_data;
+      mip_src_stride = src_stride;
+      mip_slice_stride = slice_stride;
+    }
+    if (mip_row_bytes > max_chunk)
+    {
+      HINA_LOGE(ctx, "mip %u row size (%" PRIu64 ") exceeds staging page size (%u)", mip, mip_row_bytes, page_size);
+      return false;
+    }
+    for (uint32_t slice = 0; slice < slice_count; ++slice)
+    {
+      const uint8_t* slice_src = mip_src + (uint64_t)slice * mip_slice_stride;
+      uint32_t row_index = 0;
+      while (row_index < mip_block_rows)
+      {
+        uint32_t rows = (uint32_t)(max_chunk / mip_row_bytes);
+        if (rows == 0) rows = 1;
+        if (rows > mip_block_rows - row_index) rows = mip_block_rows - row_index;
+        uint32_t chunk_size = rows * (uint32_t)mip_row_bytes;
+        VkBuffer staging_buf = VK_NULL_HANDLE;
+        uint64_t staging_offset = 0;
+        uint32_t align = ctx->core.device->core.caps.limits.staging_copy_alignment;
+        uint8_t* dst = hina_staging_ctx_alloc(ctx, chunk_size, align, &staging_buf, &staging_offset);
+        if (!dst)
+        {
+          HINA_LOGE(ctx, "staging alloc failed for texture upload chunk (mip=%u, size=%u)", mip, chunk_size);
+          return false;
+        }
+        const uint8_t* chunk_src = slice_src + (uint64_t)row_index * mip_src_stride;
+        hina_copy_texture_rows(dst, chunk_src, rows, mip_row_bytes, mip_src_stride);
+        VkImageSubresourceLayers subres = {aspect, mip, is_3d ? 0 : slice, 1};
+        int32_t offset_y = is_compressed ? (int32_t)(row_index * block.block_h) : (int32_t)row_index;
+        VkOffset3D offset = {0, offset_y, is_3d ? (int32_t)slice : 0};
+        uint32_t extent_height;
+        if (is_compressed)
+        {
+          uint32_t remaining_texels = mip_h > (uint32_t)offset_y ? mip_h - (uint32_t)offset_y : 0u;
+          uint32_t rows_texels = rows * block.block_h;
+          extent_height = remaining_texels < rows_texels ? remaining_texels : rows_texels;
+        }
+        else
+        {
+          extent_height = rows;
+        }
+        VkExtent3D extent = {mip_w, extent_height, 1};
+        hina_copy_buffer_to_image(xfer_cmd, staging_buf, hot->vk.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  staging_offset, subres, offset, extent);
+        row_index += rows;
+      }
+    }
+    if (is_3d && slice_count > 1) slice_count = slice_count >> 1 ? slice_count >> 1 : 1;
   }
   // Queue family ownership transfer for exclusive sharing
   // Copy on xfer_cmd (transfer queue), finalization on owner_cmd (graphics/compute)
-  uint32_t mip_count = generate_mips ? hot->mip_levels : 1u;
+  uint32_t mip_count = (generate_mips || has_mip_data) ? hot->mip_levels : 1u;
   VkImageSubresourceRange full_range = {aspect, 0, mip_count, 0, is_3d ? 1u : layers};
   if (needs_qfot)
   {
@@ -13840,17 +13907,182 @@ static bool hina_upload_texture_initial(hina_context* ctx, hina_texture_hot* hot
       HINA_IMAGE_BARRIER_QFOT(owner_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, final_stage, 0, VK_ACCESS_SHADER_READ_BIT,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                               xfer_family, owner_family, hot->vk.image,
-                              ((VkImageSubresourceRange){aspect, 0, 1, 0, is_3d ? 1u : layers}));
+                              ((VkImageSubresourceRange){aspect, 0, mip_count, 0, is_3d ? 1u : layers}));
     }
     else
     {
       HINA_IMAGE_BARRIER(owner_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, final_stage, VK_ACCESS_TRANSFER_WRITE_BIT,
                          VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, hot->vk.image,
-                         ((VkImageSubresourceRange){aspect, 0, 1, 0, is_3d ? 1u : layers}));
+                         ((VkImageSubresourceRange){aspect, 0, mip_count, 0, is_3d ? 1u : layers}));
     }
     HINA_DEBUG_ADD_BARRIERS(ctx, 1);
   }
+  return true;
+}
+
+bool hina_ctx_upload_texture_mips(hina_context* ctx, hina_texture tex,
+                                   const void* const* mip_data,
+                                   uint32_t base_mip, uint32_t mip_count)
+{
+  HINA_ASSERT(ctx && mip_data && mip_count > 0);
+  HINA_ASSERTF(hina_texture_slot_valid(tex), "hina_ctx_upload_texture_mips: invalid texture handle");
+  uint16_t tidx = hina_id_index(tex.id);
+  hina_texture_hot* hot = HINA_TEX_HOT(tidx);
+  HINA_ASSERTF(base_mip + mip_count <= hot->mip_levels,
+               "hina_ctx_upload_texture_mips: mip range [%u, %u) exceeds mip_levels %u",
+               base_mip, base_mip + mip_count, hot->mip_levels);
+  bool is_3d = hot->texture_dim == HINA_TEX_DIM_3D;
+  hina_format fmt = hina_format_from_vk(hot->dims.format);
+  bool is_compressed = hina_format_is_block_compressed(fmt);
+  hina_block_format_info block = {0};
+  uint64_t pixel_size = 0;
+  if (is_compressed)
+  {
+    if (!hina_format_block_info(fmt, &block))
+    {
+      HINA_LOGE(ctx, "hina_ctx_upload_texture_mips: unsupported compressed format");
+      return false;
+    }
+  }
+  else
+  {
+    pixel_size = hina_format_size(fmt);
+    if (pixel_size == 0)
+    {
+      HINA_LOGE(ctx, "hina_ctx_upload_texture_mips: unsupported format");
+      return false;
+    }
+  }
+  uint32_t base_w = hot->dims.width;
+  uint32_t base_h = hot->dims.height;
+  uint32_t layers = hot->layers ? hot->layers : 1u;
+  uint32_t depth = hot->depth ? hot->depth : 1u;
+  VkImageAspectFlags aspect = hina_aspect_from_format(hot->dims.format);
+  // Acquire staging command buffer
+  VkCommandBuffer xfer_cmd = hina_staging_ctx_acquire_cmd(ctx);
+  if (!xfer_cmd)
+  {
+    HINA_LOGE(ctx, "hina_ctx_upload_texture_mips: failed to begin command buffer");
+    return false;
+  }
+  uint32_t owner_family = (uint32_t)hot->owning_family;
+  VkPipelineStageFlags final_stage = hina_shader_read_stages_for_family(ctx, owner_family);
+  VkCommandBuffer owner_cmd = xfer_cmd;
+  uint32_t xfer_family = ctx->staging.queue_family;
+  bool needs_qfot = xfer_family != owner_family;
+  if (needs_qfot)
+  {
+    owner_cmd = hina_staging_ctx_acquire_owner_cmd(ctx, owner_family);
+    if (!owner_cmd)
+    {
+      HINA_LOGE(ctx, "hina_ctx_upload_texture_mips: failed to begin owner command buffer");
+      return false;
+    }
+  }
+  // Pre-copy barrier: transition target mips from current layout to TRANSFER_DST
+  VkImageSubresourceRange mip_range = {aspect, base_mip, mip_count, 0, is_3d ? 1u : layers};
+  HINA_IMAGE_BARRIER(xfer_cmd, hot->state.stages, VK_PIPELINE_STAGE_TRANSFER_BIT, hot->state.access,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, hot->state.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     hot->vk.image, mip_range);
+  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  // Copy loop: iterate mip levels, slices, row-group chunks (same pattern as hina_upload_texture_initial)
+  uint32_t page_size = ctx->core.device->page_pool.page_size;
+  uint32_t max_chunk = page_size > 256 ? page_size - 256 : page_size;
+  uint32_t slice_count = is_3d ? depth : layers;
+  // Advance 3D slice_count to the depth at base_mip
+  if (is_3d)
+  {
+    for (uint32_t m = 0; m < base_mip && slice_count > 1; ++m)
+      slice_count = slice_count >> 1 ? slice_count >> 1 : 1;
+  }
+  for (uint32_t mi = 0; mi < mip_count; ++mi)
+  {
+    uint32_t mip = base_mip + mi;
+    const uint8_t* mip_src = (const uint8_t*)mip_data[mi];
+    if (!mip_src)
+    {
+      if (is_3d && slice_count > 1) slice_count = slice_count >> 1 ? slice_count >> 1 : 1;
+      continue;
+    }
+    uint32_t mip_w = base_w >> mip;
+    uint32_t mip_h = base_h >> mip;
+    if (mip_w == 0) mip_w = 1;
+    if (mip_h == 0) mip_h = 1;
+    uint32_t mip_block_rows = is_compressed ? hina_div_ceil_u32(mip_h, block.block_h) : mip_h;
+    uint64_t mip_row_bytes = is_compressed
+                               ? (uint64_t)hina_div_ceil_u32(mip_w, block.block_w) * block.block_bytes
+                               : (uint64_t)mip_w * pixel_size;
+    uint64_t mip_slice_stride = mip_row_bytes * mip_block_rows;
+    if (mip_row_bytes > max_chunk)
+    {
+      HINA_LOGE(ctx, "hina_ctx_upload_texture_mips: mip %u row size exceeds staging page", mip);
+      return false;
+    }
+    for (uint32_t slice = 0; slice < slice_count; ++slice)
+    {
+      const uint8_t* slice_src = mip_src + (uint64_t)slice * mip_slice_stride;
+      uint32_t row_index = 0;
+      while (row_index < mip_block_rows)
+      {
+        uint32_t rows = (uint32_t)(max_chunk / mip_row_bytes);
+        if (rows == 0) rows = 1;
+        if (rows > mip_block_rows - row_index) rows = mip_block_rows - row_index;
+        uint32_t chunk_size = rows * (uint32_t)mip_row_bytes;
+        VkBuffer staging_buf = VK_NULL_HANDLE;
+        uint64_t staging_offset = 0;
+        uint32_t align = ctx->core.device->core.caps.limits.staging_copy_alignment;
+        uint8_t* dst = hina_staging_ctx_alloc(ctx, chunk_size, align, &staging_buf, &staging_offset);
+        if (!dst)
+        {
+          HINA_LOGE(ctx, "hina_ctx_upload_texture_mips: staging alloc failed (mip=%u, size=%u)", mip, chunk_size);
+          return false;
+        }
+        const uint8_t* chunk_src = slice_src + (uint64_t)row_index * mip_row_bytes;
+        hina_copy_texture_rows(dst, chunk_src, rows, mip_row_bytes, mip_row_bytes);
+        VkImageSubresourceLayers subres = {aspect, mip, is_3d ? 0 : slice, 1};
+        int32_t offset_y = is_compressed ? (int32_t)(row_index * block.block_h) : (int32_t)row_index;
+        VkOffset3D offset = {0, offset_y, is_3d ? (int32_t)slice : 0};
+        uint32_t extent_height;
+        if (is_compressed)
+        {
+          uint32_t remaining = mip_h > (uint32_t)offset_y ? mip_h - (uint32_t)offset_y : 0u;
+          uint32_t rows_texels = rows * block.block_h;
+          extent_height = remaining < rows_texels ? remaining : rows_texels;
+        }
+        else
+        {
+          extent_height = rows;
+        }
+        VkExtent3D extent = {mip_w, extent_height, 1};
+        hina_copy_buffer_to_image(xfer_cmd, staging_buf, hot->vk.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  staging_offset, subres, offset, extent);
+        row_index += rows;
+      }
+    }
+    if (is_3d && slice_count > 1) slice_count = slice_count >> 1 ? slice_count >> 1 : 1;
+  }
+  // Post-copy barrier: transition back to SHADER_READ_ONLY
+  if (needs_qfot)
+  {
+    HINA_IMAGE_BARRIER_QFOT(xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, xfer_family, owner_family, hot->vk.image,
+                            mip_range);
+    HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+    HINA_IMAGE_BARRIER_QFOT(owner_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, final_stage, 0, VK_ACCESS_SHADER_READ_BIT,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            xfer_family, owner_family, hot->vk.image, mip_range);
+  }
+  else
+  {
+    HINA_IMAGE_BARRIER(owner_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, final_stage, VK_ACCESS_TRANSFER_WRITE_BIT,
+                       VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, hot->vk.image, mip_range);
+  }
+  HINA_DEBUG_ADD_BARRIERS(ctx, 1);
+  // hot->state.layout remains SHADER_READ_ONLY (per-image tracking, mips transiently went through TRANSFER_DST)
+  hina_staging_add_texture(ctx, tex.id);
   return true;
 }
 
@@ -14348,7 +14580,7 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
   hina_queue initial_owner = desc->initial_owner;
   if (initial_owner == 0) initial_owner = HINA_QUEUE_GRAPHICS;
   uint32_t owning_family = hina_queue_to_family(ctx, initial_owner);
-  if (desc->initial_data && owning_family == ctx->core.device->queue.transfer_family &&
+  if ((desc->initial_data || desc->mip_data) && owning_family == ctx->core.device->queue.transfer_family &&
       ctx->core.device->queue.transfer_family != ctx->core.device->queue.graphics_family)
   {
     HINA_LOGW(ctx, "initial_owner=TRANSFER not supported for texture upload; defaulting to graphics");
@@ -14438,7 +14670,7 @@ hina_texture hina_ctx_make_texture(hina_context* ctx, const hina_texture_desc* d
   // Upload initial data first (if provided) - this transitions image to correct layout
   // Data is staged but NOT submitted yet (deferred/batched for efficiency)
   bool upload_succeeded = false;
-  if (!desc->initial_data)
+  if (!desc->initial_data && !desc->mip_data)
   {
     hot->texture_dim |= HINA_TEXTURE_UPLOAD_READY_BIT;
   }
